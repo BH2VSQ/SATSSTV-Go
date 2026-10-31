@@ -3,7 +3,7 @@ package ptt
 import "testing"
 
 func TestNewControllerForVOXAndManual(t *testing.T) {
-	for _, mode := range []Mode{ModeVOX, ModeManual} {
+	for _, mode := range []Mode{ModeVOX} {
 		controller, err := NewController(Config{Mode: mode})
 		if err != nil {
 			t.Fatalf("create %s controller: %v", mode, err)

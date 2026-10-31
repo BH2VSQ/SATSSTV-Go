@@ -38,7 +38,7 @@ func NewController(config Config) (Controller, error) {
 			mode:       string(config.Mode),
 			activeHigh: config.ActiveHigh,
 		}, nil
-	case ModeVOX, ModeManual:
+	case ModeVOX:
 		return NewNoopController(Mode(strings.ToLower(strings.TrimSpace(string(config.Mode)))))
 	default:
 		return nil, fmt.Errorf("unsupported PTT mode %q", config.Mode)

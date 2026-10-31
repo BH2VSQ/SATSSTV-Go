@@ -36,6 +36,12 @@ func NewEncoder(sampleRate int) *Encoder {
 // Encode converts an image into the selected analog SSTV mode. The image is
 // center-cropped to the mode aspect ratio and bilinearly resized to its raster.
 func (e *Encoder) Encode(ctx context.Context, src image.Image, modeID string) ([]int16, error) {
+	return e.EncodeWithProgress(ctx, src, modeID, nil)
+}
+
+// EncodeWithProgress encodes an image and reports completed raster rows. The
+// callback runs on the encoder goroutine and must not block for long.
+func (e *Encoder) EncodeWithProgress(ctx context.Context, src image.Image, modeID string, onProgress func(done, total int)) ([]int16, error) {
 	if src == nil {
 		return nil, errors.New("input image is nil")
 	}
@@ -106,6 +112,9 @@ func (e *Encoder) Encode(ctx context.Context, src image.Image, modeID string) ([
 			if lineErr != nil {
 				return nil, fmt.Errorf("encode %s line %d: %w", spec.Name, row, lineErr)
 			}
+			if onProgress != nil {
+				onProgress(row+1, spec.Height)
+			}
 		}
 	case FamilyMartin, FamilyScottie, FamilyWraase, FamilyPasokon:
 		for row := 0; row < spec.Height; row++ {
@@ -114,6 +123,9 @@ func (e *Encoder) Encode(ctx context.Context, src image.Image, modeID string) ([
 			}
 			if err := encodeRGBLine(generator, rgb, row, spec); err != nil {
 				return nil, fmt.Errorf("encode %s line %d: %w", spec.Name, row, err)
+			}
+			if onProgress != nil {
+				onProgress(row+1, spec.Height)
 			}
 		}
 	case FamilyPD:
@@ -124,6 +136,9 @@ func (e *Encoder) Encode(ctx context.Context, src image.Image, modeID string) ([
 			if err := encodePDPair(generator, yuv, row, spec); err != nil {
 				return nil, fmt.Errorf("encode %s line pair %d: %w", spec.Name, row/2, err)
 			}
+			if onProgress != nil {
+				onProgress(min(row+2, spec.Height), spec.Height)
+			}
 		}
 	case FamilyMP:
 		for row := 0; row < spec.Height; row += 2 {
@@ -132,6 +147,9 @@ func (e *Encoder) Encode(ctx context.Context, src image.Image, modeID string) ([
 			}
 			if err := encodeMPPair(generator, yuv, row, spec); err != nil {
 				return nil, fmt.Errorf("encode %s super-line %d: %w", spec.Name, row/2, err)
+			}
+			if onProgress != nil {
+				onProgress(min(row+2, spec.Height), spec.Height)
 			}
 		}
 	case FamilyMRML:
@@ -142,6 +160,9 @@ func (e *Encoder) Encode(ctx context.Context, src image.Image, modeID string) ([
 			if err := encodeMRMLLine(generator, yuv[row], spec); err != nil {
 				return nil, fmt.Errorf("encode %s line %d: %w", spec.Name, row, err)
 			}
+			if onProgress != nil {
+				onProgress(row+1, spec.Height)
+			}
 		}
 	case FamilyMCN, FamilyAVT:
 		for row := 0; row < spec.Height; row++ {
@@ -150,6 +171,9 @@ func (e *Encoder) Encode(ctx context.Context, src image.Image, modeID string) ([
 			}
 			if err := encodeRGBProfileLine(generator, rgb[row], spec); err != nil {
 				return nil, fmt.Errorf("encode %s line %d: %w", spec.Name, row, err)
+			}
+			if onProgress != nil {
+				onProgress(row+1, spec.Height)
 			}
 		}
 	default:

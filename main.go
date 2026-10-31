@@ -293,7 +293,9 @@ func (a *App) GetLatestRXImage() (string, error) {
 		}
 		return "data:image/png;base64," + base64.StdEncoding.EncodeToString(data), nil
 	}
-	return "", fmt.Errorf("相册中还没有接收图像")
+	// No previous RX image is a normal state. The frontend renders an empty
+	// last-RX placeholder and fills it when the first frame is received.
+	return "", nil
 }
 
 // DeleteAlbumImage removes one archived image and its index entry.
@@ -338,11 +340,13 @@ func (a *App) SaveAlbumImage(dataURL, kind, mode, status string) (AlbumEntry, er
 }
 
 func (a *App) ImportAlbumImage(kind string) (AlbumEntry, error) {
-	if kind != "rx" && kind != "tx" {
-		return AlbumEntry{}, fmt.Errorf("无效的相册分类")
+	// RX images are generated from the live receiver and archived automatically.
+	// Only TX drafts may be manually imported into the album.
+	if kind != "tx" {
+		return AlbumEntry{}, fmt.Errorf("仅允许导入 TX 图像，RX 图像由实时接收自动归档")
 	}
 	path, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
-		Title: "导入历史图像到相册", Filters: []runtime.FileFilter{{DisplayName: "图片文件", Pattern: "*.png;*.jpg;*.jpeg"}},
+		Title: "导入 TX 历史图像到相册", Filters: []runtime.FileFilter{{DisplayName: "图片文件", Pattern: "*.png;*.jpg;*.jpeg"}},
 	})
 	if err != nil {
 		return AlbumEntry{}, err

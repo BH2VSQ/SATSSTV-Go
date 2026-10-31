@@ -210,3 +210,18 @@
   .tx-pane .pane-heading{height:auto;min-height:25px}
   .tx-mode-control select{max-width:125px}
 }
+
+
+/* Live RX/TX progress and the single VOX-driven transmit toggle. */
+.rx-decode-progress,.tx-progress-wrap{display:flex;flex-direction:column;gap:3px;flex:none;padding:1px 3px 2px}
+.rx-decode-progress{height:24px}
+.tx-progress-wrap{height:25px;padding:0 2px 2px}
+.rx-progress-meta,.tx-progress-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#697681;font-size:9px;line-height:11px}
+.rx-progress-meta b,.tx-progress-meta b{color:#3e5969;font-variant-numeric:tabular-nums;font-size:9px}
+.rx-progress-track,.tx-progress-track{height:6px;flex:none;overflow:hidden;border:1px solid #b9c2c8;border-radius:2px;background:#dce1e4}
+.rx-progress-track i,.tx-progress-track i{display:block;width:0;height:100%;background:linear-gradient(90deg,#5bcefa,#86c8d9);transition:width .12s linear}
+.tx-progress-track i{background:linear-gradient(90deg,#78b98b,#5bcefa)}
+.tx-toggle-button{background:linear-gradient(#e3f5e8,#c7e8d0);border-color:#79ae88;color:#245b35;font-weight:800}
+.tx-toggle-button:hover{background:linear-gradient(#effaf2,#d6efdc);border-color:#5b9f70}
+.tx-toggle-button.tx-running{background:linear-gradient(#f9e5e7,#edc6ca);border-color:#ca7a82;color:#862c35}
+.tx-toggle-button.tx-running:hover{background:linear-gradient(#fff0f1,#f3d6d9);border-color:#b95c68}

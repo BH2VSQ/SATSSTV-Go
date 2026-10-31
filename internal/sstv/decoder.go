@@ -34,10 +34,8 @@ func detectVISFrom(samples []int16, sampleRate, startAt int) (code uint8, bodySt
 	if sampleRate < 8_000 || sampleRate > 192_000 {
 		return 0, 0, startAt, fmt.Errorf("invalid sample rate %d", sampleRate)
 	}
-	step := max(1, sampleRate/500) // Search every 2 ms.
+	step := max(1, sampleRate/500) // Coarse search every 2 ms.
 	leaderN := int(math.Round(0.300 * float64(sampleRate)))
-	breakN := int(math.Round(0.010 * float64(sampleRate)))
-	bitN := int(math.Round(0.030 * float64(sampleRate)))
 	headerN := int(math.Round(0.910 * float64(sampleRate)))
 	if len(samples) < headerN {
 		return 0, 0, startAt, errors.New("audio is too short to contain a VIS header")
@@ -47,53 +45,78 @@ func detectVISFrom(samples []int16, sampleRate, startAt int) (code uint8, bodySt
 	if remainder := start % step; remainder != 0 {
 		start += step - remainder
 	}
-	for ; start <= maxStart; start += step {
-		if bestTone(samples[start:start+leaderN], sampleRate, 1_900, 1_200) != 1_900 {
+	// The long VIS leader is an efficient coarse candidate detector. Once a
+	// candidate is found, refine its start to 0.25 ms before classifying each
+	// symbol. This avoids the timing error caused by fixed 2 ms alignment while
+	// keeping idle-stream CPU use close to the former coarse scan.
+	fineStep := max(1, sampleRate/4000)
+	for coarse := start; coarse <= maxStart; coarse += step {
+		if bestTone(samples[coarse:coarse+leaderN], sampleRate, 1_900, 1_200) != 1_900 {
 			continue
 		}
-		p := start + leaderN
-		if bestTone(samples[p:p+breakN], sampleRate, 1_200, 1_900) != 1_200 {
-			continue
+		low := max(startAt, coarse-step)
+		if low < 0 {
+			low = 0
 		}
-		p += breakN
-		if bestTone(samples[p:p+leaderN], sampleRate, 1_900, 1_200) != 1_900 {
-			continue
-		}
-		p += leaderN
-		if bestTone(samples[p:p+bitN], sampleRate, 1_200, 1_900) != 1_200 {
-			continue
-		}
-		p += bitN
-
-		var code uint8
-		ones := 0
-		valid := true
-		for bit := 0; bit < 7; bit++ {
-			f := bestTone(samples[p:p+bitN], sampleRate, 1_100, 1_300)
-			if f == 1_100 {
-				code |= 1 << bit
-				ones++
-			} else if f != 1_300 {
-				valid = false
+		high := min(maxStart, coarse+step)
+		for candidate := low; candidate <= high; candidate += fineStep {
+			if decoded, after, ok := decodeVISHeaderAt(samples, sampleRate, candidate); ok {
+				return decoded, after, candidate, nil
 			}
-			p += bitN
-		}
-		parityFreq := bestTone(samples[p:p+bitN], sampleRate, 1_100, 1_300)
-		parityOne := parityFreq == 1_100
-		parityZero := parityFreq == 1_300
-		if (!parityOne && !parityZero) || ((ones+boolInt(parityOne))%2 != 0) {
-			valid = false
-		}
-		p += bitN
-		stopFreq := bestTone(samples[p:p+bitN], sampleRate, 1_200, 1_100)
-		if stopFreq != 1_200 {
-			valid = false
-		}
-		if valid {
-			return code, start + headerN, start, nil
 		}
 	}
 	return 0, 0, maxStart + 1, errors.New("standard SSTV VIS header not detected")
+}
+
+func decodeVISHeaderAt(samples []int16, sampleRate, start int) (uint8, int, bool) {
+	leaderN := int(math.Round(0.300 * float64(sampleRate)))
+	breakN := int(math.Round(0.010 * float64(sampleRate)))
+	bitN := int(math.Round(0.030 * float64(sampleRate)))
+	headerN := leaderN + breakN + leaderN + 10*bitN
+	if start < 0 || start+headerN > len(samples) {
+		return 0, 0, false
+	}
+	p := start
+	if headerTone(samples[p:p+leaderN], sampleRate, 1_900, 1_200) != 1_900 {
+		return 0, 0, false
+	}
+	p += leaderN
+	if headerTone(samples[p:p+breakN], sampleRate, 1_200, 1_900) != 1_200 {
+		return 0, 0, false
+	}
+	p += breakN
+	if headerTone(samples[p:p+leaderN], sampleRate, 1_900, 1_200) != 1_900 {
+		return 0, 0, false
+	}
+	p += leaderN
+	if headerTone(samples[p:p+bitN], sampleRate, 1_200, 1_900) != 1_200 {
+		return 0, 0, false
+	}
+	p += bitN
+	var decoded uint8
+	ones := 0
+	for bit := 0; bit < 7; bit++ {
+		tone := headerTone(samples[p:p+bitN], sampleRate, 1_100, 1_300)
+		if tone == 1_100 {
+			decoded |= 1 << bit
+			ones++
+		} else if tone != 1_300 {
+			return 0, 0, false
+		}
+		p += bitN
+	}
+	parity := headerTone(samples[p:p+bitN], sampleRate, 1_100, 1_300)
+	if parity != 1_100 && parity != 1_300 {
+		return 0, 0, false
+	}
+	if (ones+boolInt(parity == 1_100))%2 != 0 {
+		return 0, 0, false
+	}
+	p += bitN
+	if headerTone(samples[p:p+bitN], sampleRate, 1_200, 1_100) != 1_200 {
+		return 0, 0, false
+	}
+	return decoded, start + headerN, true
 }
 
 func boolInt(v bool) int {
@@ -134,6 +157,66 @@ func bestTone(samples []int16, sampleRate int, candidates ...float64) float64 {
 		return 0
 	}
 	return best
+}
+
+// headerTone classifies SSTV header symbols while allowing a modest receiver
+// frequency offset. Each expected tone is searched over a small band; a
+// confidence margin rejects ambiguous/noisy symbols instead of guessing.
+func headerTone(samples []int16, sampleRate int, centers ...float64) float64 {
+	if len(samples) == 0 || sampleRate <= 0 || len(centers) == 0 {
+		return 0
+	}
+	var energy float64
+	for _, sample := range samples {
+		x := float64(sample) / 32768
+		energy += x * x
+	}
+	if energy/float64(len(samples)) <= 1e-11 {
+		return 0
+	}
+	bestCenter, bestPower, secondPower := 0.0, -1.0, -1.0
+	// Use finer frequency bins for long leaders and wider bins for short
+	// symbols whose FFT-equivalent resolution is inherently coarser.
+	frequencyStep := math.Max(5, math.Min(25, float64(sampleRate)/float64(len(samples))*0.75))
+	for _, center := range centers {
+		centerPower := 0.0
+		for offset := -60.0; offset <= 60.0; offset += frequencyStep {
+			f := center + offset
+			if f <= 0 || f >= float64(sampleRate)/2 {
+				continue
+			}
+			power := goertzelPower(samples, sampleRate, f)
+			if power > centerPower {
+				centerPower = power
+			}
+		}
+		if centerPower > bestPower {
+			secondPower = bestPower
+			bestPower = centerPower
+			bestCenter = center
+		} else if centerPower > secondPower {
+			secondPower = centerPower
+		}
+	}
+	// Goertzel power is normalized against segment energy. A clean tone has a
+	// much stronger narrowband peak than broadband speech/noise; reject weak
+	// peaks even when one candidate happens to win by a small margin.
+	if bestPower <= 0 || bestPower/(energy*float64(len(samples))) < 0.08 || (secondPower > 0 && bestPower/secondPower < 1.12) {
+		return 0
+	}
+	return bestCenter
+}
+
+func goertzelPower(samples []int16, sampleRate int, frequency float64) float64 {
+	omega := 2 * math.Pi * frequency / float64(sampleRate)
+	coeff := 2 * math.Cos(omega)
+	s1, s2 := 0.0, 0.0
+	for _, sample := range samples {
+		x := float64(sample) / 32768
+		s0 := x + coeff*s1 - s2
+		s2, s1 = s1, s0
+	}
+	return s1*s1 + s2*s2 - coeff*s1*s2
 }
 
 // Decode performs standard VIS detection followed by mode-specific image
@@ -178,6 +261,19 @@ func DecodeMode(ctx context.Context, samples []int16, sampleRate int, modeID str
 		return nil, errors.New("invalid SSTV image body offset")
 	}
 	freq := instantaneousFrequency(samples, sampleRate)
+	return decodeModeFromFrequency(ctx, freq, sampleRate, spec, bodyStart)
+}
+
+// decodeModeFromFrequency reconstructs the raster from an already demodulated
+// frequency track. StreamDecoder uses it to refresh a live preview without
+// re-running the PLL over the audio received so far.
+func decodeModeFromFrequency(ctx context.Context, freq []float64, sampleRate int, spec ModeSpec, bodyStart int) (*image.NRGBA, error) {
+	if sampleRate < 8_000 || sampleRate > 192_000 {
+		return nil, fmt.Errorf("invalid sample rate %d", sampleRate)
+	}
+	if bodyStart < 0 || bodyStart >= len(freq) {
+		return nil, errors.New("invalid SSTV image body offset")
+	}
 	clock := sampleClock{rate: sampleRate, pos: bodyStart}
 	img := image.NewNRGBA(image.Rect(0, 0, spec.Width, spec.Height))
 
@@ -281,39 +377,51 @@ func frequencyToByte(frequency float64) uint8 {
 // instantaneousFrequency down-converts the SSTV video band around 1900 Hz,
 // smooths the I/Q streams with a short box filter and differentiates phase.
 // Pixel centers are sampled later by the per-mode line readers.
-func instantaneousFrequency(samples []int16, sampleRate int) []float64 {
-	// A second-order digital PLL tracks the continuous phase of the SSTV
-	// carrier. The loop starts at the VIS video centre frequency and is already
-	// locked by the 1900 Hz VIS leaders before image pixels arrive. A Costas-like
-	// quadrature detector avoids trying to estimate a full sine period inside
-	// every short pixel dwell (some are only 6-7 samples at 48 kHz).
+type frequencyTracker struct {
+	rate     int
+	phase    float64
+	estimate float64
+	lowI     float64
+	lowQ     float64
+}
+
+func newFrequencyTracker(sampleRate int) *frequencyTracker {
+	return &frequencyTracker{rate: sampleRate, estimate: VideoCenterHz}
+}
+
+func (t *frequencyTracker) Process(samples []int16) []float64 {
+	if t == nil || t.rate <= 0 || len(samples) == 0 {
+		return nil
+	}
 	freq := make([]float64, len(samples))
 	const (
 		phaseGain = 0.15
 		freqGain  = 0.002
 		loopLPF   = 0.30
 	)
-	phase, estimate := 0.0, VideoCenterHz
-	lowI, lowQ := 0.0, 0.0
 	for n, sample := range samples {
 		x := float64(sample) / 32768
-		localI := x * math.Cos(phase)
-		localQ := -x * math.Sin(phase)
-		lowI += loopLPF * (localI - lowI)
-		lowQ += loopLPF * (localQ - lowQ)
-		phaseError := math.Atan2(lowI, -lowQ)
-		estimate += freqGain * phaseError * float64(sampleRate) / (2 * math.Pi)
-		// Clamp the loop to the normal SSTV audio band so an isolated clipped
-		// sample cannot send the NCO outside the signal acquisition range.
-		estimate = math.Max(900, math.Min(2_600, estimate))
-		phase += 2*math.Pi*estimate/float64(sampleRate) + phaseGain*phaseError
-		phase = math.Mod(phase, 2*math.Pi)
-		if phase < 0 {
-			phase += 2 * math.Pi
+		localI := x * math.Cos(t.phase)
+		localQ := -x * math.Sin(t.phase)
+		t.lowI += loopLPF * (localI - t.lowI)
+		t.lowQ += loopLPF * (localQ - t.lowQ)
+		phaseError := math.Atan2(t.lowI, -t.lowQ)
+		t.estimate += freqGain * phaseError * float64(t.rate) / (2 * math.Pi)
+		t.estimate = math.Max(900, math.Min(2_600, t.estimate))
+		t.phase += 2*math.Pi*t.estimate/float64(t.rate) + phaseGain*phaseError
+		t.phase = math.Mod(t.phase, 2*math.Pi)
+		if t.phase < 0 {
+			t.phase += 2 * math.Pi
 		}
-		freq[n] = estimate
+		freq[n] = t.estimate
 	}
 	return freq
+}
+
+// instantaneousFrequency is the whole-buffer convenience wrapper around the
+// stateful PLL used by the live stream decoder.
+func instantaneousFrequency(samples []int16, sampleRate int) []float64 {
+	return newFrequencyTracker(sampleRate).Process(samples)
 }
 
 func decodeRobot(ctx context.Context, freq []float64, clock *sampleClock, img *image.NRGBA, spec ModeSpec) error {
@@ -599,19 +707,32 @@ type StreamEvent struct {
 }
 
 // StreamDecoder accepts arbitrary-sized PCM chunks and automatically detects
-// sequential VIS-framed transmissions. It retains at most one active frame
-// plus a short idle search window. Images are emitted at frame completion;
-// progressive row events can be added without changing this API.
+// sequential VIS-framed transmissions. It retains one active frame plus a
+// bounded idle search window. Progressive snapshots are available during the
+// frame through DrainUpdates; completed frames are returned from Feed.
 type StreamDecoder struct {
-	rate          int
-	pending       []int16
-	mode          *ModeSpec
-	bodyStart     int
-	maxIdle       int
-	visSearchFrom int
-	skipUntil     int // end offset of a complete frame rejected by fixed-mode filtering
-	fixedMode     string
-	activeVIS     uint8
+	rate            int
+	pending         []int16
+	freq            []float64
+	tracker         *frequencyTracker
+	mode            *ModeSpec
+	bodyStart       int
+	maxIdle         int
+	visSearchFrom   int
+	skipUntil       int // end offset of a complete frame rejected by fixed-mode filtering
+	fixedMode       string
+	activeVIS       uint8
+	lastPreviewRows int
+	updates         []StreamUpdate
+}
+
+// StreamUpdate contains a progressively reconstructed raster. The image is a
+// snapshot and may be encoded or displayed after Feed returns.
+type StreamUpdate struct {
+	Image     *image.NRGBA
+	Mode      ModeSpec
+	Rows      int
+	TotalRows int
 }
 
 func NewStreamDecoder(sampleRate int) (*StreamDecoder, error) {
@@ -622,7 +743,8 @@ func NewStreamDecoder(sampleRate int) (*StreamDecoder, error) {
 }
 
 // Feed appends one captured PCM block and returns every complete image now
-// available. It is safe to use during a simultaneous audio playback session.
+// available. It also prepares progressive image snapshots as raster rows
+// arrive, keeping PLL state between input blocks.
 func (d *StreamDecoder) Feed(ctx context.Context, samples []int16) ([]StreamEvent, error) {
 	if d == nil {
 		return nil, errors.New("nil SSTV stream decoder")
@@ -630,8 +752,12 @@ func (d *StreamDecoder) Feed(ctx context.Context, samples []int16) ([]StreamEven
 	if err := ctxErr(ctx); err != nil {
 		return nil, err
 	}
+	wasActive := d.mode != nil && d.tracker != nil
 	if len(samples) > 0 {
 		d.pending = append(d.pending, samples...)
+		if wasActive {
+			d.freq = append(d.freq, d.tracker.Process(samples)...)
+		}
 	}
 	var events []StreamEvent
 	for {
@@ -639,9 +765,6 @@ func (d *StreamDecoder) Feed(ctx context.Context, samples []int16) ([]StreamEven
 			return events, err
 		}
 
-		// A fixed RX slot rejects an entire non-matching image. Do not resume
-		// VIS hunting inside its pixel data, where noise or image tones could
-		// accidentally resemble another header.
 		if d.skipUntil > 0 {
 			if len(d.pending) < d.skipUntil {
 				return events, nil
@@ -652,14 +775,9 @@ func (d *StreamDecoder) Feed(ctx context.Context, samples []int16) ([]StreamEven
 		}
 
 		if d.mode == nil {
-			spec, vis, bodyStart, _, nextSearch, err := detectModeHeaderFrom(d.pending, d.rate, d.visSearchFrom)
+			spec, vis, bodyStart, headerStart, nextSearch, err := detectModeHeaderFrom(d.pending, d.rate, d.visSearchFrom)
 			if err != nil {
 				d.visSearchFrom = max(d.visSearchFrom, nextSearch)
-				// Header probes are deliberately bounded to a 3 s search window.
-				// Once every candidate in that window has been examined, discard
-				// already-scanned idle audio while retaining 1 s before the next
-				// candidate. This keeps memory bounded and lets short frames be
-				// detected after arbitrarily long receiver idle periods.
 				if d.visSearchFrom > d.rate*2 {
 					trim := min(d.visSearchFrom-d.rate, len(d.pending))
 					if trim > 0 {
@@ -685,36 +803,103 @@ func (d *StreamDecoder) Feed(ctx context.Context, samples []int16) ([]StreamEven
 				d.visSearchFrom = 0
 				continue
 			}
+			if headerStart < 0 || headerStart > len(d.pending) {
+				d.visSearchFrom = max(d.visSearchFrom+1, nextSearch)
+				return events, nil
+			}
+			d.pending = append([]int16(nil), d.pending[headerStart:]...)
+			bodyStart -= headerStart
 			d.mode, d.bodyStart, d.activeVIS = &spec, bodyStart, vis
+			d.tracker = newFrequencyTracker(d.rate)
+			d.freq = d.tracker.Process(d.pending)
+			d.lastPreviewRows = 0
+			d.updates = nil
 		}
-		bodyMS := BodyDurationMS(*d.mode)
-		bodySamples := int(math.Round(bodyMS * float64(d.rate) / 1000))
+
+		bodySamples := int(math.Round(BodyDurationMS(*d.mode) * float64(d.rate) / 1000))
 		frameEnd := d.bodyStart + bodySamples
 		if len(d.pending) < frameEnd {
+			d.prepareProgressiveUpdate(ctx, frameEnd)
 			return events, nil
 		}
-		img, err := DecodeMode(ctx, d.pending[:frameEnd], d.rate, d.mode.ID, d.bodyStart)
+		img, err := decodeModeFromFrequency(ctx, d.freq[:frameEnd], d.rate, *d.mode, d.bodyStart)
 		if err != nil {
 			if ctxErr(ctx) != nil {
 				return events, err
 			}
-			// A complete but undecodable frame must not poison the stream forever.
-			// Discard its known duration and resume header hunting on the next feed.
 			failedMode := d.mode.Name
 			d.pending = append([]int16(nil), d.pending[frameEnd:]...)
-			d.mode = nil
-			d.bodyStart = 0
-			d.activeVIS = 0
-			d.visSearchFrom = 0
+			if len(d.freq) >= frameEnd {
+				d.freq = append([]float64(nil), d.freq[frameEnd:]...)
+			} else {
+				d.freq = nil
+			}
+			d.clearActiveFrame()
 			return events, fmt.Errorf("decode streamed %s frame: %w", failedMode, err)
 		}
 		events = append(events, StreamEvent{Image: img, Mode: *d.mode, VIS: d.activeVIS})
 		d.pending = append([]int16(nil), d.pending[frameEnd:]...)
-		d.mode = nil
-		d.bodyStart = 0
-		d.activeVIS = 0
-		d.visSearchFrom = 0
+		if len(d.freq) >= frameEnd {
+			d.freq = append([]float64(nil), d.freq[frameEnd:]...)
+		} else {
+			d.freq = nil
+		}
+		d.clearActiveFrame()
 	}
+}
+
+func (d *StreamDecoder) prepareProgressiveUpdate(ctx context.Context, frameEnd int) {
+	if d.mode == nil || d.bodyStart < 0 || len(d.freq) <= d.bodyStart {
+		return
+	}
+	bodySamples := frameEnd - d.bodyStart
+	if bodySamples <= 0 {
+		return
+	}
+	received := min(max(0, len(d.freq)-d.bodyStart), bodySamples)
+	rows := int(float64(received) / float64(bodySamples) * float64(d.mode.Height))
+	if rows <= d.lastPreviewRows || rows <= 0 {
+		return
+	}
+	// Refresh every 1.5% of the image, with a minimum of one raster row. This
+	// keeps slow modes visually progressive while avoiding a full-raster
+	// reconstruction for every tiny audio callback.
+	stride := max(1, d.mode.Height/64)
+	if rows-d.lastPreviewRows < stride && rows < d.mode.Height {
+		return
+	}
+	padded := make([]float64, frameEnd)
+	copy(padded, d.freq[:min(len(d.freq), frameEnd)])
+	for i := len(d.freq); i < frameEnd; i++ {
+		padded[i] = VideoCenterHz
+	}
+	img, err := decodeModeFromFrequency(ctx, padded, d.rate, *d.mode, d.bodyStart)
+	if err != nil {
+		return
+	}
+	d.lastPreviewRows = rows
+	d.updates = append(d.updates, StreamUpdate{Image: img, Mode: *d.mode, Rows: rows, TotalRows: d.mode.Height})
+}
+
+func (d *StreamDecoder) clearActiveFrame() {
+	d.mode = nil
+	d.bodyStart = 0
+	d.activeVIS = 0
+	d.tracker = nil
+	d.lastPreviewRows = 0
+	d.visSearchFrom = 0
+}
+
+// DrainUpdates returns and clears progressive image snapshots produced since
+// the previous call. It must be called by the same serialized stream owner as
+// Feed.
+func (d *StreamDecoder) DrainUpdates() []StreamUpdate {
+	if d == nil || len(d.updates) == 0 {
+		return nil
+	}
+	updates := d.updates
+	d.updates = nil
+	return updates
 }
 
 // SetMode selects a fixed receive mode. An empty string restores Auto detection.
@@ -729,6 +914,10 @@ func (d *StreamDecoder) SetMode(modeID string) error {
 		d.skipUntil = 0
 		d.visSearchFrom = 0
 		d.activeVIS = 0
+		d.freq = nil
+		d.tracker = nil
+		d.lastPreviewRows = 0
+		d.updates = nil
 		return nil
 	}
 	spec, err := LookupMode(modeID)
@@ -744,6 +933,10 @@ func (d *StreamDecoder) SetMode(modeID string) error {
 	d.skipUntil = 0
 	d.visSearchFrom = 0
 	d.activeVIS = 0
+	d.freq = nil
+	d.tracker = nil
+	d.lastPreviewRows = 0
+	d.updates = nil
 	return nil
 }
 
@@ -758,6 +951,10 @@ func (d *StreamDecoder) Reset() {
 	d.skipUntil = 0
 	d.visSearchFrom = 0
 	d.activeVIS = 0
+	d.freq = nil
+	d.tracker = nil
+	d.lastPreviewRows = 0
+	d.updates = nil
 }
 
 // ActiveMode reports the currently detected in-progress image, if any.
@@ -766,4 +963,34 @@ func (d *StreamDecoder) ActiveMode() (ModeSpec, bool) {
 		return ModeSpec{}, false
 	}
 	return *d.mode, true
+}
+
+// StreamProgress describes the active frame's progress from the end of VIS
+// through the raster. Percent reaches 100 when the full frame audio is ready
+// for pixel reconstruction; the decoded image event follows immediately.
+type StreamProgress struct {
+	Mode      ModeSpec
+	Received  int
+	Total     int
+	Percent   float64
+	Rows      int
+	TotalRows int
+}
+
+// Progress reports the active stream frame without mutating decoder state.
+func (d *StreamDecoder) Progress() (StreamProgress, bool) {
+	if d == nil || d.mode == nil || d.rate <= 0 {
+		return StreamProgress{}, false
+	}
+	total := int(math.Round(BodyDurationMS(*d.mode) * float64(d.rate) / 1000))
+	received := max(0, len(d.pending)-d.bodyStart)
+	if received > total {
+		received = total
+	}
+	percent := 0.0
+	if total > 0 {
+		percent = float64(received) * 100 / float64(total)
+	}
+	rows := int(math.Floor(percent * float64(d.mode.Height) / 100))
+	return StreamProgress{Mode: *d.mode, Received: received, Total: total, Percent: math.Max(0, math.Min(100, percent)), Rows: rows, TotalRows: d.mode.Height}, true
 }

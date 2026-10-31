@@ -158,7 +158,14 @@ func (d *FullDuplex) StopReceive() error {
 
 // Transmit keys the uplink, waits for the configured lead-in, plays one SSTV
 // waveform and releases PTT after the audio tail. RX is never stopped here.
-func (d *FullDuplex) Transmit(ctx context.Context, samples []float32) (retErr error) {
+func (d *FullDuplex) Transmit(ctx context.Context, samples []float32) error {
+	return d.TransmitWithProgress(ctx, samples, nil)
+}
+
+// TransmitWithProgress reports playback progress from 0 to 1 when the playback
+// backend supports per-buffer position reporting. TX lifecycle and PTT cleanup
+// remain identical to Transmit.
+func (d *FullDuplex) TransmitWithProgress(ctx context.Context, samples []float32, onProgress func(float64)) (retErr error) {
 	if d == nil {
 		return ErrClosed
 	}
@@ -225,8 +232,19 @@ func (d *FullDuplex) Transmit(ctx context.Context, samples []float32) (retErr er
 	if err := waitContext(txCtx, d.timing.PTTLead); err != nil {
 		return err
 	}
-	if err := d.playback.Play(txCtx, samples, d.rate); err != nil {
-		return fmt.Errorf("play SSTV waveform: %w", err)
+	var playErr error
+	if progressPlayback, ok := d.playback.(interface {
+		PlayWithProgress(context.Context, []float32, int, func(float64)) error
+	}); ok {
+		playErr = progressPlayback.PlayWithProgress(txCtx, samples, d.rate, onProgress)
+	} else {
+		playErr = d.playback.Play(txCtx, samples, d.rate)
+		if playErr == nil && onProgress != nil {
+			onProgress(1)
+		}
+	}
+	if playErr != nil {
+		return fmt.Errorf("play SSTV waveform: %w", playErr)
 	}
 	if err := waitContext(txCtx, d.timing.PTTTail); err != nil {
 		return err

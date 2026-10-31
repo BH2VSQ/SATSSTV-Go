@@ -5,16 +5,15 @@ import (
 	"fmt"
 )
 
-// NoopController represents VOX or external/manual keying. The software does
-// not send a hardware PTT command; audio playback is responsible for the TX
-// trigger when Mode is VOX.
+// NoopController represents radio-side VOX. The software does not send a
+// hardware PTT command; SSTV audio triggers the radio transmitter.
 type NoopController struct {
 	Mode Mode
 }
 
 func NewNoopController(mode Mode) (*NoopController, error) {
-	if mode != ModeVOX && mode != ModeManual {
-		return nil, fmt.Errorf("noop PTT controller only supports VOX or manual mode, got %q", mode)
+	if mode != ModeVOX {
+		return nil, fmt.Errorf("noop PTT controller only supports VOX mode, got %q", mode)
 	}
 	return &NoopController{Mode: mode}, nil
 }

@@ -18,5 +18,4 @@ const (
 	ModeRTS    Mode = "rts"
 	ModeDTR    Mode = "dtr"
 	ModeVOX    Mode = "vox"
-	ModeManual Mode = "manual"
 )

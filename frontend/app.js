@@ -6,11 +6,11 @@ const SLOT_STORAGE = 'satsstv.modeSlots.v1';
 const TX_MODE_STORAGE = 'satsstv.txMode.v1';
 const RX_MODE_STORAGE = 'satsstv.rxMode.v1';
 const VALUE_IDS = ['myCall', 'hisCall', 'qth', 'locator', 'report', 'message'];
-const tokenDefaults = { MYCALL: 'N0CALL', HISCALL: 'N0TEST', QTH: 'EXAMPLE QTH', LOCATOR: 'AA00AA', REPORT: '59', MESSAGE: 'TEST MESSAGE', DATE: 'YYYY-MM-DD', TIME: 'HH:MM:SS' };
+const tokenDefaults = { MYCALL: 'N0CALL', HISCALL: 'N0TEST', QTH: 'EXAMPLE QTH', LOCATOR: 'AA00AA', REPORT: '595', MESSAGE: 'TEST MESSAGE', DATE: 'YYYY-MM-DD', TIME: 'HH:MM:SS' };
 
 const defaultTemplateSlots = [
   { id: 'cq', name: 'CQ', objects: [
-    { type: 'text', text: 'CQ CQ CQ', x: 6, y: 8, fontSize: 29, color: '#f5a9b8', bold: true },
+    { type: 'text', text: 'CQ SSTV', x: 6, y: 8, fontSize: 29, color: '#f5a9b8', bold: true },
     { type: 'text', text: 'DE {MYCALL}', x: 6, y: 24, fontSize: 19, color: '#ffffff', bold: true },
     { type: 'text', text: '{LOCATOR}', x: 6, y: 86, fontSize: 12, color: '#ffffff', bold: false },
   ]},
@@ -43,8 +43,10 @@ let selectedTemplateSlot = 0;
 const templateImageCache = new Map();
 let contextTarget = null;
 let stationSettings = { myCall: '', locator: '' };
-let audioState = { connected: false, rxActive: false, txActive: false, sampleRate: 48000, pttMode: 'manual' };
+let audioState = { connected: false, rxActive: false, txActive: false, sampleRate: 48000, pttMode: 'vox' };
 let waterfallHistory = [];
+let captureTelemetrySeen = false;
+let latestRXImageData = '';
 const MAX_WATERFALL_ROWS = 64;
 
 function dateTokens() {
@@ -174,7 +176,7 @@ function drawCover(ctx, img, width, height) {
 function componentBounds(ctx, c, width, height) {
   const x = (Number(c.x) || 0) / 100 * width;
   const y = (Number(c.y) || 0) / 100 * height;
-  if (c.type === 'image') {
+  if (isImageComponent(c)) {
     return { x, y, width: (Number(c.width) || 40) / 100 * width, height: (Number(c.height) || 40) / 100 * height, image: true };
   }
   const text = resolveTokens(c.text || '');
@@ -184,15 +186,35 @@ function componentBounds(ctx, c, width, height) {
   const maxWidth = Math.max(1, ...lines.map((line) => ctx.measureText(line).width));
   return { text, x, y, width: maxWidth, height: lineHeight * lines.length, lines, lineHeight, image: false };
 }
+function isImageComponent(c) { return c?.type === 'image' || c?.type === 'last_rx'; }
 function getTemplateImage(c) {
-  if (!c.imageData) return null;
-  let image = templateImageCache.get(c.imageData);
+  const dataURL = c?.type === 'last_rx' ? latestRXImageData : c?.imageData;
+  if (!dataURL) return null;
+  let image = templateImageCache.get(dataURL);
   if (image) return image;
   image = new Image();
   image.onload = () => renderCanvas();
-  image.src = c.imageData;
-  templateImageCache.set(c.imageData, image);
+  image.src = dataURL;
+  templateImageCache.set(dataURL, image);
   return image;
+}
+function drawLastRXPlaceholder(ctx, bounds) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(229,238,245,.88)';
+  ctx.fillRect(bounds.x, bounds.y, bounds.width, bounds.height);
+  ctx.strokeStyle = 'rgba(91,132,156,.8)';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([5, 4]);
+  ctx.strokeRect(bounds.x + 1, bounds.y + 1, Math.max(0, bounds.width - 2), Math.max(0, bounds.height - 2));
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#648397';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `600 ${Math.max(8, Math.min(15, bounds.width * .09))}px "Segoe UI", "Microsoft YaHei", sans-serif`;
+  ctx.fillText('上一次 RX 图像', bounds.x + bounds.width / 2, bounds.y + bounds.height / 2 - 5, Math.max(1, bounds.width - 8));
+  ctx.font = `400 ${Math.max(6, Math.min(10, bounds.width * .055))}px "Segoe UI", "Microsoft YaHei", sans-serif`;
+  ctx.fillText('等待接收图像', bounds.x + bounds.width / 2, bounds.y + bounds.height / 2 + 11, Math.max(1, bounds.width - 8));
+  ctx.restore();
 }
 function renderToCanvas(canvas, selectionOutline = false) {
   const mode = activeTXMode();
@@ -208,13 +230,15 @@ function renderToCanvas(canvas, selectionOutline = false) {
   }
   components.forEach((c, idx) => {
     const b = componentBounds(ctx, c, width, height);
-    if (c.type === 'image') {
+    if (isImageComponent(c)) {
       const img = getTemplateImage(c);
       if (img?.complete && img.naturalWidth) {
         const scale = Math.min(b.width / img.naturalWidth, b.height / img.naturalHeight);
         const drawWidth = img.naturalWidth * scale;
         const drawHeight = img.naturalHeight * scale;
         ctx.drawImage(img, b.x + (b.width - drawWidth) / 2, b.y + (b.height - drawHeight) / 2, drawWidth, drawHeight);
+      } else if (c.type === 'last_rx') {
+        drawLastRXPlaceholder(ctx, b);
       }
     } else {
       ctx.font = `${c.bold ? '700' : '400'} ${c.fontSize || 18}px "Segoe UI", "Microsoft YaHei", sans-serif`;
@@ -240,11 +264,11 @@ function renderComponentList() {
   components.forEach((c, i) => {
     const row = document.createElement('button'); row.className = `component-item${selectedComponent === i ? ' selected' : ''}`;
     const sample = document.createElement('span'); sample.className = 'component-sample';
-    sample.textContent = c.type === 'image' ? 'IMG' : (c.text || '').replace(/\{[A-Z]+\}/g, '…').slice(0, 1) || 'T';
+    sample.textContent = isImageComponent(c) ? (c.type === 'last_rx' ? 'RX' : 'IMG') : (c.text || '').replace(/\{[A-Z]+\}/g, '…').slice(0, 1) || 'T';
     sample.style.color = c.color || '#5b8ba0';
     const name = document.createElement('span'); name.className = 'component-name';
-    name.textContent = c.type === 'image' ? (c.imageName || '模板图像') : (c.text || '').replace(/\s+/g, ' ').slice(0, 28) || `文字 ${i + 1}`;
-    const meta = document.createElement('small'); meta.textContent = c.type === 'image' ? `${Math.round(c.width)}×${Math.round(c.height)}%` : `${c.fontSize}px`;
+    name.textContent = isImageComponent(c) ? (c.type === 'last_rx' ? '上一次 RX 图像' : (c.imageName || '模板图像')) : (c.text || '').replace(/\s+/g, ' ').slice(0, 28) || `文字 ${i + 1}`;
+    const meta = document.createElement('small'); meta.textContent = isImageComponent(c) ? `${Math.round(c.width)}×${Math.round(c.height)}%` : `${c.fontSize}px`;
     row.append(sample, name, meta); row.addEventListener('click', () => selectComponent(i)); host.appendChild(row);
   });
   $('componentProperties').classList.toggle('disabled-properties', components.length === 0);
@@ -257,7 +281,7 @@ function selectComponent(index) {
 }
 function updateComponentProperties() {
   const c = components[selectedComponent];
-  const isImage = c?.type === 'image';
+  const isImage = isImageComponent(c);
   ['componentText', 'fontSize', 'fontColor', 'fontBold'].forEach(id => { $(id).disabled = !c || isImage; });
   ['posX', 'posY', 'deleteText'].forEach(id => { $(id).disabled = !c; });
   ['imageWidth', 'imageHeight'].forEach(id => { $(id).disabled = !isImage; });
@@ -278,7 +302,7 @@ function updateComponentProperties() {
 function updateSelectedComponent() {
   const c = components[selectedComponent]; if (!c) return;
   c.x = Number($('posX').value); c.y = Number($('posY').value);
-  if (c.type === 'image') {
+  if (isImageComponent(c)) {
     c.width = Number($('imageWidth').value); c.height = Number($('imageHeight').value);
     c.x = Math.min(c.x, Math.max(0, 100 - c.width));
     c.y = Math.min(c.y, Math.max(0, 100 - c.height));
@@ -313,12 +337,20 @@ async function chooseTemplateImage() {
     await addImageComponent(url, path.split(/[\\/]/).pop());
   } catch (e) { setStatus(`添加模板图像失败：${String(e)}`, true); }
 }
-async function addLatestRXImage() {
+function addLatestRXImage() {
+  components.push({ type: 'last_rx', imageName: '上一次 RX 图像', x: 8, y: 18, width: 42, height: 42 });
+  selectComponent(components.length - 1);
+  setStatus(latestRXImageData ? '已添加上一次 RX 图像组件' : '已添加上一次 RX 图像占位组件，收到首张图像后会自动填入');
+}
+async function refreshLatestRXImage() {
   try {
-    const url = await app().GetLatestRXImage();
-    await addImageComponent(url, '上一次 RX 图像');
-    setStatus('已将上一次 RX 图像添加到模板');
-  } catch (e) { setStatus(`添加上一次 RX 图像失败：${String(e)}`, true); }
+    latestRXImageData = await app().GetLatestRXImage() || '';
+  } catch {
+    // Missing or not-yet-created RX archive is an ordinary empty state.
+    latestRXImageData = '';
+  }
+  templateImageCache.clear();
+  renderCanvas();
 }
 function deleteSelectedComponent() {
   if (!components.length) return;
@@ -340,9 +372,9 @@ function renderTemplates() {
   templateSlots.forEach((t, index) => {
     const b = document.createElement('button'); b.className = `template-card${index === selectedTemplateSlot ? ' selected-template' : ''}`;
     const preview = document.createElement('span'); preview.className = 'template-thumb';
-    const textObjects = t.objects.filter(o => o.type !== 'image');
-    const mainText = document.createElement('b'); mainText.textContent = (textObjects[0]?.text || (t.objects.some(o => o.type === 'image') ? 'IMAGE' : (index === 3 ? '空白模板' : 'TEXT'))).replace(/\{[A-Z]+\}/g, '…').slice(0, 16);
-    const secondary = document.createElement('i'); secondary.textContent = textObjects[1]?.text?.replace(/\{[A-Z]+\}/g, '…').slice(0, 18) || (t.objects.some(o => o.type === 'image') ? '包含图像组件' : '');
+    const textObjects = t.objects.filter(o => !isImageComponent(o));
+    const mainText = document.createElement('b'); mainText.textContent = (textObjects[0]?.text || (t.objects.some(o => isImageComponent(o)) ? 'IMAGE' : (index === 3 ? '空白模板' : 'TEXT'))).replace(/\{[A-Z]+\}/g, '…').slice(0, 16);
+    const secondary = document.createElement('i'); secondary.textContent = textObjects[1]?.text?.replace(/\{[A-Z]+\}/g, '…').slice(0, 18) || (t.objects.some(o => isImageComponent(o)) ? '包含图像组件' : '');
     preview.append(mainText, secondary);
     const label = document.createElement('span'); label.className = 'template-name'; label.textContent = `${index + 1}. ${t.name || '空白模板'}`;
     b.append(preview, label); b.addEventListener('click', () => loadTemplateAt(index)); host.appendChild(b);
@@ -366,6 +398,7 @@ async function loadTemplateSlots() {
   catch (e) { templateSlots = defaultTemplateSlots.map(t => ({ ...t, objects: t.objects.map(o => ({ ...o })) })); setStatus(`读取模板失败，使用内置模板：${String(e)}`, true); }
   if (!Array.isArray(templateSlots) || templateSlots.length !== 4) templateSlots = defaultTemplateSlots.map(t => ({ ...t, objects: t.objects.map(o => ({ ...o })) }));
   loadTemplateAt(0);
+  await refreshLatestRXImage();
 }
 
 function findComponentAt(x, y) {
@@ -389,8 +422,8 @@ function setupCanvasDrag() {
   });
   canvas.addEventListener('pointermove', (e) => {
     if (!pointerDrag) return; const p = canvasPoint(e), c = components[pointerDrag.index];
-    const maxX = c.type === 'image' ? Math.max(0, 100 - Number(c.width || 40)) : 100;
-    const maxY = c.type === 'image' ? Math.max(0, 100 - Number(c.height || 40)) : 100;
+    const maxX = isImageComponent(c) ? Math.max(0, 100 - Number(c.width || 40)) : 100;
+    const maxY = isImageComponent(c) ? Math.max(0, 100 - Number(c.height || 40)) : 100;
     c.x = Math.max(0, Math.min(maxX, (p.x - pointerDrag.offsetX) / canvas.width * 100));
     c.y = Math.max(0, Math.min(maxY, (p.y - pointerDrag.offsetY) / canvas.height * 100));
     updateComponentProperties(); renderComponentList(); renderCanvas();
@@ -466,19 +499,29 @@ function renderLiveSpectrum(values) {
 }
 
 function updateAudioState(state) {
+  const wasRXActive = !!audioState.rxActive;
   audioState = { ...audioState, ...(state || {}) };
+  if (audioState.rxActive && !wasRXActive) {
+    captureTelemetrySeen = false;
+    waterfallHistory = [];
+    drawIdleSpectrum();
+  }
+  if (!audioState.rxActive) captureTelemetrySeen = false;
   const connected = !!audioState.connected;
   const label = audioState.rxActive ? `RX 自动运行 · ${(audioState.sampleRate || 48000) / 1000} kHz` : (connected ? '音频已就绪' : '音频待初始化');
   document.querySelector('.device-state').lastChild.textContent = ` ${label}`;
   document.querySelector('.device-state i').style.background = audioState.rxActive ? '#5b9f77' : '#c39a55';
   $('rate').disabled = false;
   ['audioInput','audioOutput','pttMode','rigctlAddress','serialPort','pttActiveHigh','pttLead','pttTail'].forEach(id => { if ($(id)) $(id).disabled = false; });
-  $('startTX').disabled = !connected || audioState.txActive || !activeTXMode()?.ready;
-  $('stopTX').disabled = !audioState.txActive;
+  const txButton = $('txToggle');
+  txButton.disabled = !connected || (!audioState.txActive && !activeTXMode()?.ready);
+  txButton.textContent = audioState.txActive ? '停止发射' : '开始发射';
+  txButton.classList.toggle('tx-running', !!audioState.txActive);
   $('audioSettingsStatus').textContent = connected ? `共享模式音频已就绪，${audioState.rxActive ? 'RX 持续接收中' : 'RX 正在恢复'}${audioState.txActive ? '，TX 运行中' : ''}` : '音频设备待初始化，工作台会自动启动 RX';
-  $('spectrumState').textContent = audioState.rxActive ? 'INPUT ACTIVE · SHARED' : 'INPUT IDLE';
-  $('spectrumOverlay').style.display = audioState.rxActive ? 'none' : 'grid';
-  $('rxHint').textContent = audioState.rxActive ? '持续采集并自动识别 / 指定模式解码' : 'RX 音频流正在自动初始化…';
+  $('spectrumState').textContent = !audioState.rxActive ? 'INPUT IDLE' : (captureTelemetrySeen ? 'INPUT ACTIVE · SHARED' : 'WAITING FOR INPUT');
+  $('spectrumOverlay').textContent = !audioState.rxActive ? 'RX 尚未启动' : (captureTelemetrySeen ? '' : 'RX 已启动，正在等待音频设备输入采样…');
+  $('spectrumOverlay').style.display = audioState.rxActive && captureTelemetrySeen ? 'none' : 'grid';
+  $('rxHint').textContent = !audioState.rxActive ? 'RX 音频流正在自动初始化…' : (captureTelemetrySeen ? '实时音频采集中' : 'RX 已启动，等待输入采样');
   $('rxStatus').textContent = audioState.rxActive ? '自动接收中' : '初始化中';
   $('txStatus').textContent = audioState.txActive ? '正在发射' : '草稿';
 }
@@ -486,26 +529,82 @@ function bindRuntimeEvents() {
   if (!window.runtime?.EventsOn) return;
   window.runtime.EventsOn('audio:state', updateAudioState);
   window.runtime.EventsOn('audio:telemetry', (data) => {
+    captureTelemetrySeen = true;
+    $('spectrumState').textContent = 'INPUT ACTIVE · SHARED';
     const dbfs = Number(data?.dbfs ?? -120);
     const fill = Math.max(0, Math.min(100, (dbfs + 60) / 60 * 100));
     $('inputLevel').style.width = `${fill}%`;
     $('inputLevelText').textContent = `${dbfs.toFixed(1)} dBFS`;
-    $('rxHint').textContent = data?.droppedBlocks ? `采集队列丢弃 ${data.droppedBlocks} 个音频块` : '实时音频采集中';
+    const samplesReceived = Number(data?.samplesReceived) || 0;
+    $('rxHint').textContent = data?.droppedBlocks ? `采集队列丢弃 ${data.droppedBlocks} 个音频块` : (dbfs < -90 ? `已收到 ${samplesReceived.toLocaleString()} 个采样，当前输入接近静音` : `实时音频采集中 · ${samplesReceived.toLocaleString()} samples`);
     renderLiveSpectrum(data?.spectrum);
     $('spectrumOverlay').style.display = 'none';
   });
+  window.runtime.EventsOn('rx:progress', (data) => {
+    const percent = Math.max(0, Math.min(100, Number(data?.percent) || 0));
+    $('rxProgressFill').style.width = `${percent}%`;
+    $('rxProgressText').textContent = `${Math.round(percent)}%`;
+    if (data?.complete) {
+      $('rxProgressLabel').textContent = `${data.mode || 'SSTV'} 解码完成`;
+    } else if (data?.active) {
+      const rows = Number(data.rows) || 0;
+      const total = Number(data.totalRows) || 0;
+      $('rxProgressLabel').textContent = `正在接收 ${data.mode || 'SSTV'} · ${rows}/${total} 行`;
+    } else {
+      $('rxProgressLabel').textContent = '等待 SSTV 信号';
+      $('rxProgressFill').style.width = '0%';
+      $('rxProgressText').textContent = '0%';
+    }
+  });
+  window.runtime.EventsOn('rx:callsign', (data) => {
+    const callsign = String(data?.callsign || '').trim();
+    if (!callsign) return;
+    $('rxCallsign').textContent = callsign;
+    $('rxCallsign').title = `来源：${data?.source || 'FSKID'}`;
+    setStatus(`已通过 ${data?.source || 'FSKID'} 识别到呼号 ${callsign}`);
+  });
+  window.runtime.EventsOn('rx:preview', (data) => {
+    const frame = $('rxImageFrame');
+    let img = frame.querySelector('#rxLiveImage');
+    if (!img) {
+      frame.innerHTML = '';
+      img = document.createElement('img');
+      img.id = 'rxLiveImage';
+      img.alt = `${data.mode || 'SSTV'} 实时解码图像`;
+      frame.appendChild(img);
+    }
+    img.src = data.image;
+    img.alt = `${data.mode || 'SSTV'} 实时解码图像`;
+    $('rxDetectedMode').textContent = data.mode || '---';
+    $('rxResolution').textContent = `${data.width} × ${data.height}`;
+    $('rxStatus').textContent = '实时图像解码中';
+    $('rxProgressLabel').textContent = `实时显示 ${data.mode || 'SSTV'} · ${data.rows}/${data.totalRows} 行`;
+  });
   window.runtime.EventsOn('rx:frame', async (data) => {
+    latestRXImageData = data.image || latestRXImageData;
+    templateImageCache.clear();
+    renderCanvas();
     const frame = $('rxImageFrame'); frame.innerHTML = '';
     const img = document.createElement('img'); img.src = data.image; img.alt = `${data.mode} 接收图像`; frame.appendChild(img);
     $('rxDetectedMode').textContent = data.mode; $('rxResolution').textContent = `${data.width} × ${data.height}`; $('rxTimestamp').textContent = data.timestamp;
     $('rxStatus').textContent = '图像接收完成';
+    $('rxProgressFill').style.width = '100%'; $('rxProgressText').textContent = '100%'; $('rxProgressLabel').textContent = '图像接收完成';
     setStatus(`${data.mode} 图像接收完成${data.albumSaved ? '，已加入相册' : ''}`);
     await refreshAlbum();
   });
   window.runtime.EventsOn('rx:error', message => setStatus(`RX 解码提示：${message}`, true));
   window.runtime.EventsOn('tx:state', data => {
     $('txStatus').textContent = data.state === 'playing' ? '发射中' : data.state === 'encoding' ? '编码中' : data.state === 'completed' ? '完成' : data.state === 'stopped' ? '已停止' : data.state === 'error' ? '错误' : '草稿';
+    $('txProgressLabel').textContent = data.message || data.state;
+    if (data.state === 'completed') { $('txProgressFill').style.width = '100%'; $('txProgressText').textContent = '100%'; }
+    if (data.state === 'stopped' || data.state === 'error') $('txProgressLabel').textContent = data.message || data.state;
     setStatus(data.message || data.state, data.state === 'error');
+  });
+  window.runtime.EventsOn('tx:progress', (data) => {
+    const percent = Math.max(0, Math.min(100, Number(data?.percent) || 0));
+    $('txProgressFill').style.width = `${percent}%`;
+    $('txProgressText').textContent = `${Math.round(percent)}%`;
+    $('txProgressLabel').textContent = data?.message || (data?.stage === 'playing' ? '正在发射 SSTV' : '正在编码 SSTV');
   });
   window.runtime.EventsOn('tx:complete', () => refreshAlbum());
 }
@@ -515,6 +614,11 @@ async function startTX() {
   if (!mode || !mode.ready) return setStatus('当前 TX 模式的编码器不可用', true);
   if (!audioState.connected) return setStatus('TX 音频输出尚未初始化，请在设备设置中选择输出设备并应用', true);
   try {
+    // Use the current QSO editor identity for the FSKID payload, so the
+    // transmitted station ID always matches the visible MYCALL template token.
+    const savedStation = await app().SaveStationSettings({ myCall: $('myCall').value, locator: $('locator').value });
+    stationSettings = { myCall: savedStation?.myCall || '', locator: savedStation?.locator || '' };
+    syncStationSettingsForm();
     await app().StartTX(exportCanvasDataURL(), mode.id, Number($('rate').value));
     updateAudioState({ ...audioState, txActive: true });
     setStatus(`正在准备发送 ${mode.name}…`);
@@ -523,6 +627,10 @@ async function startTX() {
 async function stopTX() {
   try { await app().StopTX(); setStatus('已请求停止 TX'); }
   catch (e) { setStatus(`停止 TX 失败：${String(e)}`, true); }
+}
+async function toggleTX() {
+  if (audioState.txActive) return stopTX();
+  return startTX();
 }
 
 async function refreshAudioDevices() {
@@ -544,7 +652,7 @@ async function loadAudioSettings() {
     const cfg = await app().GetAudioSettings();
     $('rate').value = String(cfg.sampleRate || 48000);
     $('audioInput').value = cfg.captureDeviceId || ''; $('audioOutput').value = cfg.playbackDeviceId || '';
-    $('pttMode').value = cfg.pttMode || 'manual'; $('rigctlAddress').value = cfg.rigctlAddress || ''; $('serialPort').value = cfg.serialPort || '';
+    $('pttMode').value = cfg.pttMode || 'vox'; $('rigctlAddress').value = cfg.rigctlAddress || ''; $('serialPort').value = cfg.serialPort || '';
     $('pttActiveHigh').checked = cfg.activeHigh !== false;
     $('pttLead').value = cfg.pttLeadMs ?? 300; $('pttTail').value = cfg.pttTailMs ?? 250;
   } catch (e) { $('audioSettingsStatus').textContent = `读取音频设置失败：${String(e)}`; }
@@ -633,7 +741,7 @@ function openAlbumMenu(x, y, entry) {
   const deleteBtn = document.createElement('button'); deleteBtn.className = 'context-item danger-context-item'; deleteBtn.textContent = '删除图像';
   deleteBtn.addEventListener('click', async () => {
     hideContextMenu();
-    try { await app().DeleteAlbumImage(entry.id); await refreshAlbum(); setStatus(`已删除相册图像：${entry.filename}`); }
+    try { await app().DeleteAlbumImage(entry.id); await refreshAlbum(); await refreshLatestRXImage(); setStatus(`已删除相册图像：${entry.filename}`); }
     catch (e) { setStatus(`删除图像失败：${String(e)}`, true); }
   });
   menu.appendChild(deleteBtn); showContextMenu(x, y);
@@ -723,8 +831,7 @@ async function initializeAudioRX() {
 $('chooseImage').addEventListener('click', chooseImage);
 $('clearBackground').addEventListener('click', clearBackground);
 $('encode').addEventListener('click', encodeWAV);
-$('startTX').addEventListener('click', startTX);
-$('stopTX').addEventListener('click', stopTX);
+$('txToggle').addEventListener('click', toggleTX);
 $('addText').addEventListener('click', addTextComponent);
 $('addImage').addEventListener('click', chooseTemplateImage);
 $('addLastRX').addEventListener('click', addLatestRXImage);
@@ -736,8 +843,6 @@ VALUE_IDS.forEach(id => $(id).addEventListener('input', () => {
   if (id === 'myCall' || id === 'locator') syncStationSettingsForm();
   renderCanvas();
 }));
-$('importRX').addEventListener('click', () => importAlbum('rx'));
-$('importAlbumRX').addEventListener('click', () => importAlbum('rx'));
 $('importAlbumTX').addEventListener('click', () => importAlbum('tx'));
 $('albumFilter').addEventListener('change', renderAlbum);
 document.querySelectorAll('.nav-btn').forEach(b => b.addEventListener('click', () => showPage(b.dataset.page)));

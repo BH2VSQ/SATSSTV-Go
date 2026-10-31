@@ -29,18 +29,20 @@
 
       <div class="workbench-grid">
         <section class="pane rx-pane">
-          <div class="pane-heading"><div class="pane-title"><span class="rx-tag">RX</span><strong>接收监视</strong><small id="rxStatus">待机</small></div><div class="pane-tools"><span class="rx-auto-state" id="rxAutoState">Auto · 自动接收</span><button class="small-btn" id="importRX">导入历史图像</button></div></div>
+          <div class="pane-heading"><div class="pane-title"><span class="rx-tag">RX</span><strong>接收监视</strong><small id="rxStatus">待机</small></div><div class="pane-tools"><span class="rx-auto-state" id="rxAutoState">Auto · 自动接收</span></div></div>
           <div class="rx-image-frame" id="rxImageFrame">
             <div class="empty-state"><span class="empty-picture">▧</span><b>等待接收图像</b><small>解码完成的图像会显示在这里</small></div>
           </div>
-          <div class="image-status"><span>模式 <b id="rxDetectedMode">Auto</b></span><span>尺寸 <b id="rxResolution">---</b></span><span>接收时间 <b id="rxTimestamp">--</b></span></div>
+          <div class="image-status"><span>模式 <b id="rxDetectedMode">Auto</b></span><span>尺寸 <b id="rxResolution">---</b></span><span>呼号 <b id="rxCallsign">等待 FSKID</b></span><span>接收时间 <b id="rxTimestamp">--</b></span></div>
+          <div class="rx-decode-progress"><div class="rx-progress-meta"><span id="rxProgressLabel">等待 SSTV 信号</span><b id="rxProgressText">0%</b></div><div class="rx-progress-track"><i id="rxProgressFill"></i></div></div>
           <div class="spectrum-head"><b>Audio Spectrum / Waterfall</b><span id="spectrumState">INPUT IDLE</span></div>
           <div class="spectrum-frame"><canvas id="spectrum" width="900" height="230"></canvas><div id="spectrumOverlay">实时显示 900 至 2800 Hz SSTV 音频频谱与瀑布图</div></div>
           <div class="rx-footer"><span class="level-label">输入电平</span><div class="level-meter"><i id="inputLevel"></i></div><span id="inputLevelText">-- dBFS</span><span class="rx-hint" id="rxHint">RX 将随工作台自动启动</span></div>
         </section>
 
         <section class="pane tx-pane">
-          <div class="pane-heading"><div class="pane-title"><span class="tx-tag">TX</span><strong>发送编辑器</strong><small id="txStatus">草稿</small></div><div class="pane-tools"><label class="tx-mode-control">TX MODE<select id="txModeSelect" aria-label="发射模式"></select></label><button class="small-btn" id="chooseImage">载入图片</button><button class="small-btn" id="encode">生成 WAV</button><button class="small-btn primary-small" id="startTX">实时发射</button><button class="small-btn" id="stopTX" disabled>停止 TX</button></div></div>
+          <div class="pane-heading"><div class="pane-title"><span class="tx-tag">TX</span><strong>发送编辑器</strong><small id="txStatus">草稿</small></div><div class="pane-tools"><label class="tx-mode-control">TX MODE<select id="txModeSelect" aria-label="发射模式"></select></label><button class="small-btn" id="chooseImage">载入图片</button><button class="small-btn" id="encode">生成 WAV</button><button class="small-btn tx-toggle-button" id="txToggle" disabled>开始发射</button></div></div>
+          <div class="tx-progress-wrap" aria-live="polite"><div class="tx-progress-meta"><span id="txProgressLabel">发射就绪</span><b id="txProgressText">0%</b></div><div class="tx-progress-track"><i id="txProgressFill"></i></div></div>
           <div class="tx-editor-grid">
             <div class="tx-preview-column">
               <div class="tx-canvas-frame"><canvas id="txCanvas" width="320" height="240"></canvas></div>
@@ -49,7 +51,7 @@
               <div class="tx-action-row"><span id="txResult">编辑画面就绪</span></div>
             </div>
             <div class="component-editor">
-              <div class="editor-section-head"><b>模板组件</b><div class="component-actions"><button id="addText" class="small-btn add-btn">＋ 文字</button><button id="addImage" class="small-btn add-btn">＋ 图像</button><button id="addLastRX" class="small-btn add-btn">上次 RX</button></div></div>
+              <div class="editor-section-head"><b>模板组件</b><div class="component-actions"><button id="addText" class="small-btn add-btn">＋ 文字</button><button id="addImage" class="small-btn add-btn">＋ 图像</button><button id="addLastRX" class="small-btn add-btn">上次 RX 图像组件</button></div></div>
               <div id="componentList" class="component-list"></div>
               <div id="componentProperties" class="component-properties">
                 <div class="property-head"><b>组件属性</b><button id="deleteText" class="link-btn danger-link">删除</button></div>
@@ -77,7 +79,7 @@
               <input id="hisCall" class="qso-primary" placeholder="对方呼号" maxlength="24">
               <input id="qth" placeholder="QTH" maxlength="40">
               <input id="locator" placeholder="网格定位" maxlength="12">
-              <input id="report" placeholder="RST / 报告" maxlength="16">
+              <input id="report" value="595" placeholder="RST / 报告" maxlength="16">
               <input id="message" placeholder="自定义消息" maxlength="100">
             </div>
           </div>
@@ -86,8 +88,8 @@
     </main>
 
     <main id="albumPage" class="page album-page">
-      <div class="album-toolbar"><div><strong>图像相册</strong><small>历史接收与发送图像，自动记录时间戳</small></div><div class="album-actions"><select id="albumFilter"><option value="all">全部图像</option><option value="rx">仅接收 RX</option><option value="tx">仅发送 TX</option></select><button id="importAlbumRX" class="small-btn">导入 RX 图像</button><button id="importAlbumTX" class="small-btn">导入 TX 图像</button></div></div>
-      <div id="albumGrid" class="album-grid"><div class="album-empty">相册暂无图像。完成接收后会自动归档，也可以从文件导入历史图像。</div></div>
+      <div class="album-toolbar"><div><strong>图像相册</strong><small>历史接收与发送图像，自动记录时间戳</small></div><div class="album-actions"><select id="albumFilter"><option value="all">全部图像</option><option value="rx">仅接收 RX</option><option value="tx">仅发送 TX</option></select><button id="importAlbumTX" class="small-btn">导入 TX 图像</button></div></div>
+      <div id="albumGrid" class="album-grid"><div class="album-empty">相册暂无图像。完成接收或发射后会自动归档。</div></div>
       <div class="album-footnote">点击缩略图可查看大图；右键可导出带时间戳的 PNG 或删除记录。图像保存在本机用户配置目录。</div>
     </main>
 
@@ -108,13 +110,13 @@
       </section>
       <section class="radio-settings">
         <h3>PTT 发射控制</h3>
-        <label>控制方式<select id="pttMode"><option value="manual">手动 PTT</option><option value="vox">VOX</option><option value="rts">串口 RTS</option><option value="dtr">串口 DTR</option><option value="hamlib">Hamlib Rigctld</option></select></label>
+        <label>控制方式<select id="pttMode"><option value="vox">VOX（电台自动发射）</option><option value="rts">串口 RTS</option><option value="dtr">串口 DTR</option><option value="hamlib">Hamlib Rigctld</option></select></label>
         <label>Rigctl 地址<input id="rigctlAddress" type="text" placeholder="主机名:端口" autocomplete="off"></label>
         <label>串口名称<input id="serialPort" type="text" placeholder="COMx" autocomplete="off"></label>
         <label>PTT 前置延时 (ms)<input id="pttLead" type="number" min="0" max="10000" value="300"></label>
         <label>PTT 释放延时 (ms)<input id="pttTail" type="number" min="0" max="10000" value="250"></label>
         <label class="settings-check"><input id="pttActiveHigh" type="checkbox" checked> RTS/DTR 高电平发射</label>
-        <p>手动模式不会自动控制电台 PTT。VOX 需要电台自身启用 VOX。使用 RTS/DTR 或 Hamlib 前请确认串口和电台控制配置。保存并应用时会短暂重建音频流，随后自动恢复当前 RX 模式。</p>
+        <p>默认使用 VOX，由电台根据 SSTV 音频自动切换发射。也可选择串口 RTS/DTR 或 Hamlib Rigctld 控制电台 PTT。保存并应用时会短暂重建音频流，随后自动恢复当前 RX 模式。</p>
       </section>
       <section class="station-settings">
         <h3>本站身份信息</h3>

@@ -70,8 +70,8 @@ func (m *malgoAppRuntime) StartReceive(ctx context.Context, cb func([]float32)) 
 	return m.duplex.StartReceive(ctx, cb)
 }
 func (m *malgoAppRuntime) StopReceive() error { return m.duplex.StopReceive() }
-func (m *malgoAppRuntime) Transmit(ctx context.Context, samples []float32) error {
-	return m.duplex.Transmit(ctx, samples)
+func (m *malgoAppRuntime) Transmit(ctx context.Context, samples []float32, onProgress func(float64)) error {
+	return m.duplex.TransmitWithProgress(ctx, samples, onProgress)
 }
 func (m *malgoAppRuntime) Close() error                 { return m.duplex.Close() }
 func (m *malgoAppRuntime) DroppedCaptureBlocks() uint64 { return m.backend.DroppedCaptureBlocks() }

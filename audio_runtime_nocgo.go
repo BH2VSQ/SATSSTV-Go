@@ -23,7 +23,7 @@ func (unavailableAudioRuntime) StartReceive(context.Context, func([]float32)) er
 	return errors.New("CGO unavailable")
 }
 func (unavailableAudioRuntime) StopReceive() error { return nil }
-func (unavailableAudioRuntime) Transmit(context.Context, []float32) error {
+func (unavailableAudioRuntime) Transmit(context.Context, []float32, func(float64)) error {
 	return errors.New("CGO unavailable")
 }
 func (unavailableAudioRuntime) Close() error { return nil }

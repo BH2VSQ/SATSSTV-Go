@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image/jpeg"
 	"image/png"
 	"math"
 	"os"
@@ -21,8 +22,9 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-// AudioSettings stores device and PTT preferences. The first-run PTT mode is
-// manual so the application cannot unexpectedly key a radio on first launch.
+// AudioSettings stores device and radio keying preferences. VOX is the
+// first-run default so the radio can key from the SSTV audio without a manual
+// PTT action.
 type AudioSettings struct {
 	SampleRate       int    `json:"sampleRate"`
 	CaptureDeviceID  string `json:"captureDeviceId"`
@@ -58,12 +60,12 @@ type appAudioRuntime interface {
 	DeviceLists() (inputs, outputs []AudioDeviceInfo, err error)
 	StartReceive(ctx context.Context, onSamples func([]float32)) error
 	StopReceive() error
-	Transmit(ctx context.Context, samples []float32) error
+	Transmit(ctx context.Context, samples []float32, onProgress func(float64)) error
 	Close() error
 }
 
 func defaultAudioSettings() AudioSettings {
-	return AudioSettings{SampleRate: 48_000, PTTMode: string(ptt.ModeManual), ActiveHigh: true, PTTLeadMS: 300, PTTTailMS: 250}
+	return AudioSettings{SampleRate: 48_000, PTTMode: string(ptt.ModeVOX), ActiveHigh: true, PTTLeadMS: 300, PTTTailMS: 250}
 }
 
 func (a *App) audioSettingsPath() (string, error) {
@@ -101,11 +103,13 @@ func normalizeAudioSettings(cfg AudioSettings) (AudioSettings, error) {
 		return AudioSettings{}, fmt.Errorf("采样率必须在 8000 至 192000 Hz 之间")
 	}
 	cfg.PTTMode = strings.ToLower(strings.TrimSpace(cfg.PTTMode))
-	if cfg.PTTMode == "" {
-		cfg.PTTMode = string(ptt.ModeManual)
+	if cfg.PTTMode == "" || cfg.PTTMode == "manual" {
+		// Migrate old v3.5 manual settings to VOX. Manual PTT is no longer a
+		// selectable control mode because it cannot automate SSTV transmission.
+		cfg.PTTMode = string(ptt.ModeVOX)
 	}
 	switch ptt.Mode(cfg.PTTMode) {
-	case ptt.ModeHamlib, ptt.ModeRTS, ptt.ModeDTR, ptt.ModeVOX, ptt.ModeManual:
+	case ptt.ModeHamlib, ptt.ModeRTS, ptt.ModeDTR, ptt.ModeVOX:
 	default:
 		return AudioSettings{}, fmt.Errorf("未知 PTT 控制方式：%s", cfg.PTTMode)
 	}
@@ -365,7 +369,12 @@ func (a *App) startRX(modeID string) error {
 		a.audioMu.Unlock()
 		return err
 	}
-	go a.runRXWorker(rxCtx, queue, decoder, cfg.SampleRate, &dropped, session)
+	fskidDecoder, err := sstv.NewFSKIDDecoder(cfg.SampleRate)
+	if err != nil {
+		_ = a.stopRX()
+		return err
+	}
+	go a.runRXWorker(rxCtx, queue, decoder, fskidDecoder, cfg.SampleRate, &dropped, session)
 	a.emitAudioState()
 	return nil
 }
@@ -396,8 +405,10 @@ type captureDiagnostics interface {
 	CaptureError() string
 }
 
-func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *sstv.StreamDecoder, sampleRate int, dropped *atomic.Uint64, session appAudioRuntime) {
+func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *sstv.StreamDecoder, fskidDecoder *sstv.FSKIDDecoder, sampleRate int, dropped *atomic.Uint64, session appAudioRuntime) {
 	lastTelemetry := time.Time{}
+	var receivedSamples uint64
+	lastProgress := time.Time{}
 	lastCaptureError := ""
 	for {
 		select {
@@ -407,6 +418,7 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 			if len(block) == 0 {
 				continue
 			}
+			receivedSamples += uint64(len(block))
 			pcm := audio.Float32ToPCM16(block)
 			if time.Since(lastTelemetry) >= 80*time.Millisecond {
 				level := rmsDBFS(block)
@@ -422,16 +434,40 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 					}
 				}
 				if a.ctx != nil {
-					runtime.EventsEmit(a.ctx, "audio:telemetry", map[string]any{"dbfs": level, "spectrum": spectrum, "droppedBlocks": droppedBlocks})
+					runtime.EventsEmit(a.ctx, "audio:telemetry", map[string]any{"dbfs": level, "spectrum": spectrum, "droppedBlocks": droppedBlocks, "samplesReceived": receivedSamples, "blockSamples": len(block)})
 				}
 				lastTelemetry = time.Now()
 			}
 			// setRXMode and stopRX may update or clear the stream decoder while
 			// capture is active. Keep the decoder state serialized with those
 			// control operations; capture callbacks themselves never take this lock.
+			// FSKID is a separate station-identification stream appended after the
+			// analog picture. Decode it in parallel with the raster receiver.
+			for _, identity := range fskidDecoder.Feed(pcm) {
+				if a.ctx != nil {
+					runtime.EventsEmit(a.ctx, "rx:callsign", map[string]any{"callsign": identity.Callsign, "source": "MMSSTV FSKID"})
+				}
+			}
 			a.rxDecoderMu.Lock()
 			events, err := decoder.Feed(ctx, pcm)
+			progress, progressActive := decoder.Progress()
+			progressiveUpdates := decoder.DrainUpdates()
 			a.rxDecoderMu.Unlock()
+			for _, update := range progressiveUpdates {
+				if a.ctx == nil || update.Image == nil {
+					continue
+				}
+				var preview bytes.Buffer
+				if jpeg.Encode(&preview, update.Image, &jpeg.Options{Quality: 76}) != nil {
+					continue
+				}
+				dataURL := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(preview.Bytes())
+				runtime.EventsEmit(a.ctx, "rx:preview", map[string]any{"image": dataURL, "mode": update.Mode.Name, "modeId": update.Mode.ID, "width": update.Mode.Width, "height": update.Mode.Height, "rows": update.Rows, "totalRows": update.TotalRows})
+			}
+			if progressActive && a.ctx != nil && time.Since(lastProgress) >= 100*time.Millisecond {
+				runtime.EventsEmit(a.ctx, "rx:progress", map[string]any{"active": true, "mode": progress.Mode.Name, "modeId": progress.Mode.ID, "percent": progress.Percent, "rows": progress.Rows, "totalRows": progress.TotalRows, "receivedSamples": progress.Received, "totalSamples": progress.Total})
+				lastProgress = time.Now()
+			}
 			if err != nil {
 				if ctx.Err() == nil && a.ctx != nil {
 					runtime.EventsEmit(a.ctx, "rx:error", err.Error())
@@ -439,6 +475,9 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 				continue
 			}
 			for _, event := range events {
+				if a.ctx != nil {
+					runtime.EventsEmit(a.ctx, "rx:progress", map[string]any{"active": false, "percent": 100, "mode": event.Mode.Name, "modeId": event.Mode.ID, "rows": event.Mode.Height, "totalRows": event.Mode.Height, "complete": true})
+				}
 				var buf bytes.Buffer
 				if err := png.Encode(&buf, event.Image); err != nil {
 					continue
@@ -551,7 +590,11 @@ func (a *App) StartTX(dataURL, modeID string, sampleRate int) error {
 			cancel()
 			a.finishTX(txGeneration)
 		}()
-		samples, encodeErr := sstv.NewEncoder(sampleRate).Encode(txCtx, img, modeID)
+		samples, encodeErr := sstv.NewEncoder(sampleRate).EncodeWithProgress(txCtx, img, modeID, func(done, total int) {
+			if total > 0 {
+				a.emitTXProgress("encoding", 50*float64(done)/float64(total), "正在编码 SSTV 图像")
+			}
+		})
 		if encodeErr != nil {
 			if errors.Is(encodeErr, context.Canceled) || errors.Is(txCtx.Err(), context.Canceled) {
 				a.emitTXState("stopped", "编码阶段已取消发射")
@@ -560,12 +603,29 @@ func (a *App) StartTX(dataURL, modeID string, sampleRate int) error {
 			}
 			return
 		}
+		station, stationErr := a.GetStationSettings()
+		if stationErr != nil {
+			a.emitTXState("error", "读取本站呼号失败："+stationErr.Error())
+			return
+		}
+		samples, encodeErr = sstv.AppendMMSSTVFSKID(samples, sampleRate, station.MyCall, spec.Header == sstv.HeaderNarrowVIS)
+		if encodeErr != nil {
+			a.emitTXState("error", "生成 MMSSTV FSKID 失败："+encodeErr.Error())
+			return
+		}
+		if station.MyCall != "" {
+			a.emitTXProgress("encoding", 55, "SSTV 图像编码完成，已附加 FSKID 呼号")
+		} else {
+			a.emitTXProgress("encoding", 55, "SSTV 图像编码完成，未设置本站呼号，跳过 FSKID")
+		}
 		if err := txCtx.Err(); err != nil {
 			a.emitTXState("stopped", "发射已取消")
 			return
 		}
-		a.emitTXState("playing", "正在播放 SSTV 音频并执行 PTT 控制…")
-		if playErr := session.Transmit(txCtx, audio.PCM16ToFloat32(samples)); playErr != nil {
+		a.emitTXState("playing", "正在播放 SSTV 图像与呼号识别数据…")
+		if playErr := session.Transmit(txCtx, audio.PCM16ToFloat32(samples), func(fraction float64) {
+			a.emitTXProgress("playing", 55+45*math.Max(0, math.Min(1, fraction)), "正在发射 SSTV")
+		}); playErr != nil {
 			if errors.Is(playErr, context.Canceled) {
 				a.emitTXState("stopped", "发射已停止")
 			} else {
@@ -604,6 +664,12 @@ func (a *App) StopTX() {
 	a.audioMu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+}
+
+func (a *App) emitTXProgress(stage string, percent float64, message string) {
+	if a.ctx != nil {
+		runtime.EventsEmit(a.ctx, "tx:progress", map[string]any{"stage": stage, "percent": math.Max(0, math.Min(100, percent)), "message": message})
 	}
 }
 

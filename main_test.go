@@ -67,6 +67,13 @@ func TestAlbumRejectsInvalidKind(t *testing.T) {
 	}
 }
 
+func TestAlbumDoesNotAllowManualRXHistoryImport(t *testing.T) {
+	app := &App{}
+	if _, err := app.ImportAlbumImage("rx"); err == nil {
+		t.Fatal("manual RX history import should be disabled")
+	}
+}
+
 func TestStationSettingsPersistAndNormalize(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmp)
@@ -120,14 +127,14 @@ func TestAudioSettingsPersistAndNormalize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAudioSettings() on first run: %v", err)
 	}
-	if initial.SampleRate != 48_000 || initial.PTTMode != "manual" {
+	if initial.SampleRate != 48_000 || initial.PTTMode != "vox" {
 		t.Fatalf("unexpected safe first-run audio defaults: %+v", initial)
 	}
 	if initial.RigctlAddress != "" || initial.SerialPort != "" {
 		t.Fatalf("first-run audio defaults must not contain radio endpoint examples: %+v", initial)
 	}
 
-	want := AudioSettings{SampleRate: 44_100, CaptureDeviceID: "capture-example-id", PlaybackDeviceID: "playback-example-id", PTTMode: "manual", ActiveHigh: true, PTTLeadMS: 400, PTTTailMS: 300}
+	want := AudioSettings{SampleRate: 44_100, CaptureDeviceID: "capture-example-id", PlaybackDeviceID: "playback-example-id", PTTMode: "vox", ActiveHigh: true, PTTLeadMS: 400, PTTTailMS: 300}
 	saved, err := app.saveAudioSettings(want)
 	if err != nil {
 		t.Fatalf("SaveAudioSettings(): %v", err)
@@ -141,6 +148,16 @@ func TestAudioSettingsPersistAndNormalize(t *testing.T) {
 	}
 	if loaded != want {
 		t.Fatalf("persisted audio settings mismatch: got %+v, want %+v", loaded, want)
+	}
+}
+
+func TestLegacyManualPTTSettingsMigrateToVOX(t *testing.T) {
+	cfg, err := normalizeAudioSettings(AudioSettings{SampleRate: 48_000, PTTMode: "manual"})
+	if err != nil {
+		t.Fatalf("legacy manual PTT settings should migrate: %v", err)
+	}
+	if cfg.PTTMode != "vox" {
+		t.Fatalf("legacy manual PTT should migrate to VOX, got %q", cfg.PTTMode)
 	}
 }
 
@@ -269,6 +286,27 @@ func TestTemplateSlotsDefaultAndPersistence(t *testing.T) {
 	}
 }
 
+func TestTemplateSlotsMigrateLegacyCQCaption(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv("APPDATA", tmp)
+	t.Setenv("HOME", tmp)
+
+	app := &App{}
+	slots := defaultTemplateSlots()
+	slots[0].Objects[0].Text = "CQ CQ CQ"
+	if _, err := app.SaveTemplateSlots(slots); err != nil {
+		t.Fatalf("save legacy template: %v", err)
+	}
+	loaded, err := app.GetTemplateSlots()
+	if err != nil {
+		t.Fatalf("load migrated template: %v", err)
+	}
+	if got := loaded[0].Objects[0].Text; got != "CQ SSTV" {
+		t.Fatalf("legacy built-in CQ caption = %q, want CQ SSTV", got)
+	}
+}
+
 func TestTemplateImageLayerValidationAndPersistence(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmp)
@@ -334,7 +372,39 @@ func TestAlbumLatestRXAndDelete(t *testing.T) {
 	if _, err := os.Stat(rx.Path); !os.IsNotExist(err) {
 		t.Fatalf("deleted image should no longer exist, stat err = %v", err)
 	}
+	latest, err = app.GetLatestRXImage()
+	if err != nil || latest != "" {
+		t.Fatalf("GetLatestRXImage() after deleting last RX = %q, %v; want empty without error", latest, err)
+	}
 	if err := app.DeleteAlbumImage("../album.json"); err == nil {
 		t.Fatal("path-like album ID should be rejected")
+	}
+}
+
+func TestLastRXTemplateComponentAndEmptyLatestImage(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv("APPDATA", tmp)
+	t.Setenv("HOME", tmp)
+
+	app := &App{}
+	latest, err := app.GetLatestRXImage()
+	if err != nil || latest != "" {
+		t.Fatalf("empty GetLatestRXImage() = %q, %v; want empty string without error", latest, err)
+	}
+	slots, err := app.GetTemplateSlots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	slots[3].Objects = []TemplateObject{{Type: "last_rx", ImageName: "上一次 RX 图像", X: 8, Y: 18, Width: 42, Height: 42}}
+	if _, err := app.SaveTemplateSlots(slots); err != nil {
+		t.Fatalf("save last-RX placeholder component: %v", err)
+	}
+	loaded, err := app.GetTemplateSlots()
+	if err != nil {
+		t.Fatalf("load last-RX placeholder component: %v", err)
+	}
+	if got := loaded[3].Objects[0]; got.Type != "last_rx" || got.ImageData != "" || got.Width != 42 || got.Height != 42 {
+		t.Fatalf("last-RX template component = %+v", got)
 	}
 }

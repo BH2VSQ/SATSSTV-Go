@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// TemplateObject is one editable text or image layer on the SSTV canvas.
+// TemplateObject is one editable text, static image, or dynamic last-RX layer on the SSTV canvas.
 type TemplateObject struct {
 	Type      string  `json:"type"`
 	Text      string  `json:"text,omitempty"`
@@ -33,7 +33,7 @@ type TemplateSlot struct {
 func defaultTemplateSlots() []TemplateSlot {
 	return []TemplateSlot{
 		{ID: "cq", Name: "CQ", Objects: []TemplateObject{
-			{Type: "text", Text: "CQ CQ CQ", X: 6, Y: 8, FontSize: 29, Color: "#f5a9b8", Bold: true},
+			{Type: "text", Text: "CQ SSTV", X: 6, Y: 8, FontSize: 29, Color: "#f5a9b8", Bold: true},
 			{Type: "text", Text: "DE {MYCALL}", X: 6, Y: 24, FontSize: 19, Color: "#ffffff", Bold: true},
 			{Type: "text", Text: "{LOCATOR}", X: 6, Y: 86, FontSize: 12, Color: "#ffffff"},
 		}},
@@ -77,6 +77,13 @@ func (a *App) GetTemplateSlots() ([]TemplateSlot, error) {
 	}
 	if err := validateTemplateSlots(slots); err != nil {
 		return nil, fmt.Errorf("模板配置文件无效：%w", err)
+	}
+	// Migrate the built-in v3.5 CQ caption without changing user-authored
+	// template text in the other slots.
+	if len(slots) > 0 && slots[0].ID == "cq" && len(slots[0].Objects) > 0 {
+		if slots[0].Objects[0].Type == "text" && strings.EqualFold(strings.TrimSpace(slots[0].Objects[0].Text), "CQ CQ CQ") {
+			slots[0].Objects[0].Text = "CQ SSTV"
+		}
 	}
 	return slots, nil
 }
@@ -139,9 +146,18 @@ func validateTemplateSlots(slots []TemplateSlot) error {
 				if len(obj.Text) > 4096 || obj.FontSize < 0 || obj.FontSize > 160 {
 					return fmt.Errorf("模板 %q 的文字组件 %d 参数无效", slot.Name, j+1)
 				}
-			case "image":
+			case "image", "last_rx":
 				if obj.Width <= 0 || obj.Width > 100 || obj.Height <= 0 || obj.Height > 100 {
 					return fmt.Errorf("模板 %q 的图像组件 %d 尺寸无效", slot.Name, j+1)
+				}
+				if obj.Type == "last_rx" {
+					// The previous-RX object intentionally stores no image bytes.
+					// It resolves to the latest received frame at render time.
+					obj.ImageData = ""
+					if obj.ImageName == "" {
+						obj.ImageName = "上一次 RX 图像"
+					}
+					continue
 				}
 				totalImageBytes += len(obj.ImageData)
 				if len(obj.ImageData) > 16<<20 || totalImageBytes > 48<<20 {

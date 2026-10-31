@@ -2,6 +2,7 @@ package sstv
 
 import (
 	"context"
+	"fmt"
 	"image"
 	"image/color"
 	"math"
@@ -498,5 +499,140 @@ func TestNarrowBandMPUsesNarrowSyncAndPorch(t *testing.T) {
 				t.Errorf("line porch = %.0f Hz, want %.0f Hz", gotPorch, tc.wantPorch)
 			}
 		})
+	}
+}
+
+func TestStreamDecoderEmitsProgressiveImagesBeforeFrameCompletion(t *testing.T) {
+	const rate = 48_000
+	for _, modeID := range []string{Robot36ID, "martin_m1", "pd120"} {
+		t.Run(modeID, func(t *testing.T) {
+			encoded, err := NewEncoder(rate).Encode(context.Background(), makeTestSSTVImage(), modeID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoder, err := NewStreamDecoder(rate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var updates []StreamUpdate
+			var final []StreamEvent
+			for start := 0; start < len(encoded); start += 4096 {
+				end := min(start+4096, len(encoded))
+				events, feedErr := decoder.Feed(context.Background(), encoded[start:end])
+				if feedErr != nil {
+					t.Fatal(feedErr)
+				}
+				updates = append(updates, decoder.DrainUpdates()...)
+				final = append(final, events...)
+			}
+			if len(updates) < 2 {
+				t.Fatalf("got %d progressive updates, want multiple updates before frame completion", len(updates))
+			}
+			if len(final) != 1 {
+				t.Fatalf("got %d final frames, want one", len(final))
+			}
+			lastRows := 0
+			for _, update := range updates {
+				if update.Rows <= lastRows || update.Rows >= update.TotalRows {
+					t.Fatalf("progressive row count did not advance monotonically: previous=%d update=%d/%d", lastRows, update.Rows, update.TotalRows)
+				}
+				lastRows = update.Rows
+			}
+			// Rows comfortably above the progress boundary must already match
+			// the eventual final raster, proving these are decoded pixels.
+			preview := updates[len(updates)/2]
+			checkRow := max(0, preview.Rows-3)
+			for _, x := range []int{16, 80, 160, 240, 304} {
+				if got, want := preview.Image.NRGBAAt(x, checkRow), final[0].Image.NRGBAAt(x, checkRow); got != want {
+					t.Fatalf("progressive pixel (%d,%d)=%v differs from final %v", x, checkRow, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestVISDetectionToleratesFrequencyOffsetAndArbitraryStart(t *testing.T) {
+	const rate = 48_000
+	for _, offset := range []float64{-45, -25, 25, 45} {
+		t.Run(fmt.Sprintf("offset_%+.0fHz", offset), func(t *testing.T) {
+			g, err := NewToneGenerator(rate, 0.55)
+			if err != nil {
+				t.Fatal(err)
+			}
+			write := func(hz, ms float64) {
+				if err := g.ToneMS(hz+offset, ms); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write(1900, 300)
+			write(1200, 10)
+			write(1900, 300)
+			write(1200, 30) // start bit
+			code := uint8(8)
+			ones := 0
+			for bit := 0; bit < 7; bit++ {
+				if code&(1<<bit) != 0 {
+					write(1100, 30)
+					ones++
+				} else {
+					write(1300, 30)
+				}
+			}
+			if ones%2 == 0 {
+				write(1300, 30)
+			} else {
+				write(1100, 30)
+			}
+			write(1200, 30)
+			prefix := make([]int16, 377)
+			samples := append(prefix, g.Samples()...)
+			// Keep enough trailing audio for the Auto detector to rule out longer
+			// MMSSTV extended/N-VIS headers before committing to standard VIS.
+			samples = append(samples, make([]int16, rate/2)...)
+			// Add deterministic low-level broadband noise to model a real input.
+			state := uint32(0x12345678)
+			for i := range samples {
+				state = state*1664525 + 1013904223
+				noise := int16(int32((state>>16)&0x7ff) - 1024)
+				value := int32(samples[i]) + int32(noise)
+				if value > 32767 {
+					value = 32767
+				}
+				if value < -32768 {
+					value = -32768
+				}
+				samples[i] = int16(value)
+			}
+			spec, vis, _, err := DetectModeHeader(samples, rate)
+			if err != nil {
+				t.Fatalf("DetectModeHeader failed: %v", err)
+			}
+			if spec.ID != Robot36ID || vis != 8 {
+				t.Fatalf("detected %s / VIS %d, want Robot 36 / VIS 8", spec.ID, vis)
+			}
+		})
+	}
+}
+
+func TestFrequencyTrackerMatchesSingleBufferDemodulation(t *testing.T) {
+	const rate = 48_000
+	wave, err := NewEncoder(rate).Encode(context.Background(), makeTestSSTVImage(), Robot36ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := instantaneousFrequency(wave, rate)
+	tracker := newFrequencyTracker(rate)
+	var got []float64
+	for start := 0; start < len(wave); start += 997 {
+		end := min(start+997, len(wave))
+		got = append(got, tracker.Process(wave[start:end])...)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("stream frequency count=%d, whole-buffer count=%d", len(got), len(want))
+	}
+	for _, index := range []int{0, 1, 14399, 14400, 50000, len(wave) / 2, len(wave) - 1} {
+		if got[index] != want[index] {
+			t.Fatalf("frequency at sample %d = %.6f, whole-buffer %.6f", index, got[index], want[index])
+		}
 	}
 }

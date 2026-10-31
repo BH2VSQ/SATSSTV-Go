@@ -26,10 +26,8 @@ func detectModeHeaderFrom(samples []int16, sampleRate, startAt int) (spec ModeSp
 	step := max(1, sampleRate/500)
 	var nextCandidates []int
 
-	// Ordinary VIS is the common case. If it starts exactly at the current
-	// search cursor, a registered standard mode can be accepted immediately.
-	// If it appears later, verify that it is not a false VIS inside a longer
-	// MMSSTV extended header before committing to it.
+	// Probe ordinary VIS first, then verify any registered code against the
+	// longer MMSSTV header families before committing to Auto mode selection.
 	visCode, afterVIS, nextVIS, visErr := detectVISFrom(samples, sampleRate, startAt)
 	if visErr == nil {
 		headerStart = afterVIS - int(math.Round(0.910*float64(sampleRate)))
@@ -44,10 +42,10 @@ func detectModeHeaderFrom(samples []int16, sampleRate, startAt int) (spec ModeSp
 				}
 				return found, visCode, body, headerStart, body, nil
 			}
-			if headerStart == startAt {
-				return found, visCode, afterVIS, headerStart, afterVIS, nil
-			}
-
+			// A registered 7-bit code can also be the first seven data bits of an
+			// MMSSTV 16-bit VIS. Always verify the longer header formats before
+			// locking Auto to a standard mode, even when the leader starts at the
+			// current search cursor.
 			if code, offset, next, err := detectExtendedVISFrom(samples, sampleRate, startAt); err == nil {
 				extendedStart := offset - int(math.Round(mmsstvExtendedHeaderMS/1000*float64(sampleRate)))
 				if foundExtended, ok := ModeFromExtendedVIS(code); ok && extendedStart <= headerStart {
@@ -127,22 +125,22 @@ func detectExtendedVISFrom(samples []int16, rate, startAt int) (uint16, int, int
 			continue
 		}
 		p += leaderN
-		if bestTone(samples[p:p+breakN], rate, 1200, 1900) != 1200 {
+		if headerTone(samples[p:p+breakN], rate, 1200, 1900) != 1200 {
 			continue
 		}
 		p += breakN
-		if bestTone(samples[p:p+leaderN], rate, 1900, 1200) != 1900 {
+		if headerTone(samples[p:p+leaderN], rate, 1900, 1200) != 1900 {
 			continue
 		}
 		p += leaderN
-		if bestTone(samples[p:p+bitN], rate, 1200, 1100) != 1200 {
+		if headerTone(samples[p:p+bitN], rate, 1200, 1100) != 1200 {
 			continue
 		}
 		p += bitN
 		var code uint16
 		valid := true
 		for bit := 0; bit < 16; bit++ {
-			tone := bestTone(samples[p:p+bitN], rate, 1100, 1300)
+			tone := headerTone(samples[p:p+bitN], rate, 1100, 1300)
 			if tone == 1100 {
 				code |= 1 << bit
 			} else if tone != 1300 {
@@ -150,7 +148,7 @@ func detectExtendedVISFrom(samples []int16, rate, startAt int) (uint16, int, int
 			}
 			p += bitN
 		}
-		if bestTone(samples[p:p+bitN], rate, 1200, 1100) != 1200 {
+		if headerTone(samples[p:p+bitN], rate, 1200, 1100) != 1200 {
 			valid = false
 		}
 		if valid {
@@ -178,11 +176,11 @@ func detectNarrowVISFrom(samples []int16, rate, startAt int) (uint8, int, int, e
 			continue
 		}
 		p += leaderN
-		if bestTone(samples[p:p+breakN], rate, 2100, 1900) != 2100 {
+		if headerTone(samples[p:p+breakN], rate, 2100, 1900) != 2100 {
 			continue
 		}
 		p += breakN
-		if bestTone(samples[p:p+bitN], rate, 1900, 2100) != 1900 {
+		if headerTone(samples[p:p+bitN], rate, 1900, 2100) != 1900 {
 			continue
 		}
 		p += bitN
@@ -190,7 +188,7 @@ func detectNarrowVISFrom(samples []int16, rate, startAt int) (uint8, int, int, e
 		valid := true
 		for group := range groups {
 			for bit := 5; bit >= 0; bit-- {
-				tone := bestTone(samples[p:p+bitN], rate, 1900, 2100)
+				tone := headerTone(samples[p:p+bitN], rate, 1900, 2100)
 				if tone == 1900 {
 					groups[group] |= 1 << bit
 				} else if tone != 2100 {
@@ -244,7 +242,7 @@ func detectAVT90BodyStart(samples []int16, rate, firstStart int) (int, bool, int
 		if !ok {
 			return 0, false, firstStart, nil
 		}
-		if bestTone(samples[start:end], rate, 1900, 1600, 2200) != 1900 {
+		if headerTone(samples[start:end], rate, 1900, 1600, 2200) != 1900 {
 			return 0, false, start, errors.New("invalid AVT90 countdown marker")
 		}
 		var first, inverse uint8
@@ -253,7 +251,7 @@ func detectAVT90BodyStart(samples []int16, rate, firstStart int) (int, bool, int
 			if !ok {
 				return 0, false, firstStart, nil
 			}
-			tone := bestTone(samples[start:end], rate, 1600, 2200)
+			tone := headerTone(samples[start:end], rate, 1600, 2200)
 			if tone == 2200 {
 				first |= 1 << bit
 			} else if tone != 1600 {
@@ -265,7 +263,7 @@ func detectAVT90BodyStart(samples []int16, rate, firstStart int) (int, bool, int
 			if !ok {
 				return 0, false, firstStart, nil
 			}
-			tone := bestTone(samples[start:end], rate, 1600, 2200)
+			tone := headerTone(samples[start:end], rate, 1600, 2200)
 			if tone == 2200 {
 				inverse |= 1 << bit
 			} else if tone != 1600 {
@@ -288,26 +286,26 @@ func decodeStandardVISAt(samples []int16, rate, start int) (uint8, bool) {
 		return 0, false
 	}
 	p := start
-	if bestTone(samples[p:p+leaderN], rate, 1900, 1200) != 1900 {
+	if headerTone(samples[p:p+leaderN], rate, 1900, 1200) != 1900 {
 		return 0, false
 	}
 	p += leaderN
-	if bestTone(samples[p:p+breakN], rate, 1200, 1900) != 1200 {
+	if headerTone(samples[p:p+breakN], rate, 1200, 1900) != 1200 {
 		return 0, false
 	}
 	p += breakN
-	if bestTone(samples[p:p+leaderN], rate, 1900, 1200) != 1900 {
+	if headerTone(samples[p:p+leaderN], rate, 1900, 1200) != 1900 {
 		return 0, false
 	}
 	p += leaderN
-	if bestTone(samples[p:p+bitN], rate, 1200, 1100) != 1200 {
+	if headerTone(samples[p:p+bitN], rate, 1200, 1100) != 1200 {
 		return 0, false
 	}
 	p += bitN
 	var code uint8
 	ones := 0
 	for bit := 0; bit < 7; bit++ {
-		tone := bestTone(samples[p:p+bitN], rate, 1100, 1300)
+		tone := headerTone(samples[p:p+bitN], rate, 1100, 1300)
 		if tone == 1100 {
 			code |= 1 << bit
 			ones++
@@ -316,7 +314,7 @@ func decodeStandardVISAt(samples []int16, rate, start int) (uint8, bool) {
 		}
 		p += bitN
 	}
-	parity := bestTone(samples[p:p+bitN], rate, 1100, 1300)
+	parity := headerTone(samples[p:p+bitN], rate, 1100, 1300)
 	if parity != 1100 && parity != 1300 {
 		return 0, false
 	}
@@ -324,7 +322,7 @@ func decodeStandardVISAt(samples []int16, rate, start int) (uint8, bool) {
 		return 0, false
 	}
 	p += bitN
-	if bestTone(samples[p:p+bitN], rate, 1200, 1100) != 1200 {
+	if headerTone(samples[p:p+bitN], rate, 1200, 1100) != 1200 {
 		return 0, false
 	}
 	return code, true

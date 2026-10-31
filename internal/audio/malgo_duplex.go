@@ -10,6 +10,7 @@ import (
 	"math"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/gen2brain/malgo"
@@ -267,6 +268,13 @@ func (m *MalgoDuplex) StopCapture() error {
 // device remains started and emits digital silence between transmissions.
 // Playback is independent of the capture device, enabling software full-duplex.
 func (m *MalgoDuplex) Play(ctx context.Context, samples []float32, sampleRate int) error {
+	return m.PlayWithProgress(ctx, samples, sampleRate, nil)
+}
+
+// PlayWithProgress plays an SSTV waveform and polls the native callback's
+// consumed sample offset from a non-real-time goroutine. The native callback
+// stays lock-bounded and never calls Wails runtime code.
+func (m *MalgoDuplex) PlayWithProgress(ctx context.Context, samples []float32, sampleRate int, onProgress func(float64)) error {
 	if m == nil {
 		return errors.New("audio engine is closed")
 	}
@@ -330,15 +338,33 @@ func (m *MalgoDuplex) Play(ctx context.Context, samples []float32, sampleRate in
 	}
 	m.ctxMu.RUnlock()
 
-	select {
-	case <-job.done:
-		m.playbackMu.Lock()
-		jobErr := job.err
-		m.playbackMu.Unlock()
-		return jobErr
-	case <-ctx.Done():
-		m.finishPlaybackJob(job, ctx.Err())
-		return ctx.Err()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-job.done:
+			m.playbackMu.Lock()
+			jobErr := job.err
+			offset := len(samples)
+			m.playbackMu.Unlock()
+			if onProgress != nil && jobErr == nil {
+				onProgress(1)
+			}
+			_ = offset
+			return jobErr
+		case <-ticker.C:
+			if onProgress != nil {
+				m.playbackMu.Lock()
+				offset, total := job.offset, len(samples)
+				m.playbackMu.Unlock()
+				if total > 0 {
+					onProgress(math.Max(0, math.Min(1, float64(offset)/float64(total))))
+				}
+			}
+		case <-ctx.Done():
+			m.finishPlaybackJob(job, ctx.Err())
+			return ctx.Err()
+		}
 	}
 }
 
