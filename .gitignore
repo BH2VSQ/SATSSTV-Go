@@ -15,7 +15,7 @@ go.work
 go.work.sum
 
 # Build artifacts
-build/
+build/bin
 bin/
 dist/
 

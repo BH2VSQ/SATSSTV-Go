@@ -19,17 +19,14 @@
     </header>
 
     <main id="workbenchPage" class="page active-page">
-    <section class="modebar">
-      <div class="modebar-label"><b>RX MODE</b><small>右键槽位可更换预设</small></div>
-      <div id="modeSlots" class="mode-slots">
-        <button class="mode-slot auto-slot active" id="autoMode">Auto</button>
-      </div>
-      <div class="modebar-meta"><span id="modeInfo">载入模式中…</span><select id="rate" aria-label="音频采样率"><option value="48000">48 kHz</option><option value="44100">44.1 kHz</option><option value="96000">96 kHz</option></select></div>
-    </section>
-
       <div class="workbench-grid">
         <section class="pane rx-pane">
           <div class="pane-heading"><div class="pane-title"><span class="rx-tag">RX</span><strong>接收监视</strong><small id="rxStatus">待机</small></div><div class="pane-tools"><span class="rx-auto-state" id="rxAutoState">Auto · 自动接收</span></div></div>
+          <div class="modebar rx-modebar">
+            <div class="modebar-label"><b>RX MODE</b><small>右键更换槽位</small></div>
+            <div id="modeSlots" class="mode-slots"></div>
+            <div class="modebar-meta"><span id="modeInfo">载入模式中…</span><select id="rate" aria-label="音频采样率"><option value="48000">48 kHz</option><option value="44100">44.1 kHz</option><option value="96000">96 kHz</option></select></div>
+          </div>
           <div class="rx-image-frame" id="rxImageFrame">
             <div class="empty-state"><span class="empty-picture">▧</span><b>等待接收图像</b><small>解码完成的图像会显示在这里</small></div>
           </div>
@@ -41,7 +38,12 @@
         </section>
 
         <section class="pane tx-pane">
-          <div class="pane-heading"><div class="pane-title"><span class="tx-tag">TX</span><strong>发送编辑器</strong><small id="txStatus">草稿</small></div><div class="pane-tools"><label class="tx-mode-control">TX MODE<select id="txModeSelect" aria-label="发射模式"></select></label><button class="small-btn" id="chooseImage">载入图片</button><button class="small-btn" id="encode">生成 WAV</button><button class="small-btn tx-toggle-button" id="txToggle" disabled>开始发射</button></div></div>
+          <div class="pane-heading"><div class="pane-title"><span class="tx-tag">TX</span><strong>发送编辑器</strong><small id="txStatus">草稿</small></div><div class="pane-tools"><button class="small-btn" id="chooseImage">载入图片</button><button class="small-btn" id="encode">生成 WAV</button><button class="small-btn tone-toggle-button" id="toneToggle" disabled>1500 Hz 单音</button><button class="small-btn tx-toggle-button" id="txToggle" disabled>开始发射</button></div></div>
+          <div class="modebar tx-modebar">
+            <div class="modebar-label"><b>TX MODE</b><small>独立发送模式</small></div>
+            <div id="txModeSlots" class="mode-slots"></div>
+            <div class="modebar-meta"><span id="txModeInfo">Robot 36</span></div>
+          </div>
           <div class="tx-progress-wrap" aria-live="polite"><div class="tx-progress-meta"><span id="txProgressLabel">发射就绪</span><b id="txProgressText">0%</b></div><div class="tx-progress-track"><i id="txProgressFill"></i></div></div>
           <div class="tx-editor-grid">
             <div class="tx-preview-column">
@@ -63,6 +65,13 @@
                   <label class="property-field">垂直位置 <output id="yValue">10%</output><input id="posY" type="range" min="0" max="100" value="10"></label>
                 </div>
                 <label class="check-field"><input id="fontBold" type="checkbox"> 粗体</label>
+                <div id="outlineProperties" class="outline-properties">
+                  <label class="check-field"><input id="outlineEnabled" type="checkbox" checked> 显示描边</label>
+                  <div class="property-grid outline-fields">
+                    <label class="property-field">描边宽度 <output id="outlineWidthValue">1.5 px</output><input id="outlineWidth" type="range" min="0.5" max="8" step="0.5" value="1.5"></label>
+                    <label class="property-field">描边颜色<input id="outlineColor" type="color" value="#17212b"></label>
+                  </div>
+                </div>
                 <div id="imageProperties" class="property-grid image-properties" hidden>
                   <label class="property-field">图像宽度 <output id="imageWidthValue">40%</output><input id="imageWidth" type="range" min="5" max="100" value="40"></label>
                   <label class="property-field">图像高度 <output id="imageHeightValue">40%</output><input id="imageHeight" type="range" min="5" max="100" value="40"></label>

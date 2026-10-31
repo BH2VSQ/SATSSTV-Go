@@ -31,6 +31,9 @@ let modes = [];
 let slots = [];
 let activeSlot = 0;
 let autoSelected = true;
+let rxEnabled = true;
+let toneActive = false;
+let peakSpectrum = [];
 let txModeID = 'robot36';
 let selectedImagePath = '';
 let sourceImage = null;
@@ -79,41 +82,66 @@ function loadSlots() {
   } catch { slots = fallback; }
   try {
     const savedRX = JSON.parse(localStorage.getItem(RX_MODE_STORAGE) || 'null');
+    rxEnabled = savedRX?.enabled !== false;
     autoSelected = savedRX?.auto !== false;
     activeSlot = Math.max(0, Math.min(7, Number(savedRX?.slot) || 0));
+    if (!rxEnabled) { autoSelected = false; activeSlot = -1; }
     const savedTX = localStorage.getItem(TX_MODE_STORAGE);
     txModeID = savedTX || 'robot36';
-  } catch { autoSelected = true; activeSlot = 0; txModeID = 'robot36'; }
+  } catch { autoSelected = true; rxEnabled = true; activeSlot = 0; txModeID = 'robot36'; }
 }
-function saveRXModeSelection() { localStorage.setItem(RX_MODE_STORAGE, JSON.stringify({ auto: autoSelected, slot: activeSlot })); }
+function saveRXModeSelection() { localStorage.setItem(RX_MODE_STORAGE, JSON.stringify({ enabled: rxEnabled, auto: autoSelected, slot: activeSlot })); }
 function saveSlots() { localStorage.setItem(SLOT_STORAGE, JSON.stringify(slots)); }
-function currentRXModeID() { return autoSelected ? '' : slots[activeSlot]; }
+function currentRXModeID() { return !rxEnabled || autoSelected ? '' : (slots[activeSlot] || ''); }
+async function applyRXSelection(message) {
+  try {
+    await app().SetRXEnabled(rxEnabled, currentRXModeID());
+    updateAudioState(await app().GetAudioState());
+    setStatus(message);
+  } catch (e) {
+    setStatus(`更新 RX 状态失败：${String(e)}`, true);
+  }
+}
 function renderModeSlots() {
   const host = $('modeSlots'); host.innerHTML = '';
   const auto = document.createElement('button');
-  auto.className = `mode-slot auto-slot${autoSelected ? ' active' : ''}`; auto.textContent = 'Auto';
+  auto.className = `mode-slot auto-slot${rxEnabled && autoSelected ? ' active' : ''}`;
+  auto.textContent = 'Auto';
+  auto.title = rxEnabled && autoSelected ? '再次点击停止 RX' : '启用 Auto 自动识别接收';
   auto.addEventListener('click', async () => {
-    autoSelected = true; saveRXModeSelection();
-    $('rxDetectedMode').textContent = 'Auto'; $('rxAutoState').textContent = 'Auto · 自动判定接收模式';
+    const selectingAuto = !(rxEnabled && autoSelected);
+    rxEnabled = selectingAuto;
+    autoSelected = selectingAuto;
+    activeSlot = -1;
+    saveRXModeSelection();
     renderModeSlots();
-    try { await app().InitializeAudio(''); updateAudioState(await app().GetAudioState()); setStatus('RX 已切换为 Auto 自动判定模式'); }
-    catch (e) { setStatus(`切换 RX 自动模式失败：${String(e)}`, true); }
+    updateModeInfo();
+    await applyRXSelection(selectingAuto ? 'RX 已启用 Auto 自动识别' : 'RX 已停止');
   });
   host.appendChild(auto);
   slots.forEach((id, i) => {
-    const b = document.createElement('button');
-    b.className = `mode-slot${!autoSelected && activeSlot === i ? ' active' : ''}`;
-    b.textContent = niceMode(id).replace('Wraase ', '').replace('Scottie ', 'Scottie');
-    b.title = `槽位 ${i + 1}：${niceMode(id)}，右键更改`;
-    b.addEventListener('click', async () => {
-      activeSlot = i; autoSelected = false; saveRXModeSelection();
-      $('rxAutoState').textContent = `${niceMode(id)} · 指定模式接收`;
-      renderModeSlots(); updateModeInfo();
-      try { await app().InitializeAudio(id); updateAudioState(await app().GetAudioState()); setStatus(`RX 已切换为 ${niceMode(id)} 指定接收`); }
-      catch (e) { setStatus(`设置 RX 模式失败：${String(e)}`, true); }
+    const selected = rxEnabled && !autoSelected && activeSlot === i;
+    const button = document.createElement('button');
+    button.className = `mode-slot${selected ? ' active' : ''}`;
+    button.textContent = niceMode(id).replace('Wraase ', '').replace('Scottie ', 'Scottie');
+    button.title = selected ? `槽位 ${i + 1}：再次点击停止 RX，右键更换模式` : `槽位 ${i + 1}：${niceMode(id)}，右键更换`;
+    button.addEventListener('click', async () => {
+      if (selected) {
+        rxEnabled = false;
+        autoSelected = false;
+        activeSlot = -1;
+      } else {
+        rxEnabled = true;
+        autoSelected = false;
+        activeSlot = i;
+      }
+      saveRXModeSelection();
+      renderModeSlots();
+      updateModeInfo();
+      await applyRXSelection(rxEnabled ? `RX 已切换为 ${niceMode(id)} 指定接收` : 'RX 已停止');
     });
-    b.addEventListener('contextmenu', (e) => { e.preventDefault(); openModeMenu(e.clientX, e.clientY, i); });
-    host.appendChild(b);
+    button.addEventListener('contextmenu', (e) => { e.preventDefault(); openModeMenu(e.clientX, e.clientY, i); });
+    host.appendChild(button);
   });
   updateModeInfo();
 }
@@ -126,10 +154,8 @@ function openModeMenu(x, y, slotIndex) {
     item.textContent = `${m.name}${m.ready ? '' : ' · 尚未完成编解码'}`;
     item.disabled = false;
     item.addEventListener('click', async () => {
-      slots[slotIndex] = m.id; saveSlots(); activeSlot = slotIndex; autoSelected = false; saveRXModeSelection(); hideContextMenu(); renderModeSlots();
-      $('rxAutoState').textContent = `${m.name} · 指定模式接收`;
-      try { await app().InitializeAudio(m.id); updateAudioState(await app().GetAudioState()); setStatus(`RX 槽位 ${slotIndex + 1} 已设为 ${m.name}`); }
-      catch (e) { setStatus(`设置 RX 模式失败：${String(e)}`, true); }
+      slots[slotIndex] = m.id; saveSlots(); activeSlot = slotIndex; autoSelected = false; rxEnabled = true; saveRXModeSelection(); hideContextMenu(); renderModeSlots(); updateModeInfo();
+      await applyRXSelection(`RX 槽位 ${slotIndex + 1} 已设为 ${m.name}`);
     });
     menu.appendChild(item);
   });
@@ -144,29 +170,57 @@ function showContextMenu(x, y) {
 function hideContextMenu() { $('contextMenu').hidden = true; contextTarget = null; }
 function updateModeInfo() {
   const mode = activeRXMode();
-  $('modeInfo').textContent = autoSelected ? 'Auto · 自动识别所有支持模式' : `${mode?.name || '未选择'} · 指定模式接收`;
-  $('rxDetectedMode').textContent = autoSelected ? 'Auto' : (mode?.name || '---');
-  $('rxAutoState').textContent = autoSelected ? 'Auto · 自动接收' : `${mode?.name || ''} · 指定模式接收`;
+  if (!rxEnabled) {
+    $('modeInfo').textContent = 'RX 已停止';
+    $('rxDetectedMode').textContent = '---';
+    $('rxAutoState').textContent = 'RX 已停止';
+  } else if (autoSelected) {
+    $('modeInfo').textContent = 'Auto · 自动识别所有支持模式';
+    $('rxDetectedMode').textContent = 'Auto';
+    $('rxAutoState').textContent = 'Auto · 自动接收';
+  } else {
+    $('modeInfo').textContent = `${mode?.name || '未选择'} · 指定模式接收`;
+    $('rxDetectedMode').textContent = mode?.name || '---';
+    $('rxAutoState').textContent = `${mode?.name || ''} · 指定模式接收`;
+  }
   renderCanvas();
 }
 function renderTXModeOptions() {
-  const select = $('txModeSelect');
-  const previous = modes.some(m => m.id === txModeID) ? txModeID : 'robot36';
-  select.innerHTML = '';
+  const host = $('txModeSlots');
+  host.innerHTML = '';
+  txModeID = modes.some(m => m.id === txModeID && m.ready) ? txModeID : 'robot36';
   modes.forEach((mode) => {
-    const option = document.createElement('option');
-    option.value = mode.id; option.textContent = `${mode.name}${mode.ready ? '' : ' · 编解码未完成'}`;
-    option.disabled = !mode.ready;
-    select.appendChild(option);
+    const button = document.createElement('button');
+    button.className = `mode-slot${mode.id === txModeID ? ' active' : ''}`;
+    button.textContent = mode.name.replace('Wraase ', '').replace('Scottie ', 'Scottie');
+    button.title = `${mode.name}${mode.ready ? '' : ' · 编码器尚未实现'}`;
+    button.disabled = !mode.ready;
+    button.addEventListener('click', () => {
+      if (!mode.ready || mode.id === txModeID) return;
+      txModeID = mode.id;
+      localStorage.setItem(TX_MODE_STORAGE, txModeID);
+      renderTXModeOptions();
+      renderCanvas();
+      setStatus(`TX 模式已设为 ${mode.name}`);
+    });
+    host.appendChild(button);
   });
-  txModeID = modes.some(m => m.id === previous && m.ready) ? previous : 'robot36';
-  select.value = txModeID;
-  select.addEventListener('change', () => {
-    txModeID = select.value; localStorage.setItem(TX_MODE_STORAGE, txModeID);
-    $('encode').disabled = !activeTXMode()?.ready;
-    renderCanvas();
-    setStatus(`TX 模式已设为 ${activeTXMode()?.name || txModeID}`);
-  });
+  $('txModeInfo').textContent = activeTXMode()?.name || txModeID;
+  $('encode').disabled = !activeTXMode()?.ready;
+}
+function withOutlineDefaults(component) {
+  const width = Number(component?.outlineWidth);
+  const color = /^#[0-9a-f]{6}$/i.test(String(component?.outlineColor || '')) ? component.outlineColor : '#17212b';
+  return {
+    ...component,
+    outlineEnabled: component?.outlineEnabled !== false,
+    outlineWidth: Number.isFinite(width) ? Math.max(0.5, Math.min(8, width)) : 1.5,
+    outlineColor: color,
+  };
+}
+function componentOutline(component) {
+  const normalized = withOutlineDefaults(component || {});
+  return { enabled: normalized.outlineEnabled, width: normalized.outlineWidth, color: normalized.outlineColor };
 }
 function drawCover(ctx, img, width, height) {
   const scale = Math.max(width / img.width, height / img.height);
@@ -230,6 +284,7 @@ function renderToCanvas(canvas, selectionOutline = false) {
   }
   components.forEach((c, idx) => {
     const b = componentBounds(ctx, c, width, height);
+    const outline = componentOutline(c);
     if (isImageComponent(c)) {
       const img = getTemplateImage(c);
       if (img?.complete && img.naturalWidth) {
@@ -240,9 +295,25 @@ function renderToCanvas(canvas, selectionOutline = false) {
       } else if (c.type === 'last_rx') {
         drawLastRXPlaceholder(ctx, b);
       }
+      if (outline.enabled) {
+        ctx.save();
+        ctx.strokeStyle = outline.color;
+        ctx.lineWidth = outline.width;
+        ctx.strokeRect(b.x + outline.width / 2, b.y + outline.width / 2,
+          Math.max(0, b.width - outline.width), Math.max(0, b.height - outline.width));
+        ctx.restore();
+      }
     } else {
       ctx.font = `${c.bold ? '700' : '400'} ${c.fontSize || 18}px "Segoe UI", "Microsoft YaHei", sans-serif`;
       ctx.textBaseline = 'top'; ctx.textAlign = 'left'; ctx.fillStyle = c.color || '#ffffff';
+      if (outline.enabled) {
+        ctx.save();
+        ctx.strokeStyle = outline.color;
+        ctx.lineWidth = outline.width;
+        ctx.lineJoin = 'round';
+        b.lines.forEach((line, lineNo) => ctx.strokeText(line, b.x, b.y + lineNo * b.lineHeight));
+        ctx.restore();
+      }
       b.lines.forEach((line, lineNo) => ctx.fillText(line, b.x, b.y + lineNo * b.lineHeight));
     }
     if (selectionOutline && idx === selectedComponent) {
@@ -288,7 +359,14 @@ function updateComponentProperties() {
   $('imageProperties').hidden = !isImage;
   $('componentText').parentElement.hidden = !c || isImage;
   $('fontBold').parentElement.hidden = !c || isImage;
+  $('outlineProperties').hidden = !c;
+  ['outlineEnabled', 'outlineWidth', 'outlineColor'].forEach(id => { $(id).disabled = !c; });
   if (!c) return;
+  const outline = componentOutline(c);
+  $('outlineEnabled').checked = outline.enabled;
+  $('outlineWidth').value = String(outline.width);
+  $('outlineWidthValue').textContent = `${outline.width.toFixed(1)} px`;
+  $('outlineColor').value = outline.color;
   $('posX').value = c.x; $('xValue').textContent = `${Math.round(c.x)}%`;
   $('posY').value = c.y; $('yValue').textContent = `${Math.round(c.y)}%`;
   if (isImage) {
@@ -312,18 +390,22 @@ function updateSelectedComponent() {
     c.text = $('componentText').value; c.fontSize = Number($('fontSize').value); c.color = $('fontColor').value; c.bold = $('fontBold').checked;
     $('fontSizeValue').textContent = `${c.fontSize} px`;
   }
+  c.outlineEnabled = $('outlineEnabled').checked;
+  c.outlineWidth = Number($('outlineWidth').value);
+  c.outlineColor = $('outlineColor').value;
+  $('outlineWidthValue').textContent = `${c.outlineWidth.toFixed(1)} px`;
   $('xValue').textContent = `${c.x}%`; $('yValue').textContent = `${c.y}%`;
   renderComponentList(); renderCanvas();
 }
 function addTextComponent() {
-  components.push({ type: 'text', text: '自定义文字', x: 8, y: 15 + (components.length * 8 % 65), fontSize: 18, color: '#ffffff', bold: true });
+  components.push(withOutlineDefaults({ type: 'text', text: '自定义文字', x: 8, y: 15 + (components.length * 8 % 65), fontSize: 18, color: '#ffffff', bold: true }));
   selectComponent(components.length - 1);
 }
 async function addImageComponent(dataURL, imageName = '模板图像') {
   if (!dataURL) return;
   const image = new Image();
   image.onload = () => {
-    components.push({ type: 'image', imageData: dataURL, imageName, x: 8, y: 18, width: 42, height: 42 });
+    components.push(withOutlineDefaults({ type: 'image', imageData: dataURL, imageName, x: 8, y: 18, width: 42, height: 42 }));
     templateImageCache.set(dataURL, image);
     selectComponent(components.length - 1);
   };
@@ -338,7 +420,7 @@ async function chooseTemplateImage() {
   } catch (e) { setStatus(`添加模板图像失败：${String(e)}`, true); }
 }
 function addLatestRXImage() {
-  components.push({ type: 'last_rx', imageName: '上一次 RX 图像', x: 8, y: 18, width: 42, height: 42 });
+  components.push(withOutlineDefaults({ type: 'last_rx', imageName: '上一次 RX 图像', x: 8, y: 18, width: 42, height: 42 }));
   selectComponent(components.length - 1);
   setStatus(latestRXImageData ? '已添加上一次 RX 图像组件' : '已添加上一次 RX 图像占位组件，收到首张图像后会自动填入');
 }
@@ -358,7 +440,7 @@ function deleteSelectedComponent() {
   renderComponentList(); renderCanvas();
 }
 
-function templateData(template) { return (template.objects || []).map((o) => ({ ...o })); }
+function templateData(template) { return (template.objects || []).map((o) => withOutlineDefaults(o)); }
 function loadTemplateAt(index) {
   selectedTemplateSlot = Math.max(0, Math.min(3, index));
   const template = templateSlots[selectedTemplateSlot];
@@ -405,7 +487,7 @@ function findComponentAt(x, y) {
   const c = $('txCanvas'), ctx = c.getContext('2d');
   for (let i = components.length - 1; i >= 0; i--) {
     const b = componentBounds(ctx, components[i], c.width, c.height);
-    if (x >= b.x - 3 && x <= b.x + b.width + 4 && y >= b.y - 3 && y <= b.y + b.height + 4) return i;
+    if (x >= b.x - 10 && x <= b.x + b.width + 10 && y >= b.y - 10 && y <= b.y + b.height + 10) return i;
   }
   return -1;
 }
@@ -433,41 +515,49 @@ function setupCanvasDrag() {
 }
 
 function spectrumColor(value) {
-  const v = Math.max(0, Math.min(1, Number(value) || 0));
-  const hue = 215 - 185 * v;
-  const light = 7 + 62 * Math.pow(v, .72);
-  return `hsl(${hue} 88% ${light}%)`;
+  const strength = Math.max(0, Math.min(1, (Number(value) - 0.16) / 0.84));
+  const gray = Math.round(255 * (1 - Math.pow(strength, 0.82)));
+  return `rgb(${gray},${gray},${gray})`;
 }
-
 function drawIdleSpectrum() {
   const canvas = $('spectrum'), ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
-  const plotH = Math.round(h * .43), waterfallY = plotH + 1, waterfallH = h - waterfallY;
-  ctx.fillStyle = '#111922'; ctx.fillRect(0, 0, w, h);
+  const plotH = Math.round(h * 0.58);
+  const waterfallY = plotH + 2;
+  const waterfallH = h - waterfallY;
 
-  // Upper pane: live magnitude trace and MMSSTV frequency references.
-  ctx.fillStyle = '#131d27'; ctx.fillRect(0, 0, w, plotH);
-  ctx.strokeStyle = 'rgba(139,164,190,.16)'; ctx.lineWidth = 1;
-  for (let x = 0; x <= w; x += w / 12) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, plotH); ctx.stroke(); }
-  for (let y = 18; y <= plotH; y += Math.max(1, (plotH - 18) / 4)) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
-
-  const markers = [
-    { frequency: 1200, label: '1200', color: '#75c69a' },
-    { frequency: 1500, label: '1500', color: '#e5d36c' },
-    { frequency: 1900, label: '1900', color: '#f2b45c' },
-    { frequency: 2300, label: '2300', color: '#e5d36c' },
-  ];
-  ctx.font = '11px Segoe UI, sans-serif'; ctx.textBaseline = 'top'; ctx.textAlign = 'center';
-  for (const marker of markers) {
-    const x = (marker.frequency - 900) / 1900 * w;
-    ctx.strokeStyle = marker.color; ctx.globalAlpha = .68; ctx.setLineDash(marker.frequency === 1900 ? [5, 4] : []);
-    ctx.beginPath(); ctx.moveTo(x, 15); ctx.lineTo(x, plotH); ctx.stroke();
-    ctx.setLineDash([]); ctx.globalAlpha = 1; ctx.fillStyle = marker.color; ctx.fillText(marker.label, x, 2);
+  // MMSSTV-inspired orange spectrum pane and high-contrast monochrome waterfall.
+  ctx.fillStyle = '#ff813f';
+  ctx.fillRect(0, 0, w, plotH);
+  ctx.strokeStyle = 'rgba(117,59,21,.18)';
+  ctx.lineWidth = 1;
+  for (let x = 0; x <= w; x += w / 12) {
+    ctx.beginPath(); ctx.moveTo(x, 18); ctx.lineTo(x, plotH); ctx.stroke();
   }
-  ctx.textAlign = 'left'; ctx.fillStyle = 'rgba(200,213,224,.58)'; ctx.font = '9px Segoe UI, sans-serif';
-  ctx.fillText('900 Hz', 4, plotH - 12); ctx.textAlign = 'right'; ctx.fillText('2800 Hz', w - 4, plotH - 12);
+  for (let y = 28; y < plotH; y += (plotH - 28) / 4) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  const markers = [
+    { frequency: 1200, label: '1200' },
+    { frequency: 1500, label: '1500' },
+    { frequency: 1900, label: '1900' },
+    { frequency: 2300, label: '2300' },
+  ];
+  ctx.font = '12px Segoe UI, sans-serif';
+  ctx.textBaseline = 'top';
+  ctx.textAlign = 'center';
+  markers.forEach(marker => {
+    const x = (marker.frequency - 900) / 1900 * w;
+    ctx.strokeStyle = 'rgba(255,238,65,.9)';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(x, 18); ctx.lineTo(x, plotH); ctx.stroke();
+    ctx.fillStyle = '#27313b';
+    ctx.fillText(marker.label, x, 1);
+  });
+  ctx.strokeStyle = '#36414a';
+  ctx.beginPath(); ctx.moveTo(0, plotH - 1); ctx.lineTo(w, plotH - 1); ctx.stroke();
 
-  // Lower pane: scrolling waterfall. Newest row is drawn at the bottom.
-  ctx.fillStyle = '#0d141c'; ctx.fillRect(0, waterfallY, w, waterfallH);
+  ctx.fillStyle = '#f7f7f4';
+  ctx.fillRect(0, waterfallY, w, waterfallH);
   const rows = waterfallHistory.slice(-MAX_WATERFALL_ROWS);
   if (rows.length) {
     const rowH = waterfallH / MAX_WATERFALL_ROWS;
@@ -480,30 +570,42 @@ function drawIdleSpectrum() {
       });
     });
   }
-  ctx.strokeStyle = 'rgba(139,164,190,.18)'; ctx.beginPath(); ctx.moveTo(0, waterfallY); ctx.lineTo(w, waterfallY); ctx.stroke();
+  ctx.strokeStyle = '#65717b';
+  ctx.beginPath(); ctx.moveTo(0, waterfallY); ctx.lineTo(w, waterfallY); ctx.stroke();
 }
-
 function renderLiveSpectrum(values) {
   const canvas = $('spectrum'), ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
   if (!Array.isArray(values) || !values.length) { drawIdleSpectrum(); return; }
   const normalized = values.map(v => Math.max(0, Math.min(1, Number(v) || 0)));
   waterfallHistory.push(normalized);
   if (waterfallHistory.length > MAX_WATERFALL_ROWS) waterfallHistory.shift();
+  if (peakSpectrum.length !== normalized.length) peakSpectrum = normalized.slice();
+  else peakSpectrum = normalized.map((value, index) => Math.max(value, peakSpectrum[index] * 0.965));
+
   drawIdleSpectrum();
-  const plotH = Math.round(h * .43);
-  const points = normalized.map((v, i) => [i * w / Math.max(1, normalized.length - 1), plotH - 14 - v * (plotH - 25)]);
+  const plotH = Math.round(h * 0.58);
+  const pointsFor = spectrum => spectrum.map((value, index) => [
+    index * w / Math.max(1, spectrum.length - 1),
+    plotH - 9 - value * (plotH - 34),
+  ]);
+  const peaks = pointsFor(peakSpectrum);
+  ctx.beginPath(); ctx.moveTo(peaks[0][0], peaks[0][1]);
+  for (let i = 1; i < peaks.length; i++) ctx.lineTo(peaks[i][0], peaks[i][1]);
+  ctx.lineWidth = 1.3; ctx.strokeStyle = '#ffe64a'; ctx.stroke();
+
+  const points = pointsFor(normalized);
   ctx.beginPath(); ctx.moveTo(points[0][0], points[0][1]);
   for (let i = 1; i < points.length; i++) ctx.lineTo(points[i][0], points[i][1]);
-  ctx.lineWidth = 2; ctx.strokeStyle = '#5bcefa'; ctx.shadowColor = '#5bcefa'; ctx.shadowBlur = 4; ctx.stroke(); ctx.shadowBlur = 0;
-  ctx.fillStyle = 'rgba(91,206,250,.12)'; ctx.lineTo(w, plotH); ctx.lineTo(0, plotH); ctx.closePath(); ctx.fill();
+  ctx.lineWidth = 2.2; ctx.strokeStyle = '#063cff';
+  ctx.shadowColor = '#063cff'; ctx.shadowBlur = 1.5; ctx.stroke(); ctx.shadowBlur = 0;
 }
-
 function updateAudioState(state) {
   const wasRXActive = !!audioState.rxActive;
   audioState = { ...audioState, ...(state || {}) };
   if (audioState.rxActive && !wasRXActive) {
     captureTelemetrySeen = false;
     waterfallHistory = [];
+    peakSpectrum = [];
     drawIdleSpectrum();
   }
   if (!audioState.rxActive) captureTelemetrySeen = false;
@@ -514,16 +616,19 @@ function updateAudioState(state) {
   $('rate').disabled = false;
   ['audioInput','audioOutput','pttMode','rigctlAddress','serialPort','pttActiveHigh','pttLead','pttTail'].forEach(id => { if ($(id)) $(id).disabled = false; });
   const txButton = $('txToggle');
-  txButton.disabled = !connected || (!audioState.txActive && !activeTXMode()?.ready);
-  txButton.textContent = audioState.txActive ? '停止发射' : '开始发射';
-  txButton.classList.toggle('tx-running', !!audioState.txActive);
+  txButton.disabled = !connected || toneActive || (!audioState.txActive && !activeTXMode()?.ready);
+  txButton.textContent = audioState.txActive && !toneActive ? '停止发射' : '开始发射';
+  txButton.classList.toggle('tx-running', !!audioState.txActive && !toneActive);
+  const toneButton = $('toneToggle');
+  toneButton.disabled = !connected || (audioState.txActive && !toneActive);
+  toneButton.textContent = toneActive ? '停止单音' : '1500 Hz 单音';
   $('audioSettingsStatus').textContent = connected ? `共享模式音频已就绪，${audioState.rxActive ? 'RX 持续接收中' : 'RX 正在恢复'}${audioState.txActive ? '，TX 运行中' : ''}` : '音频设备待初始化，工作台会自动启动 RX';
   $('spectrumState').textContent = !audioState.rxActive ? 'INPUT IDLE' : (captureTelemetrySeen ? 'INPUT ACTIVE · SHARED' : 'WAITING FOR INPUT');
   $('spectrumOverlay').textContent = !audioState.rxActive ? 'RX 尚未启动' : (captureTelemetrySeen ? '' : 'RX 已启动，正在等待音频设备输入采样…');
   $('spectrumOverlay').style.display = audioState.rxActive && captureTelemetrySeen ? 'none' : 'grid';
-  $('rxHint').textContent = !audioState.rxActive ? 'RX 音频流正在自动初始化…' : (captureTelemetrySeen ? '实时音频采集中' : 'RX 已启动，等待输入采样');
-  $('rxStatus').textContent = audioState.rxActive ? '自动接收中' : '初始化中';
-  $('txStatus').textContent = audioState.txActive ? '正在发射' : '草稿';
+  $('rxHint').textContent = !audioState.rxActive ? (rxEnabled ? 'RX 音频流正在初始化…' : 'RX 已停止') : (captureTelemetrySeen ? '实时音频采集中' : 'RX 已启动，等待输入采样');
+  $('rxStatus').textContent = audioState.rxActive ? (autoSelected ? 'Auto 自动接收中' : '指定模式接收中') : (rxEnabled ? '初始化中' : 'RX 已停止');
+  $('txStatus').textContent = audioState.txActive ? (toneActive ? '1500 Hz 单音发射' : '正在发射') : '草稿';
 }
 function bindRuntimeEvents() {
   if (!window.runtime?.EventsOn) return;
@@ -598,6 +703,10 @@ function bindRuntimeEvents() {
     $('txProgressLabel').textContent = data.message || data.state;
     if (data.state === 'completed') { $('txProgressFill').style.width = '100%'; $('txProgressText').textContent = '100%'; }
     if (data.state === 'stopped' || data.state === 'error') $('txProgressLabel').textContent = data.message || data.state;
+    if (['completed', 'stopped', 'error'].includes(data.state)) {
+      toneActive = false;
+      updateAudioState(audioState);
+    }
     setStatus(data.message || data.state, data.state === 'error');
   });
   window.runtime.EventsOn('tx:progress', (data) => {
@@ -623,6 +732,27 @@ async function startTX() {
     updateAudioState({ ...audioState, txActive: true });
     setStatus(`正在准备发送 ${mode.name}…`);
   } catch (e) { setStatus(`启动 TX 失败：${String(e)}`, true); }
+}
+async function toggleTone() {
+  if (toneActive) {
+    try { await app().StopTX(); setStatus('已请求停止 1500 Hz 单音'); }
+    catch (e) { setStatus(`停止单音失败：${String(e)}`, true); }
+    return;
+  }
+  if (audioState.txActive) {
+    setStatus('当前已有 SSTV 发射任务正在运行', true);
+    return;
+  }
+  toneActive = true;
+  updateAudioState(audioState);
+  try {
+    await app().StartTone(Number($('rate').value));
+    setStatus('正在发送 1500 Hz 单音，最长 10 秒');
+  } catch (e) {
+    toneActive = false;
+    updateAudioState(audioState);
+    setStatus(`启动 1500 Hz 单音失败：${String(e)}`, true);
+  }
 }
 async function stopTX() {
   try { await app().StopTX(); setStatus('已请求停止 TX'); }
@@ -817,9 +947,9 @@ function setupSettings() {
 async function initializeAudioRX() {
   try {
     $('rxStatus').textContent = '正在初始化'; $('spectrumOverlay').textContent = '正在打开共享模式音频输入设备…';
-    await app().InitializeAudio(currentRXModeID());
+    await app().SetRXEnabled(rxEnabled, currentRXModeID());
     updateAudioState(await app().GetAudioState());
-    setStatus(autoSelected ? 'RX 已自动启动，正在自动识别 SSTV 模式' : `RX 已自动启动，指定模式：${activeRXMode()?.name || ''}`);
+    setStatus(!rxEnabled ? '音频设备已就绪，RX 当前已停止' : (autoSelected ? 'RX 已启动，正在自动识别 SSTV 模式' : `RX 已启动，指定模式：${activeRXMode()?.name || ''}`));
   } catch (e) {
     $('rxStatus').textContent = '音频初始化失败'; $('rxHint').textContent = String(e); $('spectrumOverlay').textContent = `音频初始化失败：${String(e)}。请检查设备设置。`;
     setStatus(`自动启动 RX 失败：${String(e)}`, true);
@@ -832,13 +962,14 @@ $('chooseImage').addEventListener('click', chooseImage);
 $('clearBackground').addEventListener('click', clearBackground);
 $('encode').addEventListener('click', encodeWAV);
 $('txToggle').addEventListener('click', toggleTX);
+$('toneToggle').addEventListener('click', toggleTone);
 $('addText').addEventListener('click', addTextComponent);
 $('addImage').addEventListener('click', chooseTemplateImage);
 $('addLastRX').addEventListener('click', addLatestRXImage);
 $('deleteText').addEventListener('click', deleteSelectedComponent);
 $('saveTemplate').addEventListener('click', saveCurrentTemplate);
 $('componentText').addEventListener('input', updateSelectedComponent);
-['fontSize', 'fontColor', 'posX', 'posY', 'fontBold', 'imageWidth', 'imageHeight'].forEach(id => $(id).addEventListener('input', updateSelectedComponent));
+['fontSize', 'fontColor', 'posX', 'posY', 'fontBold', 'imageWidth', 'imageHeight', 'outlineEnabled', 'outlineWidth', 'outlineColor'].forEach(id => $(id).addEventListener('input', updateSelectedComponent));
 VALUE_IDS.forEach(id => $(id).addEventListener('input', () => {
   if (id === 'myCall' || id === 'locator') syncStationSettingsForm();
   renderCanvas();
@@ -862,7 +993,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (!modes.some(m => m.id === txModeID && m.ready)) txModeID = 'robot36';
     renderModeSlots();
     renderTXModeOptions();
-    $('modeInfo').textContent = `${modes.length} 种 RX 模式`;
+    $('modeInfo').textContent = rxEnabled ? `${modes.length} 种 RX 模式` : 'RX 已停止';
   } catch (e) {
     $('modeInfo').textContent = `模式读取失败：${String(e)}`;
   }

@@ -82,8 +82,16 @@ export function SelectImage() {
   return window['go']['main']['App']['SelectImage']();
 }
 
+export function SetRXEnabled(arg1, arg2) {
+  return window['go']['main']['App']['SetRXEnabled'](arg1, arg2);
+}
+
 export function StartTX(arg1, arg2, arg3) {
   return window['go']['main']['App']['StartTX'](arg1, arg2, arg3);
+}
+
+export function StartTone(arg1) {
+  return window['go']['main']['App']['StartTone'](arg1);
 }
 
 export function StopTX() {

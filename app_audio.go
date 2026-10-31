@@ -201,11 +201,29 @@ func (a *App) InitializeAudio(rxModeID string) error {
 	return a.startRX(rxModeID)
 }
 
+// SetRXEnabled controls RX capture independently from the shared audio
+// session. The session remains available for TX when reception is disabled.
+func (a *App) SetRXEnabled(enabled bool, rxModeID string) error {
+	if enabled {
+		return a.InitializeAudio(rxModeID)
+	}
+	a.audioMu.Lock()
+	connected := a.audioSession != nil
+	a.audioMu.Unlock()
+	if !connected {
+		if err := a.connectAudio(); err != nil {
+			return err
+		}
+	}
+	return a.stopRX()
+}
+
 // ApplyAudioSettings saves updated device/PTT preferences, recreates the
 // streams, and immediately resumes RX with the currently selected RX mode.
 func (a *App) ApplyAudioSettings(input AudioSettings, rxModeID string) error {
 	a.audioMu.Lock()
 	txActive := a.txCancel != nil
+	wasRXActive := a.rxCancel != nil
 	a.audioMu.Unlock()
 	if txActive {
 		return errors.New("正在发射，结束 TX 后才能应用音频设置")
@@ -221,6 +239,9 @@ func (a *App) ApplyAudioSettings(input AudioSettings, rxModeID string) error {
 	}
 	if err := a.connectAudio(); err != nil {
 		return err
+	}
+	if !wasRXActive {
+		return nil
 	}
 	return a.startRX(rxModeID)
 }
@@ -333,9 +354,9 @@ func (a *App) startRX(modeID string) error {
 		baseCtx = context.Background()
 	}
 	rxCtx, cancel := context.WithCancel(baseCtx)
-	// Hold several minutes of mono audio so long-frame DSP work cannot
-	// immediately overflow the handoff queue at common device block sizes.
-	queue := make(chan []float32, 16_384)
+	// Keep a short rolling window. If DSP falls behind, the capture callback
+	// below drops the oldest block so the worker stays close to live audio.
+	queue := make(chan []float32, 8)
 	var dropped atomic.Uint64
 
 	a.rxDecoderMu.Lock()
@@ -357,7 +378,17 @@ func (a *App) startRX(modeID string) error {
 		select {
 		case queue <- block:
 		default:
-			dropped.Add(1)
+			// Replace stale audio rather than accumulating seconds of latency.
+			select {
+			case <-queue:
+				dropped.Add(1)
+			default:
+			}
+			select {
+			case queue <- block:
+			default:
+				dropped.Add(1)
+			}
 		}
 	}); err != nil {
 		cancel()
@@ -410,6 +441,7 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 	var receivedSamples uint64
 	lastProgress := time.Time{}
 	lastCaptureError := ""
+	spectrumWindow := make([]float32, 0, 2048)
 	for {
 		select {
 		case <-ctx.Done():
@@ -420,9 +452,13 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 			}
 			receivedSamples += uint64(len(block))
 			pcm := audio.Float32ToPCM16(block)
+			spectrumWindow = append(spectrumWindow, block...)
+			if len(spectrumWindow) > 2048 {
+				spectrumWindow = append(spectrumWindow[:0], spectrumWindow[len(spectrumWindow)-2048:]...)
+			}
 			if time.Since(lastTelemetry) >= 80*time.Millisecond {
 				level := rmsDBFS(block)
-				spectrum := makeSpectrum(block, sampleRate)
+				spectrum := makeSpectrum(spectrumWindow, sampleRate)
 				droppedBlocks := dropped.Load()
 				if diagnostics, ok := session.(captureDiagnostics); ok {
 					droppedBlocks += diagnostics.DroppedCaptureBlocks()
@@ -515,32 +551,77 @@ func rmsDBFS(samples []float32) float64 {
 // makeSpectrum returns a compact logarithmic-independent FFT-like magnitude
 // trace over 900..2800 Hz. A Hann-windowed direct DFT is used for the small UI
 // telemetry window to avoid introducing another DSP dependency.
+// makeSpectrum computes a Hann-windowed FFT trace over 900..2800 Hz.
+// Magnitudes are normalized in dBFS so weak SSTV tones remain visible while
+// the waterfall keeps a useful noise floor.
 func makeSpectrum(samples []float32, sampleRate int) []float64 {
 	const bins = 72
-	const size = 512
+	const fftSize = 2048
+	const floorDBFS = -90.0
+	const ceilingDBFS = 0.0
 	out := make([]float64, bins)
 	if len(samples) < 16 || sampleRate <= 0 {
 		return out
 	}
-	start := max(0, len(samples)-size)
-	window := samples[start:]
+	count := min(len(samples), fftSize)
+	start := len(samples) - count
+	window := make([]complex128, fftSize)
+	var windowSum float64
+	for i := 0; i < count; i++ {
+		weight := 0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(max(1, count-1)))
+		windowSum += weight
+		window[i] = complex(float64(samples[start+i])*weight, 0)
+	}
+	if windowSum <= 0 {
+		return out
+	}
+	fftInPlace(window)
 	for bin := 0; bin < bins; bin++ {
-		freq := 900.0 + float64(bin)*(1900.0/float64(bins-1))
-		omega := 2 * math.Pi * freq / float64(sampleRate)
-		var re, im float64
-		for i, sample := range window {
-			w := 0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(max(1, len(window)-1)))
-			angle := omega * float64(i)
-			v := float64(sample) * w
-			re += v * math.Cos(angle)
-			im -= v * math.Sin(angle)
+		frequency := 900.0 + float64(bin)*(1900.0/float64(bins-1))
+		index := int(math.Round(frequency * float64(fftSize) / float64(sampleRate)))
+		if index < 1 || index >= fftSize/2 {
+			continue
 		}
-		magnitude := math.Hypot(re, im) / float64(len(window))
-		out[bin] = math.Max(0, math.Min(1, magnitude*5))
+		amplitude := 2 * math.Hypot(real(window[index]), imag(window[index])) / windowSum
+		dbfs := 20 * math.Log10(math.Max(1e-8, amplitude))
+		out[bin] = math.Max(0, math.Min(1, (dbfs-floorDBFS)/(ceilingDBFS-floorDBFS)))
 	}
 	return out
 }
 
+func fftInPlace(values []complex128) {
+	n := len(values)
+	if n < 2 || n&(n-1) != 0 {
+		return
+	}
+	j := 0
+	for i := 1; i < n; i++ {
+		bit := n >> 1
+		for j&bit != 0 {
+			j ^= bit
+			bit >>= 1
+		}
+		j ^= bit
+		if i < j {
+			values[i], values[j] = values[j], values[i]
+		}
+	}
+	for size := 2; size <= n; size <<= 1 {
+		angle := -2 * math.Pi / float64(size)
+		step := complex(math.Cos(angle), math.Sin(angle))
+		half := size >> 1
+		for offset := 0; offset < n; offset += size {
+			factor := complex(1.0, 0.0)
+			for i := 0; i < half; i++ {
+				even := values[offset+i]
+				odd := values[offset+i+half] * factor
+				values[offset+i] = even + odd
+				values[offset+i+half] = even - odd
+				factor *= step
+			}
+		}
+	}
+}
 func (a *App) StartTX(dataURL, modeID string, sampleRate int) error {
 	img, err := decodeDataURL(dataURL)
 	if err != nil {
@@ -642,6 +723,72 @@ func (a *App) StartTX(dataURL, modeID string, sampleRate int) error {
 			runtime.EventsEmit(a.ctx, "tx:complete", map[string]any{"message": msg, "albumEntry": entry, "albumSaved": saveErr == nil})
 		}
 		a.emitTXState("completed", msg)
+	}()
+	return nil
+}
+
+// StartTone transmits a 1500 Hz calibration tone for ten seconds. It uses
+// the normal PTT lifecycle and can be cancelled through StopTX.
+func (a *App) StartTone(sampleRate int) error {
+	a.txOpMu.Lock()
+	a.audioMu.Lock()
+	session := a.audioSession
+	if session == nil {
+		a.audioMu.Unlock()
+		a.txOpMu.Unlock()
+		return errors.New("TX 音频输出尚未初始化，请检查所选输出设备")
+	}
+	if a.txCancel != nil {
+		a.audioMu.Unlock()
+		a.txOpMu.Unlock()
+		return errors.New("已有 TX 操作正在运行")
+	}
+	if sampleRate != a.audioConfig.SampleRate {
+		a.audioMu.Unlock()
+		a.txOpMu.Unlock()
+		return fmt.Errorf("工作台采样率 %d Hz 与音频设备采样率 %d Hz 不一致", sampleRate, a.audioConfig.SampleRate)
+	}
+	baseCtx := a.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	txCtx, cancel := context.WithCancel(baseCtx)
+	a.txGeneration++
+	txGeneration := a.txGeneration
+	a.txCancel = cancel
+	a.audioMu.Unlock()
+	a.txOpMu.Unlock()
+
+	a.emitAudioState()
+	a.emitTXProgress("playing", 0, "正在发送 1500 Hz 单音（10 秒）")
+	go func() {
+		defer func() {
+			cancel()
+			a.finishTX(txGeneration)
+		}()
+		generator, err := sstv.NewToneGenerator(sampleRate, 0.35)
+		if err != nil {
+			a.emitTXState("error", "生成单音失败："+err.Error())
+			return
+		}
+		if err := generator.Tone(1500, 10*time.Second); err != nil {
+			a.emitTXState("error", "生成单音失败："+err.Error())
+			return
+		}
+		if err := txCtx.Err(); err != nil {
+			a.emitTXState("stopped", "1500 Hz 单音已停止")
+			return
+		}
+		a.emitTXState("playing", "正在发送 1500 Hz 单音（10 秒）")
+		if err := session.Transmit(txCtx, audio.PCM16ToFloat32(generator.Samples()), nil); err != nil {
+			if errors.Is(err, context.Canceled) {
+				a.emitTXState("stopped", "1500 Hz 单音已停止")
+			} else {
+				a.emitTXState("error", "1500 Hz 单音发送失败："+err.Error())
+			}
+			return
+		}
+		a.emitTXState("completed", "1500 Hz 单音发送完成")
 	}()
 	return nil
 }

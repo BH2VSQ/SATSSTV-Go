@@ -169,7 +169,7 @@ func (m *MalgoDuplex) StartCapture(ctx context.Context, onSamples func([]float32
 		defer freeMalgoDeviceID(deviceID)
 	}
 
-	queue := make(chan []float32, 96)
+	queue := make(chan []float32, 8)
 	workerCtx, cancel := context.WithCancel(context.Background())
 	dev, err := malgo.InitDevice(m.ctx.Context, cfg, malgo.DeviceCallbacks{Data: func(_, input []byte, _ uint32) {
 		defer func() {
@@ -187,7 +187,17 @@ func (m *MalgoDuplex) StartCapture(ctx context.Context, onSamples func([]float32
 		select {
 		case queue <- block:
 		default:
-			m.droppedBlocks.Add(1)
+			// Discard the oldest pending samples to avoid replaying stale audio.
+			select {
+			case <-queue:
+				m.droppedBlocks.Add(1)
+			default:
+			}
+			select {
+			case queue <- block:
+			default:
+				m.droppedBlocks.Add(1)
+			}
 		}
 	}})
 	if err != nil {

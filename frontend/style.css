@@ -225,3 +225,41 @@
 .tx-toggle-button:hover{background:linear-gradient(#effaf2,#d6efdc);border-color:#5b9f70}
 .tx-toggle-button.tx-running{background:linear-gradient(#f9e5e7,#edc6ca);border-color:#ca7a82;color:#862c35}
 .tx-toggle-button.tx-running:hover{background:linear-gradient(#fff0f1,#f3d6d9);border-color:#b95c68}
+
+
+/* RX/TX mode strips live inside their respective panes. */
+.pane .modebar{
+  height:40px;flex:0 0 40px;min-width:0;gap:6px;padding:3px 5px;
+  background:#eceff1;border:1px solid #c4cbd0;border-radius:2px;
+  box-shadow:inset 0 1px 0 #fff;overflow:hidden;
+}
+.pane .modebar-label{width:68px;flex:0 0 68px;padding-left:1px}
+.pane .modebar-label b{font-size:9px}
+.pane .modebar-label small{font-size:7px}
+.pane .mode-slots{gap:3px;overflow-x:auto;overflow-y:hidden;padding:1px 1px 3px;scrollbar-width:thin}
+.pane .mode-slot{min-width:56px;height:26px;padding:0 6px;font-size:9px;border-radius:2px}
+.pane .auto-slot{min-width:50px}
+.pane .modebar-meta{width:115px;flex:0 0 115px;gap:2px;font-size:8px}
+.pane .modebar-meta select{height:19px;max-width:82px;font-size:9px}
+.tx-pane .modebar-meta{width:86px;flex-basis:86px}
+.tx-modebar .mode-slots{padding-right:4px}
+.pane .mode-slot:disabled{opacity:.38;cursor:not-allowed;background:#e2e4e5}
+.tone-toggle-button{background:linear-gradient(#fff6df,#f2dfad);border-color:#c3a65f;color:#624b18;font-weight:700}
+.tone-toggle-button:hover{background:linear-gradient(#fff9eb,#f5e8c7);border-color:#ae914b}
+.tone-toggle-button:disabled{opacity:.5;cursor:not-allowed}
+
+/* Per-layer outline editing for text and image components. */
+.outline-properties{display:flex;flex-direction:column;gap:3px;padding:3px 0;border-top:1px solid #d1d5d8}
+.outline-fields{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:4px}
+.outline-fields .property-field input[type=color]{height:21px;max-width:100%}
+.outline-properties .check-field{font-weight:700;color:#52616b}
+.outline-properties[hidden]{display:none}
+@media(max-width:1200px){
+  .pane .modebar-label{width:54px;flex-basis:54px}
+  .pane .modebar-meta{width:92px;flex-basis:92px}
+  .pane .mode-slot{min-width:50px;padding:0 4px;font-size:8px}
+}
+@media(max-width:760px){
+  .pane .modebar-meta{width:78px;flex-basis:78px}
+  .pane .modebar-meta select{max-width:68px}
+}
