@@ -169,7 +169,7 @@ func (m *MalgoDuplex) StartCapture(ctx context.Context, onSamples func([]float32
 		defer freeMalgoDeviceID(deviceID)
 	}
 
-	queue := make(chan []float32, 8)
+	queue := make(chan []float32, 256)
 	workerCtx, cancel := context.WithCancel(context.Background())
 	dev, err := malgo.InitDevice(m.ctx.Context, cfg, malgo.DeviceCallbacks{Data: func(_, input []byte, _ uint32) {
 		defer func() {
@@ -186,18 +186,11 @@ func (m *MalgoDuplex) StartCapture(ctx context.Context, onSamples func([]float32
 		}
 		select {
 		case queue <- block:
+		case <-workerCtx.Done():
 		default:
-			// Discard the oldest pending samples to avoid replaying stale audio.
-			select {
-			case <-queue:
-				m.droppedBlocks.Add(1)
-			default:
-			}
-			select {
-			case queue <- block:
-			default:
-				m.droppedBlocks.Add(1)
-			}
+			// Never replace old samples with new ones: that would corrupt the
+			// SSTV timing. Count the exceptional overflow for visible diagnostics.
+			m.droppedBlocks.Add(1)
 		}
 	}})
 	if err != nil {
@@ -478,9 +471,8 @@ func (m *MalgoDuplex) StopPlayback() error {
 	return stopErr
 }
 
-// DroppedCaptureBlocks reports input callback blocks dropped because the
-// bounded worker queue was full. A non-zero value indicates DSP/UI processing
-// is not keeping up with the selected capture rate.
+// DroppedCaptureBlocks reports exceptional input blocks that could not be
+// queued. The receiver never discards older queued samples to make room.
 func (m *MalgoDuplex) DroppedCaptureBlocks() uint64 {
 	if m == nil {
 		return 0

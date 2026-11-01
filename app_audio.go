@@ -354,9 +354,11 @@ func (a *App) startRX(modeID string) error {
 		baseCtx = context.Background()
 	}
 	rxCtx, cancel := context.WithCancel(baseCtx)
-	// Keep a short rolling window. If DSP falls behind, the capture callback
-	// below drops the oldest block so the worker stays close to live audio.
-	queue := make(chan []float32, 8)
+	// Keep several seconds of ordered audio queued. SSTV decoding is timing
+	// sensitive: dropping an old block creates a discontinuity in the VIS,
+	// line-sync and pixel clocks. The display may lag briefly, but audio must
+	// never be silently replaced by newer samples.
+	queue := make(chan []float32, 256)
 	var dropped atomic.Uint64
 
 	a.rxDecoderMu.Lock()
@@ -375,20 +377,14 @@ func (a *App) startRX(modeID string) error {
 	a.audioMu.Unlock()
 
 	if err := session.StartReceive(rxCtx, func(block []float32) {
+		// The runtime callback is already off the native device callback thread.
+		// Preserve order; if the oversized safety queue ever fills, report the
+		// loss rather than silently pretending this is a valid SSTV stream.
 		select {
 		case queue <- block:
+		case <-rxCtx.Done():
 		default:
-			// Replace stale audio rather than accumulating seconds of latency.
-			select {
-			case <-queue:
-				dropped.Add(1)
-			default:
-			}
-			select {
-			case queue <- block:
-			default:
-				dropped.Add(1)
-			}
+			dropped.Add(1)
 		}
 	}); err != nil {
 		cancel()
@@ -556,24 +552,17 @@ func rmsDBFS(samples []float32) float64 {
 	return 20 * math.Log10(rms)
 }
 
-// makeSpectrum returns a compact logarithmic-independent FFT-like magnitude
-// trace over 900..2800 Hz. A Hann-windowed direct DFT is used for the small UI
-// telemetry window to avoid introducing another DSP dependency.
 // makeSpectrum computes a Hann-windowed FFT trace over 900..2800 Hz.
-// Magnitudes are normalized in dBFS so weak SSTV tones remain visible while
-// the waterfall keeps a useful noise floor.
-// makeSpectrum computes a Hann-windowed FFT trace over 900..2800 Hz.
-// An 8192-sample window gives 5.86 Hz raw-bin spacing at 48 kHz — comparable
-// to MMSSTV's ~5.4 Hz — so a clean tone shows a narrow, tall peak.
-// Magnitudes are normalized in dBFS so weak SSTV tones remain visible while
-// the waterfall keeps a useful noise floor.
+// An 8192-sample window gives 5.86 Hz raw-bin spacing at 48 kHz. 1024 display
+// bins retain the narrow tone peaks without the old 512-bin output bottleneck.
+// Magnitudes remain calibrated to the actual PCM amplitude; no display AGC.
 // spectrumScratch is a reusable FFT workspace. makeSpectrum is only ever
 // called from the single RX worker goroutine, so it is safe to share the
 // buffer across calls instead of allocating a fresh 128 KiB every telemetry
 // tick.
 const (
 	spectrumFFTSize = 8192
-	spectrumBins    = 512
+	spectrumBins    = 1024
 )
 
 var spectrumScratch = make([]complex128, spectrumFFTSize)
@@ -587,21 +576,6 @@ func makeSpectrum(samples []float32, sampleRate int) []float64 {
 	}
 	count := min(len(samples), spectrumFFTSize)
 	start := len(samples) - count
-	// AGC: normalize the window's peak to a consistent level so a weak input
-	// still produces a clear spectral peak rather than being lost in the noise.
-	var peak float64
-	for i := start; i < start+count; i++ {
-		if a := math.Abs(float64(samples[i])); a > peak {
-			peak = a
-		}
-	}
-	gain := 1.0
-	if peak > 1e-4 {
-		gain = 0.7 / peak
-		if gain > 100 {
-			gain = 100
-		}
-	}
 	window := spectrumScratch[:spectrumFFTSize]
 	var windowSum float64
 	for i := 0; i < count; i++ {
@@ -609,7 +583,7 @@ func makeSpectrum(samples []float32, sampleRate int) []float64 {
 		// peak rather than a broad hump.
 		weight := 0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(max(1, count-1)))
 		windowSum += weight
-		window[i] = complex(float64(samples[start+i])*gain*weight, 0)
+		window[i] = complex(float64(samples[start+i])*weight, 0)
 	}
 	clear(window[count:])
 	if windowSum <= 0 {
@@ -650,10 +624,20 @@ func spectrumPeak(spectrum []float64) (peakHz, crest float64) {
 			peakIdx = i
 		}
 	}
-	mean := sum / float64(len(spectrum))
+	// Spectrum values are a display mapping of -60..0 dBFS, not linear
+	// magnitudes. Convert them back to linear amplitude before calculating
+	// peak-to-mean crest; averaging the display values made this metric wrong.
+	linear := make([]float64, len(spectrum))
+	var linearSum float64
+	for i, value := range spectrum {
+		dbfs := -60 + math.Max(0, math.Min(1, value))*60
+		linear[i] = math.Pow(10, dbfs/20)
+		linearSum += linear[i]
+	}
+	mean := linearSum / float64(len(linear))
 	peakHz = 900.0 + float64(peakIdx)*(1900.0/float64(len(spectrum)-1))
 	if mean > 0 {
-		crest = spectrum[peakIdx] / mean
+		crest = linear[peakIdx] / mean
 	}
 	return peakHz, crest
 }

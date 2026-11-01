@@ -569,6 +569,7 @@ function setupCanvasDrag() {
 
 let waterfallImageData = null;
 let waterfallOff = null;
+let currentInputDBFS = -120;
 
 function spectrumColorRGB(value) {
   const strength = Math.max(0, Math.min(1, (Number(value) - 0.16) / 0.84));
@@ -579,7 +580,7 @@ function spectrumColor(value) {
   const [gray] = spectrumColorRGB(value);
   return `rgb(${gray},${gray},${gray})`;
 }
-function drawWaterfall(ctx, w, waterfallY, waterfallH) {
+function drawWaterfall(ctx, w, waterfallY, waterfallH, xOffset = 0) {
   const rows = waterfallHistory.slice(-MAX_WATERFALL_ROWS);
   if (!rows.length) return;
   const bins = rows[0].length;
@@ -613,25 +614,52 @@ function drawWaterfall(ctx, w, waterfallY, waterfallH) {
   waterfallOff.getContext('2d').putImageData(waterfallImageData, 0, 0);
   const prevSmoothing = ctx.imageSmoothingEnabled;
   ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(waterfallOff, 0, 0, bins, rowCount, 0, waterfallY, w, waterfallH);
+  ctx.drawImage(waterfallOff, 0, 0, bins, rowCount, xOffset, waterfallY, w, waterfallH);
   ctx.imageSmoothingEnabled = prevSmoothing;
 }
 function drawIdleSpectrum() {
   const canvas = $('spectrum'), ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
+  const meterW = 42;
+  const plotX = meterW + 2;
+  const plotW = w - plotX;
   const plotH = Math.round(h * 0.58);
   const waterfallY = plotH + 2;
   const waterfallH = h - waterfallY;
 
+  // MMSSTV-style independent receiver level rail at the left of both panes.
+  ctx.fillStyle = '#f1f1ed';
+  ctx.fillRect(0, 0, meterW, h);
+  ctx.strokeStyle = '#7d858b';
+  ctx.strokeRect(0.5, 0.5, meterW - 1, h - 1);
+  const meterTop = 22, meterBottom = h - 9, meterH = meterBottom - meterTop;
+  ctx.fillStyle = '#fff000';
+  ctx.fillRect(3, meterTop, meterW - 7, meterH);
+  const level = Math.max(0, Math.min(1, (currentInputDBFS + 60) / 60));
+  const fillH = meterH * level;
+  ctx.fillStyle = '#d9a900';
+  ctx.fillRect(3, meterBottom - fillH, meterW - 7, fillH);
+  ctx.strokeStyle = '#a5a500';
+  ctx.strokeRect(3.5, meterTop + .5, meterW - 8, meterH - 1);
+  ctx.fillStyle = '#26313a';
+  ctx.font = '10px Segoe UI, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  ctx.fillText('RX', meterW / 2, 4);
+  ctx.textBaseline = 'bottom';
+  ctx.fillText(`${Math.round(currentInputDBFS)}dB`, meterW / 2, h - 1);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+
   // MMSSTV-inspired orange spectrum pane and high-contrast monochrome waterfall.
   ctx.fillStyle = '#ff813f';
-  ctx.fillRect(0, 0, w, plotH);
+  ctx.fillRect(plotX, 0, plotW, plotH);
   ctx.strokeStyle = 'rgba(117,59,21,.18)';
   ctx.lineWidth = 1;
-  for (let x = 0; x <= w; x += w / 12) {
-    ctx.beginPath(); ctx.moveTo(x, 18); ctx.lineTo(x, plotH); ctx.stroke();
+  for (let x = 0; x <= plotW; x += plotW / 12) {
+    ctx.beginPath(); ctx.moveTo(plotX + x, 18); ctx.lineTo(plotX + x, plotH); ctx.stroke();
   }
   for (let y = 28; y < plotH; y += (plotH - 28) / 4) {
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(plotX, y); ctx.lineTo(w, y); ctx.stroke();
   }
   const markers = [
     { frequency: 1200, label: '1200' },
@@ -643,7 +671,7 @@ function drawIdleSpectrum() {
   ctx.textBaseline = 'top';
   ctx.textAlign = 'center';
   markers.forEach(marker => {
-    const x = (marker.frequency - 900) / 1900 * w;
+    const x = plotX + (marker.frequency - 900) / 1900 * plotW;
     ctx.strokeStyle = 'rgba(255,238,65,.9)';
     ctx.lineWidth = 1.2;
     ctx.beginPath(); ctx.moveTo(x, 18); ctx.lineTo(x, plotH); ctx.stroke();
@@ -651,13 +679,13 @@ function drawIdleSpectrum() {
     ctx.fillText(marker.label, x, 1);
   });
   ctx.strokeStyle = '#36414a';
-  ctx.beginPath(); ctx.moveTo(0, plotH - 1); ctx.lineTo(w, plotH - 1); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(plotX, plotH - 1); ctx.lineTo(w, plotH - 1); ctx.stroke();
 
   ctx.fillStyle = '#f7f7f4';
-  ctx.fillRect(0, waterfallY, w, waterfallH);
-  drawWaterfall(ctx, w, waterfallY, waterfallH);
+  ctx.fillRect(plotX, waterfallY, plotW, waterfallH);
+  drawWaterfall(ctx, plotW, waterfallY, waterfallH, plotX);
   ctx.strokeStyle = '#65717b';
-  ctx.beginPath(); ctx.moveTo(0, waterfallY); ctx.lineTo(w, waterfallY); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(plotX, waterfallY); ctx.lineTo(w, waterfallY); ctx.stroke();
 }
 function renderLiveSpectrum(values) {
   const canvas = $('spectrum'), ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
@@ -669,9 +697,11 @@ function renderLiveSpectrum(values) {
   else peakSpectrum = normalized.map((value, index) => Math.max(value, peakSpectrum[index] * 0.965));
 
   drawIdleSpectrum();
+  const plotX = 44;
+  const plotW = w - plotX;
   const plotH = Math.round(h * 0.58);
   const pointsFor = spectrum => spectrum.map((value, index) => [
-    index * w / Math.max(1, spectrum.length - 1),
+    plotX + index * plotW / Math.max(1, spectrum.length - 1),
     plotH - 9 - value * (plotH - 34),
   ]);
   const peaks = pointsFor(peakSpectrum);
@@ -685,6 +715,7 @@ function renderLiveSpectrum(values) {
   ctx.lineWidth = 2.2; ctx.strokeStyle = '#063cff';
   ctx.shadowColor = '#063cff'; ctx.shadowBlur = 1.5; ctx.stroke(); ctx.shadowBlur = 0;
 }
+
 function updateAudioState(state) {
   const wasRXActive = !!audioState.rxActive;
   audioState = { ...audioState, ...(state || {}) };
@@ -725,6 +756,7 @@ function bindRuntimeEvents() {
     const crest = Number(data?.crest || 0);
     $('spectrumState').textContent = `峰值 ${peakHz.toFixed(0)} Hz · 峰度 ${crest.toFixed(1)}`;
     const dbfs = Number(data?.dbfs ?? -120);
+    currentInputDBFS = dbfs;
     const fill = Math.max(0, Math.min(100, (dbfs + 60) / 60 * 100));
     $('inputLevel').style.width = `${fill}%`;
     $('inputLevelText').textContent = `${dbfs.toFixed(1)} dBFS`;
