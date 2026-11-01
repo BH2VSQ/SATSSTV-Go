@@ -156,3 +156,42 @@ wails build
 - `go vet ./internal/sstv ./internal/audio ./internal/radio/... ./cmd/sstv-go`: passed。
 - `node --test frontend/tests/*.test.cjs`: 5/5 passed；`node --check frontend/app.js` 和 Wails JS 绑定语法检查通过。
 - 测试运行期间临时将本地工作副本 `go.mod` 中的 Go 版本改为 1.23.0，完成后恢复为项目声明的 `go 1.25.0`。当前容器没有实际 Windows 声卡，也没有用户侧 MMSSTV FSKID 录音；参考向量由仓库内 MMSSTV C++ 发送逻辑生成。因此这些结果证明源代码级协议回归通过，但仍需用实际 MMSSTV 发射录音做最终互操作确认。
+
+## 2026-11-01 FSKID 每图接收周期与提交前仓库整理
+
+### FSKID 偶发停留在等待状态
+
+- 复现到 FSKID 前导和符号时钟已正确锁定，但载荷解析第一次返回 `incomplete` 后，候选状态固定等待额外 40 ms 才重试。若最后的有效呼号/校验符号刚好落在监听窗口末端或最后一个设备回调中，解码器已有足够样本却没有再触发判决。
+- 待完成候选现在在每次追加新 PCM 后重试（通过 `nextTryLen = len(pending)+1` 保证下一块音频到达即重试），取消固定额外 40 ms 延迟。FSKID 定向测试在 8/12/44.1/48/96 kHz 和不规则采集分块下通过，包含信号恰好结束、不附加尾部静音的情况。
+
+### 一张 SSTV 图像对应一个 FSKID 周期
+
+- RX 主线程不再用 `fskidArmed` 和独立样本计数两个布尔/整数拼接生命周期，而是使用 `rxFSKIDCycle` 状态机：`Idle → Searching → Draining → Decoded/Expired`。
+- 每次完整图像完成都会生成新的 `cycleID`，FSKID PCM 批次、重置命令和解码完成通知都携带该 ID。旧图像异步工作队列中的延迟批次或解码结果不能修改新图像的监听状态。
+- 8 秒限制按输入采样数计算。主采集线程到达监听窗口末端时进入 `Draining`，先把最后不足 40 ms 的 PCM 批次入队，再发送有序 finish 标记；FSKID worker 处理完此前所有 PCM 后才确认 `Expired`。因此 worker 暂时落后时，已经进入队列的有效呼号仍有机会完成校验，不会被主线程提前关闭。
+- 采集发生断流时，只重置 FSKID 部分符号时序，继续保留同一图像周期的监听预算；下一张图像完成时无条件建立新的周期。
+- 新增测试覆盖连续多张图像分别解析不同呼号、旧周期迟到结果不能关闭新周期、8 秒样本预算、worker drain/finish 顺序、采集断流与 FSKID 队列溢出。
+
+### 仓库整理脚本
+
+- 新增 `scripts/cleanup_repo.py`，仅使用 Python 标准库。默认 dry-run，只有 `--apply` 才执行删除；`--apply` 默认要求输入 `yes`，`--apply --yes` 可用于自动化。
+- 清理目标限制为明确的临时/诊断/编译产物和已知生成目录（例如 `bin/`、`dist/`、`build/bin/`、`frontend/dist/`、Python 缓存）。脚本不清理 `build/` 本体及 `build/windows` 资源，不扫描或删除 `mmsstv-master/`，不跟随符号链接。
+- 在 Git 工作树中，脚本先确认传入路径就是 Git 根目录，再读取 `git ls-files`；任何被 Git 跟踪的候选文件都会跳过，包含已跟踪内容的生成目录也不会整体删除。嵌套 `.git` 目录会阻止目录清理。
+- 新增 `scripts/test_cleanup_repo.py`，验证临时文件和构建目录识别、MMSSTV 源码/Windows 资源保留、跟踪文件保护以及实际删除行为；测试 3/3 通过。
+
+### 本轮验证
+
+- `CGO_ENABLED=0 go test ./internal/sstv -run 'FSKID' -count=1`: passed；覆盖 MMSSTV FSKID 协议、采样率、噪声/频偏、完整图像尾随 FSKID、连续两张图片各自的 FSKID，以及无尾部音频时的最终判决。
+- 根包 FSKID 状态机定向测试：通过临时 Wails API 接口替身运行；测试覆盖每图周期 ID、过期/迟到结果、Draining 完成确认、同一周期连续识别和队列 overflow。
+- `node --test frontend/tests/*.test.cjs`: 5/5 passed。
+- `python -m unittest discover -s scripts -p 'test_*.py'`: 3/3 passed；Python `py_compile` passed。
+- 项目 go.mod 已恢复 `go 1.25.0`。当前容器仅有 Go 1.23，真实 Wails 依赖无法联网获取；根 Wails 桌面程序及真实 Windows 声卡仍需在目标环境构建/验证。
+
+### 本轮补充验证（FSKID 周期 drain）
+
+- 新增 `TestRXFSKIDWorkerDrainsQueuedAudioBeforeFinishAndIgnoresStaleFinish`：将 MMSSTV 参考 FSKID 拆成不规则 PCM 批次入队，随后插入上一周期的过期 finish 标记和当前周期 finish 标记。测试要求工作线程必须先解出当前周期呼号，再确认当前周期结束；过期 finish 不得提前关闭当前周期。
+- 根包 FSKID 周期相关测试使用临时 Wails API 替身运行，全部通过；`go vet .` 通过。项目 `go.mod` 已恢复 `go 1.25.0`。
+- `CGO_ENABLED=0 go test ./internal/sstv -run 'FSKID' -count=1` 通过（约 29 秒）。
+- `python -m unittest discover -s scripts -p 'test_*.py' -v`：3/3 通过；Python `py_compile` 通过。
+- `node --test frontend/tests/*.test.cjs`：5/5 通过；`node --check frontend/app.js` 和 `node --check frontend/wailsjs/go/main/App.js` 通过。
+- 清理脚本 dry-run 在移除测试生成的 `__pycache__` 后显示仓库无待清理项；dry-run 不执行删除。

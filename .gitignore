@@ -26,3 +26,23 @@ dist/
 # Editor files
 .idea/
 .vscode/
+
+# Repository cleanup script targets (local/generated artifacts only)
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage_cache/
+frontend/dist/
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+*.rej
+.DS_Store
+Thumbs.db
+desktop.ini
+*.prof
+*.pprof
+*.trace

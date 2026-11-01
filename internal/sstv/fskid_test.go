@@ -174,10 +174,15 @@ func makeMMSSTVReferenceFSKID(t *testing.T, rate int, callsign string, narrow bo
 
 func makeMMSSTVReferenceFSKIDWithOffset(t *testing.T, rate int, callsign string, narrow bool, offsetHz float64) []int16 {
 	t.Helper()
+	return makeMMSSTVReferenceFSKIDWithPhase(t, rate, callsign, narrow, offsetHz, 0)
+}
+
+func makeMMSSTVReferenceFSKIDWithPhase(t *testing.T, rate int, callsign string, narrow bool, offsetHz, initialPhase float64) []int16 {
+	t.Helper()
 	var samples []int16
 	var exactPosition float64
 	written := 0
-	phase := 0.0
+	phase := initialPhase
 	appendTone := func(frequency, durationMS float64) {
 		exactPosition += durationMS * float64(rate) / 1000
 		end := int(exactPosition) // C++ int(m_dPos): cumulative floor.
@@ -557,5 +562,191 @@ func TestFSKIDDecoderKeepsLongCallsignAlignedWithMMSSTVTxSampleClockOffset(t *te
 				t.Fatalf("long clock-scaled MMSSTV FSKID decoded %q, want [%s]", callsigns, callsign)
 			}
 		})
+	}
+}
+
+func TestFSKIDDecoderStressVariableCaptureConditions(t *testing.T) {
+	const rate = 48_000
+	const callsign = "BH2VSQ"
+	for trial := int64(0); trial < 120; trial++ {
+		rng := rand.New(rand.NewSource(0xF5_0000 + trial))
+		narrow := trial%2 == 1
+		offsetHz := []float64{-80, -55, -25, 0, 25, 55, 80}[trial%7]
+		base := makeMMSSTVReferenceFSKIDWithOffset(t, rate, callsign, narrow, offsetHz)
+		prefixLen := rng.Intn(rate / 2)
+		input := make([]int16, prefixLen)
+		for i := range input {
+			input[i] = int16(rng.Intn(201) - 100)
+		}
+		level := []float64{0.04, 0.08, 0.15, 0.30, 0.55, 0.90}[trial%6]
+		noise := []float64{0, 40, 100, 180, 300, 500}[trial%6]
+		for _, sample := range base {
+			v := float64(sample)*level + (rng.Float64()*2-1)*noise
+			if v > math.MaxInt16 {
+				v = math.MaxInt16
+			}
+			if v < math.MinInt16 {
+				v = math.MinInt16
+			}
+			input = append(input, int16(math.Round(v)))
+		}
+		decoder, err := NewFSKIDDecoder(rate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for position := 0; position < len(input); {
+			chunk := 1 + rng.Intn(4096)
+			end := min(len(input), position+chunk)
+			for _, event := range decoder.Feed(input[position:end]) {
+				got = append(got, event.Callsign)
+			}
+			position = end
+		}
+		if len(got) != 1 || got[0] != callsign {
+			t.Errorf("trial=%d narrow=%v offset=%+.0fHz prefix=%d level=%.2f noise=%.0f chunks random: decoded %q; pending=%d scan=%d waiting=%d", trial, narrow, offsetHz, prefixLen, level, noise, got, len(decoder.pending), decoder.scanFrom, len(decoder.waiting))
+		}
+	}
+}
+
+func TestFSKIDDecoderRandomCarrierInitialPhase(t *testing.T) {
+	const rate = 48_000
+	const callsign = "BH2VSQ"
+	for trial := 0; trial < 96; trial++ {
+		phase := 2 * math.Pi * float64(trial) / 96
+		narrow := trial%2 == 1
+		input := makeMMSSTVReferenceFSKIDWithPhase(t, rate, callsign, narrow, 0, phase)
+		// Random capture start and arbitrary block sizes emulate a live device
+		// callback that does not align to the transmitter's oscillator phase.
+		rng := rand.New(rand.NewSource(int64(0xCA771E + trial)))
+		prefix := make([]int16, rng.Intn(rate/20))
+		stream := append(prefix, input...)
+		decoder, err := NewFSKIDDecoder(rate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for pos := 0; pos < len(stream); {
+			end := min(len(stream), pos+1+rng.Intn(2300))
+			for _, event := range decoder.Feed(stream[pos:end]) {
+				got = append(got, event.Callsign)
+			}
+			pos = end
+		}
+		if len(got) != 1 || got[0] != callsign {
+			t.Errorf("trial=%d phase=%.3f narrow=%v decoded %q; scan=%d pending=%d", trial, phase, narrow, got, decoder.scanFrom, len(decoder.pending))
+		}
+	}
+}
+
+func TestFSKIDDecoderStressRandomGainNoiseOffsetAndChunking(t *testing.T) {
+	rates := []int{12_000, 44_100, 48_000, 96_000}
+	levels := []float64{0.008, 0.015, 0.03, 0.08, 0.35, 0.9}
+	noiseLevels := []float64{0, 4, 10, 20, 40, 80}
+	for trial := int64(0); trial < 96; trial++ {
+		rng := rand.New(rand.NewSource(0xA0D10 + trial))
+		rate := rates[trial%int64(len(rates))]
+		level := levels[(trial/3)%int64(len(levels))]
+		noise := noiseLevels[(trial/5)%int64(len(noiseLevels))]
+		offset := []float64{-100, -70, -35, 0, 35, 70, 100}[trial%7]
+		narrow := trial%2 == 1
+		phase := rng.Float64() * 2 * math.Pi
+		base := makeMMSSTVReferenceFSKIDWithPhase(t, rate, "BH2VSQ", narrow, offset, phase)
+		prefix := rng.Intn(rate / 10)
+		stream := make([]int16, prefix)
+		for i := range stream {
+			stream[i] = int16(rng.Intn(81) - 40)
+		}
+		// A small DC bias and independent noise approximate different audio
+		// capture paths; clamp exactly as a 16-bit sound-card input would.
+		dc := float64(rng.Intn(2001) - 1000)
+		for _, sample := range base {
+			v := float64(sample)*level + dc + (rng.Float64()*2-1)*noise
+			if v > math.MaxInt16 {
+				v = math.MaxInt16
+			}
+			if v < math.MinInt16 {
+				v = math.MinInt16
+			}
+			stream = append(stream, int16(math.Round(v)))
+		}
+		decoder, err := NewFSKIDDecoder(rate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for pos := 0; pos < len(stream); {
+			// Exercise realistic variable audio callback sizes (20..125 ms).
+			// Single-sample and very small boundaries are already covered by the
+			// dedicated arbitrary-chunk and random-phase tests above; doing them
+			// for every noisy/high-rate combination needlessly multiplies runtime.
+			minChunk := max(1, rate*20/1000)
+			maxExtra := max(1, rate/8-minChunk+1)
+			end := min(len(stream), pos+minChunk+rng.Intn(maxExtra))
+			for _, event := range decoder.Feed(stream[pos:end]) {
+				got = append(got, event.Callsign)
+			}
+			pos = end
+		}
+		if len(got) != 1 || got[0] != "BH2VSQ" {
+			t.Errorf("trial=%d rate=%d narrow=%v level=%.3f noise=%.1f dc=%.0f offset=%+.0f phase=%.2f decoded=%q scan=%d pending=%d", trial, rate, narrow, level, noise, dc, offset, phase, got, decoder.scanFrom, len(decoder.pending))
+		}
+	}
+}
+
+func TestFSKIDIsReceivedIndependentlyAfterEveryConsecutivePicture(t *testing.T) {
+	const rate = 12_000
+	picture, err := NewEncoder(rate).Encode(context.Background(), makeTestSSTVImage(), Robot36ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idA := makeMMSSTVReferenceFSKID(t, rate, "BH2VSQ", false)
+	idB := makeMMSSTVReferenceFSKID(t, rate, "JA1ABC", true)
+	stream := make([]int16, 0, 2*(len(picture)+len(idA)))
+	stream = append(stream, picture...)
+	stream = append(stream, idA...)
+	stream = append(stream, picture...)
+	stream = append(stream, idB...)
+
+	streamDecoder, err := NewStreamDecoder(rate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamDecoder.SetDeferredFrameDecode(true)
+	fskidDecoder, err := NewFSKIDDecoder(rate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	armed := false
+	var decoded []string
+	frameCount := 0
+	for offset := 0; offset < len(stream); {
+		end := min(len(stream), offset+997) // deliberately irregular capture blocks
+		block := stream[offset:end]
+		frames, feedErr := streamDecoder.Feed(context.Background(), block)
+		if feedErr != nil {
+			t.Fatal(feedErr)
+		}
+		if len(frames) > 0 {
+			frameCount += len(frames)
+			fskidDecoder.Reset()
+			armed = true // a new independent FSKID cycle starts for every image
+			for _, event := range fskidDecoder.Feed(streamDecoder.PendingAudio()) {
+				decoded = append(decoded, event.Callsign)
+				armed = false
+			}
+		} else if armed {
+			for _, event := range fskidDecoder.Feed(block) {
+				decoded = append(decoded, event.Callsign)
+				armed = false
+			}
+		}
+		offset = end
+	}
+	if frameCount != 2 {
+		t.Fatalf("decoded pictures = %d, want 2", frameCount)
+	}
+	if len(decoded) != 2 || decoded[0] != "BH2VSQ" || decoded[1] != "JA1ABC" {
+		t.Fatalf("per-picture FSKID sequence = %q, want [BH2VSQ JA1ABC]", decoded)
 	}
 }

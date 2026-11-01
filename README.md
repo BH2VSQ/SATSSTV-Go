@@ -98,7 +98,7 @@ RX 和 TX 图像分别归档到 `<UserConfigDir>/SATSSTV-Go/album/`。每条记�
 - TX 的开始与停止整合为一个按钮，空闲为绿色，发射期间为红色。进度条覆盖图像编码及播放阶段。
 - 移除相册中的 RX 历史图像导入入口。TX 模板中的“上次 RX 图像组件”会把最近一次自动归档的 RX 图像插入为可移动、可缩放的图层。
 - 发射结束后自动附加 MMSSTV 兼容 FSKID 呼号识别数据。接收端在完整 SSTV 图像结束后，将图像尾部剩余 PCM 和后续音频送入独立 FSKID 工作线程；校验通过后显示识别到的呼号，并自动填入 HisCall（对方呼号）输入框。若用户已经手动填写 HisCall，则保留手动内容。
-- FSKID 按 MMSSTV 原始 C++ 实现传输：固定 22 ms 符号间隔（约 45.45 baud）、6 bit 符号、B0 到 B5（LSB-first）、`0x2A` 呼号起始标记、`0x01` 结束标记及字符 XOR 校验。普通模式可带 1500 Hz 前导音，窄带模式可带 1900 Hz 前导音；接收端按 MMSSTV `DecodeFSK()` 的方式直接捕获后续 2100 Hz/100 ms guard，再检测 1900 Hz 起始位，因此不依赖可选的前导音完整存在。当前实现仅发送/解析呼号字段，不包含 MMSSTV 可选的比赛编号扩展字段。
+- FSKID 按 MMSSTV 原始 C++ 实现传输：固定 22 ms 符号间隔（约 45.45 baud）、6 bit 符号、B0 到 B5（LSB-first）、`0x2A` 呼号起始标记、`0x01` 结束标记及字符 XOR 校验。普通模式可带 1500 Hz 前导音，窄带模式可带 1900 Hz 前导音；接收端按 MMSSTV `DecodeFSK()` 的方式直接捕获后续 2100 Hz/100 ms guard，再检测 1900 Hz 起始位，因此不依赖可选的前导音完整存在。每张完整图像都会开启独立 FSKID 监听周期，带周期 ID 的异步批次避免前一张图像的迟到结果影响下一张；监听结束时等待 FSKID worker 消化完已入队 PCM 后再关闭。当前实现仅发送/解析呼号字段，不包含 MMSSTV 可选的比赛编号扩展字段。
 
 FSKID 兼容性依据：[MMSSTV 原始 FSKID.TXT](https://github.com/n5ac/mmsstv/blob/master/fskid.txt)。
 
@@ -128,6 +128,24 @@ FSKID 兼容性依据：[MMSSTV 原始 FSKID.TXT](https://github.com/n5ac/mmsstv
 - 本站设置、音频设置和相册索引采用带回滚的替换流程，尽量避免 Windows 文件替换失败造成原文件丢失。
 - 增加 TX 取消时释放 PTT 的回归测试。
 - Go 主工程与建议使用的 Wails CLI/运行时统一到 v2.17.0，最低 Go 版本调整为 1.25。
+
+## 仓库整理与提交前清理
+
+项目提供 `scripts/cleanup_repo.py`，用于清理本地临时文件、诊断输出、Go 测试产物和已知构建缓存，帮助保持 Git 仓库整洁。脚本默认只预览，不会直接删除文件：
+
+```powershell
+python scripts/cleanup_repo.py
+```
+
+确认候选清单没有需要保留的文件后再执行实际清理：
+
+```powershell
+python scripts/cleanup_repo.py --apply
+```
+
+自动化环境可使用 `--apply --yes`。脚本只处理明确列出的临时文件和构建目录；不会删除 `mmsstv-master` 参考源码、`build/windows` 图标/清单、Go/前端源码、资源文件或 Git 已跟踪文件。`build/` 目录本身不会整体删除，只针对 `build/bin` 等生成目录。清理后可运行 `git status --short` 检查待提交变更。
+
+注意：脚本只清理仓库目录内的文件，不会删除用户配置目录中的设置、模板、图库或 RX/TX 相册。
 
 ## Windows 构建
 

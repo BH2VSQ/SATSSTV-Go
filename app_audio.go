@@ -498,7 +498,88 @@ type rxTelemetryBlock struct {
 type rxFSKIDWork struct {
 	reset   bool
 	armed   bool
+	finish  bool
+	cycleID uint64
 	samples []int16
+}
+
+type rxFSKIDListenState uint8
+
+const (
+	rxFSKIDIdle rxFSKIDListenState = iota
+	rxFSKIDSearching
+	rxFSKIDDraining
+	rxFSKIDDecoded
+	rxFSKIDExpired
+)
+
+// rxFSKIDCycle models one station-ID opportunity per completed SSTV picture.
+// A generation ID prevents a late result from an older FSKID worker batch from
+// disarming the listener belonging to a newer picture.
+type rxFSKIDCycle struct {
+	id               uint64
+	state            rxFSKIDListenState
+	samplesRemaining int
+}
+
+func (c *rxFSKIDCycle) Start(sampleRate int) uint64 {
+	if c == nil || sampleRate <= 0 {
+		return 0
+	}
+	c.id++
+	if c.id == 0 { // Reserve zero for "no decoded cycle" in the atomic signal.
+		c.id++
+	}
+	c.state = rxFSKIDSearching
+	c.samplesRemaining = sampleRate * 8
+	return c.id
+}
+
+func (c *rxFSKIDCycle) ID() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.id
+}
+
+func (c *rxFSKIDCycle) Searching() bool {
+	return c != nil && c.state == rxFSKIDSearching && c.samplesRemaining > 0
+}
+
+func (c *rxFSKIDCycle) Take(sampleCount int) int {
+	if !c.Searching() || sampleCount <= 0 {
+		return 0
+	}
+	take := min(sampleCount, c.samplesRemaining)
+	c.samplesRemaining -= take
+	if c.samplesRemaining == 0 {
+		// The capture side has reached the end of this picture's listen window,
+		// but the FSKID worker may still have queued PCM to inspect. Keep the
+		// cycle decodable until it acknowledges the ordered finish marker.
+		c.state = rxFSKIDDraining
+	}
+	return take
+}
+
+func (c *rxFSKIDCycle) MarkDecoded(cycleID uint64) bool {
+	if c == nil || cycleID == 0 || cycleID != c.id || (c.state != rxFSKIDSearching && c.state != rxFSKIDDraining) {
+		return false
+	}
+	c.state = rxFSKIDDecoded
+	c.samplesRemaining = 0
+	return true
+}
+
+func (c *rxFSKIDCycle) MarkFinished(cycleID uint64) bool {
+	if c == nil || cycleID == 0 || cycleID != c.id || c.state != rxFSKIDDraining {
+		return false
+	}
+	c.state = rxFSKIDExpired
+	return true
+}
+
+func (c *rxFSKIDCycle) ResetAfterCaptureGap() bool {
+	return c != nil && c.Searching()
 }
 
 func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *sstv.StreamDecoder, fskidDecoder *sstv.FSKIDDecoder, sampleRate int, session appAudioRuntime, initialMode string) {
@@ -507,32 +588,40 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 	telemetryQueue := make(chan rxTelemetryBlock, 8)
 	previewQueue := make(chan sstv.StreamUpdate, 1) // latest preview wins; never back-pressure DSP
 	frameQueue := make(chan sstv.StreamEvent, 2)
-	fskidQueue := make(chan rxFSKIDWork, 512) // bounded side-channel audio; never blocks SSTV
+	// Forty-millisecond batches keep channel overhead low. A 512-entry queue
+	// holds more than twenty seconds of FSKID audio, comfortably exceeding the
+	// eight-second post-frame listen budget even with short native callbacks.
+	const fskidBatchMS = 40
+	fskidQueue := make(chan rxFSKIDWork, 512)
+	fskidBatchSamples := max(1, sampleRate*fskidBatchMS/1000)
+	fskidBatch := make([]int16, 0, fskidBatchSamples*2)
 	var latestPreviewSequence atomic.Uint64
 	var completedPreviewFrame atomic.Uint64
-	var fskidDecoded atomic.Bool
+	var fskidDecodedCycle atomic.Uint64
+	var fskidFinishedCycle atomic.Uint64
 	go a.runRXTelemetryWorker(ctx, telemetryQueue, sampleRate, session)
 	go a.runRXPreviewWorker(ctx, previewQueue, &latestPreviewSequence, &completedPreviewFrame)
 	go a.runRXFrameWorker(ctx, frameQueue)
-	go a.runRXFSKIDWorker(ctx, fskidQueue, fskidDecoder, &fskidDecoded)
+	go a.runRXFSKIDWorker(ctx, fskidQueue, fskidDecoder, &fskidDecodedCycle, &fskidFinishedCycle)
 	activeMode := initialMode
-	fskidArmed := false
-	var fskidListenUntil time.Time
+	var fskidCycle rxFSKIDCycle
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case block := <-queue:
 			if block == nil {
-				// The capture backend discarded a stale queue backlog. Treat this
-				// as a hard stream boundary: do not decode a raster or FSKID symbol
-				// sequence across missing samples.
+				// The capture backend discarded a stale queue backlog. The SSTV
+				// raster must be reset because its line/sample clock crossed a gap.
+				// However, if a picture has already completed, MMSSTV sends FSKID
+				// *after* that picture (often following a 300 ms leader). A short
+				// capture gap during that post-picture window must reset only the
+				// FSKID candidate timing, not disarm the per-picture listener.
 				decoder.Reset()
 				latestPreviewSequence.Add(1) // invalidate any preview already decoding
-				fskidArmed = false
-				fskidListenUntil = time.Time{}
-				fskidDecoded.Store(false)
-				enqueueRXFSKIDWork(fskidQueue, rxFSKIDWork{reset: true, armed: false})
+				resetRXFSKIDAfterCaptureDiscontinuity(
+					fskidQueue, &fskidCycle, &fskidBatch, &fskidDecodedCycle,
+				)
 				enqueueRXTelemetry(telemetryQueue, rxTelemetryBlock{Discontinuity: true})
 				lastProgress = time.Time{}
 				if a.ctx != nil {
@@ -587,25 +676,34 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 			// finish one frame and detect the next frame from the tail of the same
 			// capture block; the old branch order silently ignored the completed
 			// frame in that case and never armed FSKID for its following trailer.
-			if fskidDecoded.Swap(false) {
-				fskidArmed = false
-				fskidListenUntil = time.Time{}
+			if decodedCycleID := fskidDecodedCycle.Swap(0); decodedCycleID != 0 && fskidCycle.MarkDecoded(decodedCycleID) {
+				fskidBatch = fskidBatch[:0]
+				enqueueRXFSKIDWork(fskidQueue, rxFSKIDWork{reset: true, armed: false, cycleID: fskidCycle.ID()})
+			}
+			if finishedCycleID := fskidFinishedCycle.Swap(0); finishedCycleID != 0 {
+				fskidCycle.MarkFinished(finishedCycleID)
 			}
 			if len(events) > 0 {
-				fskidArmed = true
-				fskidListenUntil = time.Now().Add(8 * time.Second)
-				enqueueRXFSKIDWork(fskidQueue, rxFSKIDWork{reset: true, armed: true, samples: trailingFrameAudio})
-			} else if fskidArmed {
-				// Keep scanning independently of a tentative SSTV lock: a narrowband
-				// MMSSTV FSKID leader is itself a 1900 Hz / 300 ms tone and can look
-				// like the beginning of another SSTV frame. The side channel is
-				// bounded to eight seconds, long enough for the maximum FSKID payload.
-				if !fskidListenUntil.IsZero() && time.Now().After(fskidListenUntil) {
-					fskidArmed = false
-					fskidListenUntil = time.Time{}
-					enqueueRXFSKIDWork(fskidQueue, rxFSKIDWork{reset: true, armed: false})
-				} else {
-					enqueueRXFSKIDWork(fskidQueue, rxFSKIDWork{armed: true, samples: pcm})
+				// Every completed image starts a new, independent FSKID opportunity.
+				// The cycle generation is carried through the side-channel queue so
+				// late work/results from a previous image cannot affect this one.
+				cycleID := fskidCycle.Start(sampleRate)
+				fskidBatch = fskidBatch[:0]
+				// Reset/arm first, then enqueue post-raster audio in chronological order.
+				enqueueRXFSKIDWork(fskidQueue, rxFSKIDWork{reset: true, armed: true, cycleID: cycleID})
+				take := fskidCycle.Take(len(trailingFrameAudio))
+				appendRXFSKIDCycleBatch(fskidQueue, &fskidBatch, trailingFrameAudio[:take], fskidBatchSamples, cycleID)
+			} else if fskidCycle.Searching() {
+				// The eight-second window advances by captured samples, never wall time.
+				take := fskidCycle.Take(len(pcm))
+				if take > 0 {
+					appendRXFSKIDCycleBatch(fskidQueue, &fskidBatch, pcm[:take], fskidBatchSamples, fskidCycle.ID())
+				}
+				if fskidCycle.state == rxFSKIDDraining {
+					flushRXFSKIDCycleBatch(fskidQueue, &fskidBatch, fskidCycle.ID())
+					// Ordered finish acknowledgement: the worker signals completion
+					// only after it has inspected every PCM batch for this picture.
+					enqueueRXFSKIDWork(fskidQueue, rxFSKIDWork{finish: true, cycleID: fskidCycle.ID()})
 				}
 			}
 
@@ -641,6 +739,57 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 	}
 }
 
+// resetRXFSKIDAfterCaptureDiscontinuity clears only partial FSKID timing after
+// a lost capture interval. The current per-picture listen cycle and its sample
+// budget remain active; the reset is tagged with that cycle's generation.
+func resetRXFSKIDAfterCaptureDiscontinuity(
+	queue chan rxFSKIDWork,
+	cycle *rxFSKIDCycle,
+	batch *[]int16,
+	decoded *atomic.Uint64,
+) {
+	if cycle == nil {
+		return
+	}
+	if decoded != nil {
+		if decodedID := decoded.Swap(0); decodedID != 0 {
+			cycle.MarkDecoded(decodedID)
+		}
+	}
+	if batch != nil {
+		*batch = (*batch)[:0]
+	}
+	enqueueRXFSKIDWork(queue, rxFSKIDWork{
+		reset: true, armed: cycle.Searching(), cycleID: cycle.ID(),
+	})
+}
+
+// appendRXFSKIDCycleBatch preserves ordered PCM and tags every batch with the
+// image cycle that owns it. This lets the worker ignore stale batches after a
+// new image has opened another FSKID window.
+func appendRXFSKIDCycleBatch(queue chan rxFSKIDWork, batch *[]int16, samples []int16, batchSamples int, cycleID uint64) {
+	if batch == nil || batchSamples <= 0 || len(samples) == 0 {
+		return
+	}
+	*batch = append(*batch, samples...)
+	for len(*batch) >= batchSamples {
+		chunk := append([]int16(nil), (*batch)[:batchSamples]...)
+		enqueueRXFSKIDWork(queue, rxFSKIDWork{armed: true, cycleID: cycleID, samples: chunk})
+		remainder := (*batch)[batchSamples:]
+		copy(*batch, remainder)
+		*batch = (*batch)[:len(remainder)]
+	}
+}
+
+func flushRXFSKIDCycleBatch(queue chan rxFSKIDWork, batch *[]int16, cycleID uint64) {
+	if batch == nil || len(*batch) == 0 {
+		return
+	}
+	chunk := append([]int16(nil), (*batch)...)
+	*batch = (*batch)[:0]
+	enqueueRXFSKIDWork(queue, rxFSKIDWork{armed: true, cycleID: cycleID, samples: chunk})
+}
+
 func enqueueRXFSKIDWork(queue chan rxFSKIDWork, work rxFSKIDWork) {
 	select {
 	case queue <- work:
@@ -662,15 +811,16 @@ func enqueueRXFSKIDWork(queue chan rxFSKIDWork, work rxFSKIDWork) {
 	}
 }
 
-func processRXFSKIDWork(decoder *sstv.FSKIDDecoder, armed *bool, work rxFSKIDWork) []sstv.FSKIDEvent {
-	if decoder == nil || armed == nil {
+func processRXFSKIDWork(decoder *sstv.FSKIDDecoder, armed *bool, activeCycleID *uint64, work rxFSKIDWork) []sstv.FSKIDEvent {
+	if decoder == nil || armed == nil || activeCycleID == nil {
 		return nil
 	}
 	if work.reset {
 		decoder.Reset()
 		*armed = work.armed
+		*activeCycleID = work.cycleID
 	}
-	if !*armed || len(work.samples) == 0 {
+	if !*armed || work.cycleID != *activeCycleID || len(work.samples) == 0 {
 		return nil
 	}
 	events := decoder.Feed(work.samples)
@@ -680,16 +830,34 @@ func processRXFSKIDWork(decoder *sstv.FSKIDDecoder, armed *bool, work rxFSKIDWor
 	return events
 }
 
-func (a *App) runRXFSKIDWorker(ctx context.Context, queue <-chan rxFSKIDWork, decoder *sstv.FSKIDDecoder, decoded *atomic.Bool) {
+func (a *App) runRXFSKIDWorker(ctx context.Context, queue <-chan rxFSKIDWork, decoder *sstv.FSKIDDecoder, decodedCycle, finishedCycle *atomic.Uint64) {
 	armed := false
+	var activeCycleID uint64
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case work := <-queue:
-			for _, identity := range processRXFSKIDWork(decoder, &armed, work) {
-				if decoded != nil {
-					decoded.Store(true)
+			if work.finish {
+				// Overflow recovery may coalesce a finish marker with a reset.
+				// Apply that generation before acknowledging its ordered boundary.
+				if work.reset {
+					decoder.Reset()
+					armed = false
+					activeCycleID = work.cycleID
+				}
+				if work.cycleID == activeCycleID {
+					decoder.Reset()
+					armed = false
+					if finishedCycle != nil {
+						finishedCycle.Store(activeCycleID)
+					}
+				}
+				continue
+			}
+			for _, identity := range processRXFSKIDWork(decoder, &armed, &activeCycleID, work) {
+				if decodedCycle != nil {
+					decodedCycle.Store(activeCycleID)
 				}
 				if a.ctx != nil {
 					runtime.EventsEmit(a.ctx, "rx:callsign", map[string]any{"callsign": identity.Callsign, "source": "MMSSTV FSKID"})

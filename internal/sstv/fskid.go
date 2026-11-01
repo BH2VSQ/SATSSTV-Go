@@ -201,7 +201,10 @@ func (d *FSKIDDecoder) Feed(samples []int16) []FSKIDEvent {
 		callsign, consumed, status := d.decodeFSKIDPayload(candidate.dataStart, candidate.offsetHz, candidate.periodSamples, sampleAt)
 		switch status {
 		case fskIDParseIncomplete:
-			candidate.nextTryLen = len(d.pending) + max(1, d.rate/200) // Retry every 5 ms.
+			// Retry as soon as any new PCM arrives. A fixed 40 ms delay can
+			// postpone the final checksum decision beyond the end of a capture
+			// window or a device callback stream that stops at the packet tail.
+			candidate.nextTryLen = len(d.pending) + 1
 			waiting = append(waiting, candidate)
 		case fskIDParseValid:
 			events = append(events, FSKIDEvent{Callsign: callsign})
@@ -224,7 +227,12 @@ func (d *FSKIDDecoder) Feed(samples []int16) []FSKIDEvent {
 	// 1500 Hz (normal) or 1900 Hz (narrow) leader may already have been consumed
 	// by the SSTV frame boundary, so it is deliberately not required here.
 	for d.scanFrom+preambleSamples <= len(d.pending) {
-		start := d.scanFrom
+		// Keep the grid origin separate from the refined Guard edge. Refinement
+		// is allowed to move backward into the preceding leader; using that
+		// value to update scanFrom can otherwise move the scanner backward and
+		// repeatedly inspect the same narrow-band leader forever.
+		candidateOrigin := d.scanFrom
+		start := candidateOrigin
 		if start+probeN > len(d.pending) {
 			break
 		}
@@ -235,10 +243,26 @@ func (d *FSKIDDecoder) Feed(samples []int16) []FSKIDEvent {
 			continue
 		}
 
-		// Refine the leading edge of the 2100 Hz guard. The coarse 40 ms scan
-		// can begin just before the transition; this short search removes most
-		// of its window bias. The timing fit below absorbs the remaining phase.
-		start = refineFSKToneStart(d.pending, start, fskIDSpaceHz, d.rate, sampleAt)
+		// The coarse 40 ms scan intentionally tolerates noisy frequency
+		// estimates. Re-identify the stable tone with a DC-rejected Goertzel
+		// frequency search before accepting it as a 2100 Hz guard. This is
+		// essential in narrow mode: 1900 Hz + AFC must never masquerade as 2100.
+		coarseProbeStart := start + sampleAt(10)
+		coarseProbeEnd := start + sampleAt(80)
+		if coarseProbeStart < 0 || coarseProbeEnd > len(d.pending) || coarseProbeEnd <= coarseProbeStart {
+			d.scanFrom += step
+			continue
+		}
+		stableProbe := d.pending[coarseProbeStart:coarseProbeEnd]
+		guardFrequency := estimateFSKDominantFrequency(stableProbe, d.rate)
+		// MMSSTV receive offset is expected within ±80 Hz. A ±100 Hz stable
+		// guard window leaves separation from the shifted 1900 Hz narrow leader.
+		if guardFrequency <= 0 || math.Abs(guardFrequency-fskIDSpaceHz) > 100 {
+			d.scanFrom += step
+			continue
+		}
+		offset := guardFrequency - fskIDSpaceHz
+		start = refineFSKSpaceTransition(d.pending, start, d.rate, fskIDMarkHz+offset, fskIDSpaceHz+offset, sampleAt)
 		guardProbeStart := start + sampleAt(10)
 		guardProbeEnd := start + sampleAt(80)
 		if guardProbeStart < 0 || guardProbeEnd > len(d.pending) || guardProbeEnd <= guardProbeStart {
@@ -246,23 +270,38 @@ func (d *FSKIDDecoder) Feed(samples []int16) []FSKIDEvent {
 			continue
 		}
 		stableGuard := d.pending[guardProbeStart:guardProbeEnd]
-		guardFrequency := estimateToneFrequency(stableGuard, d.rate)
-		if guardFrequency <= 0 || math.Abs(guardFrequency-fskIDSpaceHz) > 120 {
+		confirmedFrequency := estimateFSKDominantFrequency(stableGuard, d.rate)
+		if confirmedFrequency <= 0 || math.Abs(confirmedFrequency-fskIDSpaceHz) > 100 {
 			d.scanFrom += step
 			continue
 		}
-		offset := guardFrequency - fskIDSpaceHz
+		offset = confirmedFrequency - fskIDSpaceHz
 		if classifyFSKTone(stableGuard, d.rate, fskIDMarkHz+offset, fskIDSpaceHz+offset) != fskIDSpaceHz+offset {
 			d.scanFrom += step
+			continue
+		}
+		// A shifted 1900 Hz narrow-band leader can land at 2000 Hz when the
+		// receiver AFC is +100 Hz, exactly on the edge of the broad Guard
+		// acquisition range. Do not lock on frequency alone: a true 2100 Hz
+		// Guard must be followed 100 ms later by the corresponding 1900 Hz
+		// Start tone using the SAME AFC estimate. This sequence check rejects
+		// the 300 ms narrow-band leader before attempting expensive clock fit.
+		if !hasMMSSTVFSKStartAfterGuard(d.pending, start, d.rate, fskIDMarkHz+offset, fskIDSpaceHz+offset, sampleAt) {
+			d.scanFrom = candidateOrigin + max(step, sampleAt(5))
 			continue
 		}
 
 		dataStart, periodSamples, timingOK := d.findMMSSTVFSKTiming(start, offset, sampleAt)
 		if !timingOK {
-			// A complete 280 ms candidate was examined; skip its guard and
-			// preamble instead of repeatedly running the timing fit on the same
-			// long 2100 Hz region.
-			d.scanFrom = max(start+step, start+preambleSamples)
+			// The 1 ms acquisition grid can encounter the leading edge of a real
+			// guard several milliseconds before the 40/70 ms probes are fully
+			// inside it. Such an early candidate can pass the coarse 2100 Hz
+			// checks but lack enough clean 100 ms guard for the preamble fit. Do
+			// NOT skip the whole 280 ms preamble here: that jumps over the actual
+			// guard and makes FSKID reception depend on the capture/grid phase.
+			// Advance only one acquisition step and retry the same guard at a
+			// slightly later origin.
+			d.scanFrom = candidateOrigin + step
 			continue
 		}
 
@@ -279,14 +318,21 @@ func (d *FSKIDDecoder) Feed(samples []int16) []FSKIDEvent {
 			d.waiting = nil
 			return events
 		case fskIDParseIncomplete:
-			if len(d.waiting) < 8 {
-				d.waiting = append(d.waiting, fskIDCandidate{
-					dataStart: dataStart, offsetHz: offset, periodSamples: periodSamples,
-					nextTryLen: dataStart + max(1, sampleAt(800)),
-				})
-			}
+			// Once the complete Guard/Start/0x2A preamble has validated, retain
+			// exactly one payload candidate and stop scanning this same 100 ms
+			// Guard at every 1 ms grid point. Re-running the full timing fit for
+			// neighbouring origins created many duplicate candidates and could
+			// starve the side-channel worker on long/noisy IDs.
+			d.waiting = append(d.waiting[:0], fskIDCandidate{
+				dataStart: dataStart, offsetHz: offset, periodSamples: periodSamples,
+				nextTryLen: len(d.pending) + 1,
+			})
+			d.scanFrom = max(candidateOrigin+step, dataStart)
+			return events
 		}
-		d.scanFrom = max(start+step, start+preambleSamples)
+		// A fully validated preamble must not be reconsidered at every
+		// neighbouring acquisition-grid point if its payload later proves bad.
+		d.scanFrom = max(candidateOrigin+step, dataStart)
 	}
 
 	// Retain at most eight seconds, enough for a 16-character callsign plus
@@ -457,36 +503,147 @@ func goertzelPowerHann(samples []int16, sampleRate int, frequency float64) float
 	if len(samples) < 2 || sampleRate <= 0 {
 		return 0
 	}
+	// Sound-card capture paths can add a sizeable DC bias. Remove it before
+	// windowing; otherwise the finite Hann window leaks that offset into both
+	// FSK bins and can move the 1900/2100 energy crossover unpredictably.
+	mean := 0.0
+	for _, sample := range samples {
+		mean += float64(sample)
+	}
+	mean /= float64(len(samples))
 	omega := 2 * math.Pi * frequency / float64(sampleRate)
 	coeff := 2 * math.Cos(omega)
 	s1, s2 := 0.0, 0.0
 	denominator := float64(len(samples) - 1)
 	for i, sample := range samples {
 		window := 0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/denominator)
-		x := float64(sample) / 32768 * window
+		x := (float64(sample) - mean) / 32768 * window
 		s0 := x + coeff*s1 - s2
 		s2, s1 = s1, s0
 	}
 	return s1*s1 + s2*s2 - coeff*s1*s2
 }
 
-// refineFSKToneStart removes the leading-window bias from the 40 ms coarse
-// detector. The search uses the expected 2100 Hz guard rather than the mixed
-// coarse-window estimate, so a window straddling the 1900/2100 transition is
-// not mistaken for a stable guard. A small correction places the start just
-// after the measured transition.
-func refineFSKToneStart(samples []int16, approximate int, targetHz float64, sampleRate int, sampleAt func(float64) int) int {
+// estimateFSKDominantFrequency finds the strongest tone in the FSK band using
+// DC-rejected Hann Goertzel measurements. A coarse scan followed by a local
+// refinement is more stable than counting zero crossings in weak, biased audio.
+func estimateFSKDominantFrequency(samples []int16, sampleRate int) float64 {
+	if len(samples) < 16 || sampleRate <= 0 {
+		return 0
+	}
+	bestFrequency, bestPower := 0.0, 0.0
+	for frequency := 1_800.0; frequency <= 2_300; frequency += 20 {
+		power := goertzelPowerHann(samples, sampleRate, frequency)
+		if power > bestPower {
+			bestFrequency, bestPower = frequency, power
+		}
+	}
+	if bestFrequency == 0 || bestPower <= 1e-14 {
+		return 0
+	}
+	coarseBest := bestFrequency
+	for frequency := math.Max(1_780, coarseBest-20); frequency <= math.Min(2_320, coarseBest+20); frequency += 4 {
+		power := goertzelPowerHann(samples, sampleRate, frequency)
+		if power > bestPower {
+			bestFrequency, bestPower = frequency, power
+		}
+	}
+	// A maximum bin always exists, even for broadband noise. Require the
+	// selected carrier to explain a meaningful fraction of the AC energy so
+	// random noise peaks cannot start expensive timing fits or create a false
+	// 2100 Hz Guard candidate before the actual post-picture FSKID.
+	var mean float64
+	for _, sample := range samples {
+		mean += float64(sample)
+	}
+	mean /= float64(len(samples))
+	var energy float64
+	for _, sample := range samples {
+		x := (float64(sample) - mean) / 32768
+		energy += x * x
+	}
+	if energy <= 1e-18 {
+		return 0
+	}
+	coherentPower := goertzelPowerZeroMean(samples, sampleRate, bestFrequency, mean)
+	if coherentPower/(energy*float64(len(samples))) < 0.012 {
+		return 0
+	}
+	return bestFrequency
+}
+
+// hasMMSSTVFSKStartAfterGuard cheaply verifies the required 2100 Hz Guard ->
+// 1900 Hz Start transition before a candidate is sent to the full timing fit.
+// The ±20 ms search absorbs the coarse 1 ms grid and Guard-edge refinement
+// uncertainty. Two consecutive confident Mark windows avoid accepting noise.
+func hasMMSSTVFSKStartAfterGuard(samples []int16, guardStart, sampleRate int, markHz, spaceHz float64, sampleAt func(float64) int) bool {
+	if sampleRate <= 0 || guardStart < 0 {
+		return false
+	}
+	window := max(1, sampleAt(8))
+	expected := guardStart + sampleAt(100)
+	radius := sampleAt(20)
+	step := max(1, sampleRate/500) // 2 ms
+	consecutive := 0
+	for center := expected - radius; center <= expected+radius; center += step {
+		from := center - window/2
+		to := from + window
+		if from < 0 || to > len(samples) || to <= from {
+			continue
+		}
+		tone, confidence := classifyFSKToneConfidence(samples[from:to], sampleRate, markHz, spaceHz)
+		if tone == markHz && confidence >= math.Log(1.05) {
+			consecutive++
+			if consecutive >= 2 {
+				return true
+			}
+		} else {
+			consecutive = 0
+		}
+	}
+	return false
+}
+
+// refineFSKSpaceTransition locates the 1900->2100 Hz guard edge by following
+// the energy ratio of the already AFC-corrected mark and space tones. The
+// search extends before the coarse window because the latter can straddle the
+// transition by up to roughly 20 ms.
+func refineFSKSpaceTransition(samples []int16, approximate, sampleRate int, markHz, spaceHz float64, sampleAt func(float64) int) int {
 	if sampleRate <= 0 || approximate < 0 || approximate >= len(samples) {
 		return approximate
 	}
-	window := max(1, sampleAt(5))
-	limit := min(len(samples)-window, approximate+sampleAt(45))
-	step := max(1, sampleRate/20_000)
-	tolerance := math.Max(90, targetHz*0.02)
-	for pos := approximate; pos <= limit; pos += step {
-		frequency := estimateToneFrequency(samples[pos:pos+window], sampleRate)
-		if frequency > 0 && math.Abs(frequency-targetHz) <= tolerance {
-			return pos + max(1, sampleAt(0.5))
+	// The initial 40 ms scan is deliberately coarse and can begin up to about
+	// 20 ms before the actual guard. A plain mark/space ratio crossing is unsafe
+	// here: during MMSSTV's 1500 Hz normal leader neither FSK bin has meaningful
+	// energy, so noise/leakage can create a false crossing before the real 2100
+	// Hz guard. Instead, locate the first stable window that is confidently the
+	// space tone. This also works after the 1900 Hz narrow-band leader.
+	window := max(1, sampleAt(8))
+	searchFrom := max(0, approximate-sampleAt(25))
+	searchTo := min(len(samples)-window, approximate+sampleAt(35))
+	step := max(1, sampleRate/4_000) // 0.25 ms
+	consecutive := 0
+	firstSpaceCenter := 0
+	for center := searchFrom + window/2; center <= searchTo+window/2; center += step {
+		from := center - window/2
+		to := from + window
+		if from < 0 || to > len(samples) || to <= from {
+			continue
+		}
+		tone, confidence := classifyFSKToneConfidence(samples[from:to], sampleRate, markHz, spaceHz)
+		if tone == spaceHz && confidence >= math.Log(1.05) {
+			if consecutive == 0 {
+				firstSpaceCenter = center
+			}
+			consecutive++
+			if consecutive >= 2 {
+				// The first confidently space-dominant window usually centers
+				// within one millisecond of the transition. The timing preamble
+				// fit below performs the final sub-millisecond correction.
+				return firstSpaceCenter
+			}
+		} else {
+			consecutive = 0
 		}
 	}
 	return approximate
@@ -498,32 +655,63 @@ func estimateToneFrequency(samples []int16, sampleRate int) float64 {
 	if len(samples) < 4 || sampleRate <= 0 {
 		return 0
 	}
+	// Remove capture-chain DC bias before detecting crossings. A fixed
+	// hysteresis threshold, relative to peak amplitude, prevents noise around
+	// zero from being counted as additional cycles on weak receiver audio.
 	var mean float64
 	for _, sample := range samples {
 		mean += float64(sample)
 	}
 	mean /= float64(len(samples))
-	var first, last float64
-	crossings := 0
-	previous := float64(samples[0]) - mean
-	for i := 1; i < len(samples); i++ {
-		current := float64(samples[i]) - mean
-		if previous <= 0 && current > 0 {
-			fraction := -previous / (current - previous)
-			position := float64(i-1) + fraction
-			if crossings == 0 {
-				first = position
-			} else {
-				last = position
-			}
-			crossings++
+	peak := 0.0
+	for _, sample := range samples {
+		if v := math.Abs(float64(sample) - mean); v > peak {
+			peak = v
 		}
-		previous = current
 	}
-	if crossings < 3 || last <= first {
+	if peak < 3 {
 		return 0
 	}
-	return float64(crossings-1) * float64(sampleRate) / (last - first)
+	threshold := math.Max(2, peak*0.12)
+	lastNegative, firstPositive := -1, -1
+	var previousCrossing, periodSum float64
+	periodCount := 0
+	for i, sample := range samples {
+		v := float64(sample) - mean
+		if v <= -threshold {
+			lastNegative = i
+			firstPositive = -1
+			continue
+		}
+		if lastNegative < 0 || v <= 0 {
+			continue
+		}
+		if firstPositive < 0 {
+			firstPositive = i
+		}
+		if v >= threshold {
+			left := float64(samples[lastNegative]) - mean
+			right := float64(samples[firstPositive]) - mean
+			position := float64(firstPositive)
+			if right != left {
+				position = float64(lastNegative) - left/(right-left)*float64(firstPositive-lastNegative)
+			}
+			if periodCount >= 0 && previousCrossing > 0 {
+				period := position - previousCrossing
+				if period >= float64(sampleRate)/3_000 && period <= float64(sampleRate)/1_000 {
+					periodSum += period
+					periodCount++
+				}
+			}
+			previousCrossing = position
+			lastNegative = -1
+			firstPositive = -1
+		}
+	}
+	if periodCount == 0 || periodSum <= 0 {
+		return 0
+	}
+	return float64(sampleRate) * float64(periodCount) / periodSum
 }
 
 // classifyFSKTone returns the stronger of the shifted MMSSTV mark/space tones.
@@ -533,20 +721,46 @@ func classifyFSKTone(samples []int16, sampleRate int, markHz, spaceHz float64) f
 	return tone
 }
 
+// goertzelPowerZeroMean avoids leakage from DC bias without allocating a
+// temporary centered PCM buffer for each symbol decision.
+func goertzelPowerZeroMean(samples []int16, sampleRate int, frequency, mean float64) float64 {
+	if len(samples) < 2 || sampleRate <= 0 {
+		return 0
+	}
+	omega := 2 * math.Pi * frequency / float64(sampleRate)
+	coeff := 2 * math.Cos(omega)
+	s1, s2 := 0.0, 0.0
+	for _, sample := range samples {
+		x := (float64(sample) - mean) / 32768
+		s0 := x + coeff*s1 - s2
+		s2, s1 = s1, s0
+	}
+	return s1*s1 + s2*s2 - coeff*s1*s2
+}
+
 func classifyFSKToneConfidence(samples []int16, sampleRate int, markHz, spaceHz float64) (float64, float64) {
 	if len(samples) == 0 || sampleRate <= 0 || markHz <= 0 || spaceHz <= 0 || markHz >= float64(sampleRate)/2 || spaceHz >= float64(sampleRate)/2 {
 		return 0, 0
 	}
+	// Center each decision window before measuring tone energy. Real capture
+	// devices can carry a DC offset from the ADC, mixer or discriminator. If
+	// that offset is included in the normalization (or Goertzel recurrence),
+	// weak but valid FSK symbols can be rejected intermittently.
+	mean := 0.0
+	for _, sample := range samples {
+		mean += float64(sample)
+	}
+	mean /= float64(len(samples))
 	var energy float64
 	for _, sample := range samples {
-		x := float64(sample) / 32768
+		x := (float64(sample) - mean) / 32768
 		energy += x * x
 	}
 	if energy/float64(len(samples)) <= 1e-11 {
 		return 0, 0
 	}
-	markPower := goertzelPower(samples, sampleRate, markHz)
-	spacePower := goertzelPower(samples, sampleRate, spaceHz)
+	markPower := goertzelPowerZeroMean(samples, sampleRate, markHz, mean)
+	spacePower := goertzelPowerZeroMean(samples, sampleRate, spaceHz, mean)
 	best, second := markPower, spacePower
 	bestTone := markHz
 	if spacePower > markPower {
