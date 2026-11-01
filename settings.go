@@ -15,6 +15,23 @@ type StationSettings struct {
 	Locator string `json:"locator"`
 }
 
+const (
+	defaultStationCallsign = "N0CALL"
+	defaultStationLocator  = "JJ00"
+)
+
+func normalizeStationSettings(settings StationSettings) StationSettings {
+	settings.MyCall = strings.ToUpper(strings.TrimSpace(settings.MyCall))
+	settings.Locator = strings.ToUpper(strings.TrimSpace(settings.Locator))
+	if settings.MyCall == "" {
+		settings.MyCall = defaultStationCallsign
+	}
+	if settings.Locator == "" {
+		settings.Locator = defaultStationLocator
+	}
+	return settings
+}
+
 // replaceFilePreservingPrevious installs a fully-written temporary file while
 // retaining a recoverable copy of the previous settings/index on platforms
 // where os.Rename cannot replace an existing destination (notably Windows).
@@ -78,7 +95,7 @@ func (a *App) GetStationSettings() (StationSettings, error) {
 	}
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return StationSettings{}, nil
+		return StationSettings{MyCall: defaultStationCallsign, Locator: defaultStationLocator}, nil
 	}
 	if err != nil {
 		return StationSettings{}, fmt.Errorf("读取本站信息失败：%w", err)
@@ -87,16 +104,14 @@ func (a *App) GetStationSettings() (StationSettings, error) {
 	if err := json.Unmarshal(data, &settings); err != nil {
 		return StationSettings{}, fmt.Errorf("本站信息文件格式错误：%w", err)
 	}
-	settings.MyCall = strings.TrimSpace(settings.MyCall)
-	settings.Locator = strings.ToUpper(strings.TrimSpace(settings.Locator))
+	settings = normalizeStationSettings(settings)
 	return settings, nil
 }
 
 // SaveStationSettings persists the operator callsign and locator in the
 // platform's user configuration directory, outside the application folder.
 func (a *App) SaveStationSettings(settings StationSettings) (StationSettings, error) {
-	settings.MyCall = strings.ToUpper(strings.TrimSpace(settings.MyCall))
-	settings.Locator = strings.ToUpper(strings.TrimSpace(settings.Locator))
+	settings = normalizeStationSettings(settings)
 	if utf8.RuneCountInString(settings.MyCall) > 24 {
 		return StationSettings{}, fmt.Errorf("本台呼号不能超过 24 个字符")
 	}

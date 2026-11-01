@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/BH2VSQ/SATSSTV-Go/internal/radio/ptt"
 	"github.com/BH2VSQ/SATSSTV-Go/internal/sstv"
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -32,20 +33,25 @@ var assets embed.FS
 type App struct {
 	ctx context.Context
 
-	audioMu        sync.Mutex
-	rxOpMu         sync.Mutex
-	txOpMu         sync.Mutex // serializes TX start and audio-session replacement/close
-	audioSession   appAudioRuntime
-	audioConfig    AudioSettings
-	rxCancel       context.CancelFunc
-	txCancel       context.CancelFunc
-	txGeneration   uint64 // prevents an older TX worker from clearing a newer TX state
-	rxDecoderMu    sync.Mutex
-	rxDecoder      *sstv.StreamDecoder
-	rxModeRequest  atomic.Pointer[string]
-	rxQueueDrops   atomic.Uint64
-	albumMu        sync.Mutex
-	imageLibraryMu sync.Mutex
+	audioMu           sync.Mutex
+	rxOpMu            sync.Mutex
+	txOpMu            sync.Mutex // serializes TX start and audio-session replacement/close
+	audioSession      appAudioRuntime
+	audioConfig       AudioSettings
+	rxCancel          context.CancelFunc
+	txCancel          context.CancelFunc
+	txGeneration      uint64 // prevents an older TX worker from clearing a newer TX state
+	pttTestMu         sync.Mutex
+	pttTestController ptt.Controller
+	pttTestCancel     context.CancelFunc
+	pttTestGeneration uint64
+	shuttingDown      atomic.Bool
+	rxDecoderMu       sync.Mutex
+	rxDecoder         *sstv.StreamDecoder
+	rxModeRequest     atomic.Pointer[string]
+	rxQueueDrops      atomic.Uint64
+	albumMu           sync.Mutex
+	imageLibraryMu    sync.Mutex
 
 	dumpMu    sync.Mutex
 	dumpBuf   []float32 // fixed-size circular buffer of recent raw captured float samples

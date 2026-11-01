@@ -315,3 +315,35 @@
 .image-library-actions{grid-column:1/-1;display:flex;gap:5px}
 .image-library-actions button{flex:1}
 .image-library-empty{grid-column:1/-1;min-height:150px;display:grid;place-items:center;text-align:center;color:#7e8992;font-size:10px;border:1px dashed #bac1c7;background:#f6f8f8;padding:12px}
+
+/* UI text is intentionally non-selectable; form values remain editable/selectable. */
+html, body, body * {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+input, textarea, select, [contenteditable="true"], .selectable-text {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+.language-select {
+  height: 25px;
+  min-width: 92px;
+  padding: 0 5px;
+  border: 1px solid #afb8bf;
+  border-radius: 3px;
+  background: linear-gradient(#fff,#e4e6e8);
+  color: #34414b;
+  font: 10px "Segoe UI","Microsoft YaHei",sans-serif;
+}
+.ptt-test-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 28px;
+  margin-top: 3px;
+}
+.ptt-test-row .small-btn { min-width: 145px; }
+.ptt-test-row .station-settings-status { flex: 1 1 120px; }

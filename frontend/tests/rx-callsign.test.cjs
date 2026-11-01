@@ -28,6 +28,11 @@ function makeHarness() {
   const context = {
     $: (id) => elements[id],
     setStatus: (message) => { status = message; },
+    t: (key, vars = {}) => key === 'callsignFilled'
+      ? `已通过 ${vars.source} 识别到呼号 ${vars.callsign}，已填入对方呼号`
+      : key === 'callsignPreserved'
+        ? `已通过 ${vars.source} 识别到呼号 ${vars.callsign}；保留了已手动填写的对方呼号`
+        : key,
     Event: class { constructor(type, options) { this.type = type; this.options = options; } },
   };
   const handler = vm.runInNewContext(`(${callbackSource})`, context);

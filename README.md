@@ -1,6 +1,28 @@
 # SATSSTV-Go
 
-Go 语言 SSTV 编解码与 Wails Windows 桌面收发工作台。项目包含 43 种指定 SSTV 模式、图文模板编辑、实时音频 RX/TX、音频频谱、PTT 控制和历史相册。
+Go 语言 SSTV 编解码与 Wails 跨平台桌面收发工作台。项目包含 43 种指定 SSTV 模式、图文模板编辑、实时音频 RX/TX、音频频谱、PTT 控制和历史相册。
+
+## GitHub Actions 自动构建
+
+`.github/workflows/go.yml` 会在每次向任意分支 push commit、创建/更新 Pull Request，或手动触发时自动执行：
+
+- Windows x64、Linux x64、macOS Apple Silicon（arm64）和 macOS Intel（amd64）分别运行 Go 测试与 `go vet`。
+- 运行前端 JavaScript 语法/Node 测试，以及仓库清理脚本的 Python 单元测试。
+- 使用 Wails CLI v2.17.0 和 CGO 原生工具链构建桌面应用，同时构建命令行工具。
+- 将各平台压缩包上传到当前 Actions workflow run 的 Artifacts，保留 14 天。
+
+每次 workflow 成功后会产生以下压缩包：
+
+| Artifact | 内容 |
+| --- | --- |
+| `SATSSTV-Go-windows-amd64` | Windows GUI `.exe` + CLI `.exe` |
+| `SATSSTV-Go-linux-amd64` | Linux GUI + CLI，`.tar.gz` |
+| `SATSSTV-Go-macos-arm64` | Apple Silicon `.app` + CLI |
+| `SATSSTV-Go-macos-amd64` | Intel `.app` + CLI |
+
+构建产物只作为 Actions Artifacts 保存，不创建 Git Tag，不发布 GitHub Release。打开仓库的 **Actions → 对应 workflow run → Artifacts** 即可下载。
+
+Linux CI 使用 Ubuntu 24.04 x64 和 WebKit2GTK 4.1（`webkit2_41` 构建标签）；macOS 分别生成 Apple Silicon 与 Intel 两种原生架构包。Linux 桌面运行时需要 GTK 3 与 WebKit2GTK 4.1；Windows 桌面使用 WebView2；macOS 使用系统 WebKit。Windows RTS/DTR 串口 PTT 仍仅在 Windows 上可用。
 
 ## GUI 工作台
 
@@ -214,3 +236,23 @@ go test ./...
 - `internal/audio/`：独立 RX/TX 流及全双工控制。
 - `internal/radio/`：Hamlib rigctld、PTT 抽象和 Windows RTS/DTR。
 - `settings.go`：本站身份信息持久化。
+
+## Interface language and PTT test
+
+The desktop interface can be switched between Simplified Chinese, English, and Japanese using the language selector in the top bar. The selection is stored locally and restored on the next launch.
+
+For hardware PTT modes (serial RTS, serial DTR, or Hamlib Rigctld), open Device Settings and use **Test PTT** to key the configured endpoint. The test releases automatically after 15 seconds and can be stopped earlier with the same button. VOX mode does not need a software PTT test.
+
+Settings are no longer dismissed by clicking the dialog backdrop or pressing Escape. Use **Save Settings** to persist and apply changes (the dialog closes after success), or the explicit close button to leave the dialog.
+
+## Interface usability and localization
+
+- UI labels and decorative text are non-selectable to prevent accidental text highlighting while operating the workbench. Input fields, text areas, and selectors remain editable and selectable.
+- The interface language can be changed from the selector in the top bar: Simplified Chinese, English, or Japanese. The selection is persisted locally and restored on the next launch. RX/TX status, audio telemetry, progress labels, image-library actions, and template-editor controls follow the selected language.
+- RTS, DTR, and Hamlib Rigctld settings include a **Test PTT** control. A test is released automatically after 15 seconds, and the same button can stop it earlier. The timeout is enforced in the Go backend, not only by the UI.
+- The Settings dialog cannot be dismissed by clicking its backdrop or pressing Escape. **Save Settings** saves and applies the settings, then closes the dialog only when the operation succeeds. The explicit close button remains available.
+
+
+### Default station identity
+
+On first launch, the station callsign defaults to `N0CALL` and the Maidenhead locator defaults to `JJ00`. Existing empty station settings are migrated to these defaults. In TX templates, `{HISCALL}` displays `ToCall` until a callsign is entered in the HisCall field.

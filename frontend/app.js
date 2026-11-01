@@ -8,7 +8,7 @@ const TX_SLOT_ACTIVE_STORAGE = 'satsstv.txModeSlotActive.v1';
 const TX_MODE_STORAGE = 'satsstv.txMode.v1'; // legacy single-mode TX selection
 const RX_MODE_STORAGE = 'satsstv.rxMode.v1';
 const VALUE_IDS = ['myCall', 'hisCall', 'qth', 'locator', 'report', 'message'];
-const tokenDefaults = { MYCALL: 'N0CALL', HISCALL: 'N0TEST', QTH: 'EXAMPLE QTH', LOCATOR: 'AA00AA', REPORT: '595', MESSAGE: 'TEST MESSAGE', DATE: 'YYYY-MM-DD', TIME: 'HH:MM:SS' };
+const tokenDefaults = { MYCALL: 'N0CALL', HISCALL: 'ToCall', QTH: 'EXAMPLE QTH', LOCATOR: 'JJ00', REPORT: '595', MESSAGE: 'TEST MESSAGE', DATE: 'YYYY-MM-DD', TIME: 'HH:MM:SS' };
 
 const defaultTemplateSlots = [
   { id: 'cq', name: 'CQ', objects: [
@@ -50,12 +50,17 @@ let txBackgroundPersistChain = Promise.resolve();
 let txBackgroundPersistVersion = 0;
 const templateImageCache = new Map();
 let contextTarget = null;
-let stationSettings = { myCall: '', locator: '' };
+let stationSettings = { myCall: 'N0CALL', locator: 'JJ00' };
 let audioState = { connected: false, rxActive: false, txActive: false, sampleRate: 48000, pttMode: 'vox' };
 let waterfallHistory = []; // retained for compatibility with older UI state; rendering uses a circular offscreen buffer
 let captureTelemetrySeen = false;
 let latestRXImageData = '';
+let templateRenderRevision = 0;
+let pttTestActive = false;
+let pttTestDeadline = 0;
+let pttTestTimer = null;
 const MAX_WATERFALL_ROWS = 64;
+const t = (key, vars = {}) => window.SATSSTVI18n?.t(key, vars) || key;
 
 function dateTokens() {
   const d = new Date(); const pad = (n) => String(n).padStart(2, '0');
@@ -73,9 +78,10 @@ function resolveTokens(text) {
 function activeRXMode() { return modes.find((m) => m.id === slots[activeSlot]) || modes.find((m) => m.ready) || modes[0]; }
 function activeTXMode() { return modes.find((m) => m.id === txSlots[activeTXSlot]) || modes.find((m) => m.id === 'robot36') || modes.find((m) => m.ready) || modes[0]; }
 function setStatus(message, error = false) {
-  $('txResult').textContent = message;
+  const localized = window.SATSSTVI18n?.localize(message) || message;
+  $('txResult').textContent = localized;
   $('txResult').classList.toggle('error', error);
-  $('globalStatus').textContent = message;
+  $('globalStatus').textContent = localized;
 }
 function niceMode(id) { return modes.find((m) => m.id === id)?.name || id || '空'; }
 
@@ -90,8 +96,9 @@ function loadSlots() {
     const savedRX = JSON.parse(localStorage.getItem(RX_MODE_STORAGE) || 'null');
     rxEnabled = savedRX?.enabled !== false;
     autoSelected = savedRX?.auto !== false;
-    activeSlot = Math.max(0, Math.min(7, Number(savedRX?.slot) || 0));
-    if (!rxEnabled) { autoSelected = false; activeSlot = -1; }
+    const savedSlot = Number(savedRX?.slot);
+    activeSlot = Number.isInteger(savedSlot) && savedSlot >= 0 && savedSlot < 8 ? savedSlot : 0;
+    if (!rxEnabled || autoSelected) activeSlot = -1;
   } catch { autoSelected = true; rxEnabled = true; activeSlot = 0; }
 }
 function loadTXSlots() {
@@ -115,6 +122,8 @@ function saveTXActiveSlot() { localStorage.setItem(TX_SLOT_ACTIVE_STORAGE, Strin
 function saveRXModeSelection() { localStorage.setItem(RX_MODE_STORAGE, JSON.stringify({ enabled: rxEnabled, auto: autoSelected, slot: activeSlot })); }
 function saveSlots() { localStorage.setItem(SLOT_STORAGE, JSON.stringify(slots)); }
 function currentRXModeID() { return !rxEnabled || autoSelected ? '' : (slots[activeSlot] || ''); }
+function isAutoRXActuallyRunning() { return rxEnabled && autoSelected && !!audioState.rxActive; }
+function shouldEnableAutoRX() { return !isAutoRXActuallyRunning(); }
 async function applyRXSelection(message) {
   try {
     await app().SetRXEnabled(rxEnabled, currentRXModeID());
@@ -135,9 +144,9 @@ function renderModeSlots() {
   const auto = document.createElement('button');
   auto.className = `mode-slot auto-slot${rxEnabled && autoSelected ? ' active' : ''}`;
   auto.textContent = 'Auto';
-  auto.title = rxEnabled && autoSelected ? '再次点击停止 RX' : '启用 Auto 自动识别接收';
+  auto.title = rxEnabled && autoSelected ? t('rxSlotStopTitle', { slot: 'Auto' }) : t('rxAutoReceive');
   auto.addEventListener('click', async () => {
-    const selectingAuto = !(rxEnabled && autoSelected);
+    const selectingAuto = shouldEnableAutoRX();
     rxEnabled = selectingAuto;
     autoSelected = selectingAuto;
     activeSlot = -1;
@@ -152,9 +161,9 @@ function renderModeSlots() {
     const button = document.createElement('button');
     button.className = `mode-slot${selected ? ' active' : ''}`;
     button.textContent = niceMode(id).replace('Wraase ', '').replace('Scottie ', 'Scottie');
-    button.title = selected ? `槽位 ${i + 1}：再次点击停止 RX，右键更换模式` : `槽位 ${i + 1}：${niceMode(id)}，右键更换`;
+    button.title = selected ? t('rxSlotStopTitle', { slot: i + 1 }) : t('rxSlotChangeTitle', { slot: i + 1, mode: niceMode(id) });
     button.addEventListener('click', async () => {
-      if (selected) {
+      if (selected && audioState.rxActive) {
         rxEnabled = false;
         autoSelected = false;
         activeSlot = -1;
@@ -176,10 +185,10 @@ function renderModeSlots() {
 function openModeMenu(x, y, slotIndex) {
   contextTarget = { type: 'mode', slotIndex };
   const menu = $('contextMenu'); menu.innerHTML = '';
-  const title = document.createElement('div'); title.className = 'context-title'; title.textContent = `设置 RX 模式槽位 ${slotIndex + 1}`; menu.appendChild(title);
+  const title = document.createElement('div'); title.className = 'context-title'; title.textContent = t('modeSlotRXTitle', { slot: slotIndex + 1 }); menu.appendChild(title);
   modes.forEach((m) => {
     const item = document.createElement('button'); item.className = 'context-item';
-    item.textContent = `${m.name}${m.ready ? '' : ' · 尚未完成编解码'}`;
+    item.textContent = `${m.name}${m.ready ? '' : ` · ${t('modeNotReady')}`}`;
     item.disabled = false;
     item.addEventListener('click', async () => {
       slots[slotIndex] = m.id; saveSlots(); activeSlot = slotIndex; autoSelected = false; rxEnabled = true; saveRXModeSelection(); hideContextMenu(); renderModeSlots(); updateModeInfo();
@@ -199,17 +208,17 @@ function hideContextMenu() { $('contextMenu').hidden = true; contextTarget = nul
 function updateModeInfo() {
   const mode = activeRXMode();
   if (!rxEnabled) {
-    $('modeInfo').textContent = 'RX 已停止';
+    $('modeInfo').textContent = t('rxStoppedLabel');
     $('rxDetectedMode').textContent = '---';
-    $('rxAutoState').textContent = 'RX 已停止';
+    $('rxAutoState').textContent = t('rxStoppedLabel');
   } else if (autoSelected) {
-    $('modeInfo').textContent = 'Auto · 自动识别所有支持模式';
+    $('modeInfo').textContent = t('rxAutoAllModes');
     $('rxDetectedMode').textContent = 'Auto';
-    $('rxAutoState').textContent = 'Auto · 自动接收';
+    $('rxAutoState').textContent = t('rxAutoReceive');
   } else {
-    $('modeInfo').textContent = `${mode?.name || '未选择'} · 指定模式接收`;
+    $('modeInfo').textContent = `${mode?.name || t('empty')} · ${t('fixedModeReceive')}`;
     $('rxDetectedMode').textContent = mode?.name || '---';
-    $('rxAutoState').textContent = `${mode?.name || ''} · 指定模式接收`;
+    $('rxAutoState').textContent = `${mode?.name || ''} · ${t('fixedModeReceive')}`;
   }
   renderCanvas();
 }
@@ -227,7 +236,7 @@ function renderTXModeSlots() {
     const button = document.createElement('button');
     button.className = `mode-slot${selected ? ' active' : ''}`;
     button.textContent = niceMode(id).replace('Wraase ', '').replace('Scottie ', 'Scottie');
-    button.title = selected ? `槽位 ${i + 1}：${niceMode(id)}，右键更换模式` : `槽位 ${i + 1}：${niceMode(id)}，右键更换`;
+    button.title = t('txSlotTitle', { slot: i + 1, mode: niceMode(id) });
     button.addEventListener('click', () => {
       if (selected) return;
       activeTXSlot = i;
@@ -246,7 +255,7 @@ function renderTXModeSlots() {
 function openTXModeMenu(x, y, slotIndex) {
   contextTarget = { type: 'txmode', slotIndex };
   const menu = $('contextMenu'); menu.innerHTML = '';
-  const title = document.createElement('div'); title.className = 'context-title'; title.textContent = `设置 TX 模式槽位 ${slotIndex + 1}`; menu.appendChild(title);
+  const title = document.createElement('div'); title.className = 'context-title'; title.textContent = t('modeSlotTXTitle', { slot: slotIndex + 1 }); menu.appendChild(title);
   modes.forEach((m) => {
     const item = document.createElement('button'); item.className = 'context-item';
     item.textContent = `${m.name}${m.ready ? '' : ' · 尚未完成编解码'}`;
@@ -339,7 +348,7 @@ function maxFontSizeForMode(mode = activeTXMode()) {
 function updateFontSizeLimits() {
   const limit = maxFontSizeForMode();
   $('fontSize').max = String(limit);
-  $('fontSize').title = `当前 TX 模式字号上限：${limit}px`;
+  $('fontSize').title = t('fontLimitTitle', { limit });
   components.forEach(c => {
     if (c.type === 'text' && Number(c.fontSize) > limit) c.fontSize = limit;
   });
@@ -362,9 +371,9 @@ function drawLastRXPlaceholder(ctx, bounds) {
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.font = `600 ${Math.max(8, Math.min(15, bounds.width * .09))}px "Segoe UI", "Microsoft YaHei", sans-serif`;
-  ctx.fillText('上一次 RX 图像', bounds.x + bounds.width / 2, bounds.y + bounds.height / 2 - 5, Math.max(1, bounds.width - 8));
+  ctx.fillText(t('lastRXImage'), bounds.x + bounds.width / 2, bounds.y + bounds.height / 2 - 5, Math.max(1, bounds.width - 8));
   ctx.font = `400 ${Math.max(6, Math.min(10, bounds.width * .055))}px "Segoe UI", "Microsoft YaHei", sans-serif`;
-  ctx.fillText('等待接收图像', bounds.x + bounds.width / 2, bounds.y + bounds.height / 2 + 11, Math.max(1, bounds.width - 8));
+  ctx.fillText(t('waitingRXImage'), bounds.x + bounds.width / 2, bounds.y + bounds.height / 2 + 11, Math.max(1, bounds.width - 8));
   ctx.restore();
 }
 function renderToCanvas(canvas, selectionOutline = false) {
@@ -431,7 +440,7 @@ function renderToCanvas(canvas, selectionOutline = false) {
   }
   if (canvas === $('txCanvas')) {
     $('canvasDimensions').textContent = `${width} × ${height}`;
-    $('imageName').textContent = background ? `底图：${background.imageName || '图库图片'}（可拖动 / 缩放）` : '纯色背景';
+    $('imageName').textContent = background ? `${t('backgroundPrefix')}${background.imageName || t('templateImage')}（${t('imageDragScaleHint')}）` : t('defaultBackgroundColor');
   }
 }
 function renderCanvas() { renderToCanvas($('txCanvas'), true); }
@@ -445,7 +454,7 @@ function renderComponentList() {
     sample.textContent = isBackgroundComponent(c) ? 'BG' : (isImageComponent(c) ? (c.type === 'last_rx' ? 'RX' : 'IMG') : (c.text || '').replace(/\{[A-Z]+\}/g, '…').slice(0, 1) || 'T');
     sample.style.color = c.color || '#5b8ba0';
     const name = document.createElement('span'); name.className = 'component-name';
-    name.textContent = isBackgroundComponent(c) ? `底图 · ${c.imageName || '图库图片'}` : (isImageComponent(c) ? (c.type === 'last_rx' ? '上一次 RX 图像' : (c.imageName || '模板图像')) : (c.text || '').replace(/\s+/g, ' ').slice(0, 28) || `文字 ${i + 1}`);
+    name.textContent = isBackgroundComponent(c) ? `${t('backgroundPrefix')}${c.imageName || t('templateImage')}` : (isImageComponent(c) ? (c.type === 'last_rx' ? t('lastRXImage') : (c.imageName || t('templateImage'))) : (c.text || '').replace(/\s+/g, ' ').slice(0, 28) || `${t('customText')} ${i + 1}`);
     const meta = document.createElement('small'); meta.textContent = isImageComponent(c) ? `${Math.round(c.width || 42)}%` : `${c.fontSize}px`;
     row.append(sample, name, meta); row.addEventListener('click', () => selectComponent(i)); host.appendChild(row);
   });
@@ -469,9 +478,9 @@ function updateComponentProperties() {
   $('fontBold').parentElement.hidden = !c || isImage;
   $('outlineProperties').hidden = !c || isBackground;
   ['outlineEnabled', 'outlineWidth', 'outlineColor'].forEach(id => { $(id).disabled = !c || isBackground; });
-  $('imageWidth').parentElement.firstChild.textContent = isBackground ? '底图缩放 ' : '图像缩放（保持原比例） ';
-  $('posX').parentElement.firstChild.textContent = isBackground ? '水平偏移 ' : '水平位置 ';
-  $('posY').parentElement.firstChild.textContent = isBackground ? '垂直偏移 ' : '垂直位置 ';
+  $('imageWidth').parentElement.firstChild.textContent = `${isBackground ? t('backgroundScale') : t('imageScaleLabel')} `;
+  $('posX').parentElement.firstChild.textContent = `${isBackground ? t('horizontalOffset') : t('horizontalPositionLabel')} `;
+  $('posY').parentElement.firstChild.textContent = `${isBackground ? t('verticalOffset') : t('verticalPositionLabel')} `;
   $('posX').min = isBackground ? '-150' : '0'; $('posX').max = isBackground ? '150' : '100';
   $('posY').min = isBackground ? '-150' : '0'; $('posY').max = isBackground ? '150' : '100';
   if (!c) return;
@@ -566,12 +575,12 @@ async function openImageLibrary() {
 }
 async function refreshImageLibrary() {
   const grid = $('imageLibraryGrid');
-  grid.innerHTML = '<div class="image-library-empty">正在读取图库…</div>';
+  grid.innerHTML = `<div class="image-library-empty">${t('libraryLoading')}</div>`;
   try {
     imageLibraryEntries = await app().ListImageLibrary();
     grid.innerHTML = '';
     if (!imageLibraryEntries.length) {
-      grid.innerHTML = '<div class="image-library-empty">图库为空。点击右上角“导入图片”添加本机图片。</div>';
+      grid.innerHTML = `<div class="image-library-empty">${t('libraryEmpty')}</div>`;
       return;
     }
     imageLibraryEntries.forEach(entry => {
@@ -582,12 +591,12 @@ async function refreshImageLibrary() {
       const meta = document.createElement('small'); meta.textContent = `${entry.width} × ${entry.height} · ${(entry.size / 1024).toFixed(1)} KB`;
       details.append(title, meta);
       const actions = document.createElement('div'); actions.className = 'image-library-actions';
-      const backgroundButton = document.createElement('button'); backgroundButton.className = 'small-btn'; backgroundButton.textContent = '设为底图';
+      const backgroundButton = document.createElement('button'); backgroundButton.className = 'small-btn'; backgroundButton.textContent = t('setAsBackground');
       backgroundButton.addEventListener('click', async () => {
         try { const dataURL = await app().LoadImageLibraryImage(entry.id); setBackgroundImage(dataURL, entry.name); $('imageLibraryDialog').close(); }
         catch (e) { setStatus(`载入底图失败：${String(e)}`, true); }
       });
-      const componentButton = document.createElement('button'); componentButton.className = 'small-btn'; componentButton.textContent = '添加图层';
+      const componentButton = document.createElement('button'); componentButton.className = 'small-btn'; componentButton.textContent = t('addLayer');
       componentButton.addEventListener('click', async () => {
         try { const dataURL = await app().LoadImageLibraryImage(entry.id); await addImageComponent(dataURL, entry.name); $('imageLibraryDialog').close(); }
         catch (e) { setStatus(`添加图像失败：${String(e)}`, true); }
@@ -596,7 +605,7 @@ async function refreshImageLibrary() {
       card.append(preview, details, actions); grid.appendChild(card);
     });
   } catch (e) {
-    grid.innerHTML = `<div class="image-library-empty">图库读取失败：${String(e)}</div>`;
+    grid.innerHTML = `<div class="image-library-empty">${t('libraryReadFailed', { error: String(e) })}</div>`;
   }
 }
 async function importImageToLibrary() {
@@ -661,6 +670,7 @@ function deleteSelectedComponent() {
 }
 
 function templateData(template) { return (template.objects || []).map((o) => withOutlineDefaults(o)); }
+function templateDisplayName(name, index) { return !name || name === '空白模板' ? t('blankTemplate') : name; }
 function copyBackground(background) { return background ? withOutlineDefaults({ ...background }) : null; }
 function queueTXBackgroundPersist(background) {
   const snapshot = copyBackground(background);
@@ -688,9 +698,17 @@ function scheduleTXBackgroundPersist() {
   if (txBackgroundSaveTimer !== null) clearTimeout(txBackgroundSaveTimer);
   txBackgroundSaveTimer = setTimeout(() => { void persistTXBackgroundNow(); }, 250);
 }
+function refreshTemplatePreview(revision = templateRenderRevision) {
+  if (revision !== templateRenderRevision) return;
+  updateFontSizeLimits();
+  renderTemplates();
+  renderComponentList(); // also synchronizes every property editor control
+  renderCanvas();
+}
 function loadTemplateAt(index) {
   selectedTemplateSlot = Math.max(0, Math.min(3, index));
   const template = templateSlots[selectedTemplateSlot];
+  if (!template) return;
   const slotObjects = templateData(template);
   const slotBackground = slotObjects.find(isBackgroundComponent) || null;
   const currentBackground = components.find(isBackgroundComponent) || null;
@@ -703,22 +721,27 @@ function loadTemplateAt(index) {
       void persistTXBackgroundNow();
     }
   }
-  selectedComponent = 0;
-  updateFontSizeLimits();
-  $('templateName').value = template.name || '';
-  renderTemplates(); renderComponentList(); renderCanvas();
-  setStatus(`已载入模板槽位 ${selectedTemplateSlot + 1}：${template.name || '空白模板'}${sharedBackground ? '（保留共享底图）' : ''}`);
+  selectedComponent = components.length ? 0 : -1;
+  $('templateName').value = template.name || t('blankTemplate');
+  const revision = ++templateRenderRevision;
+  // Paint immediately, then repaint after the WebView has committed the updated
+  // template DOM/layout. This prevents the canvas appearing stale until another
+  // unrelated mode change causes a redraw.
+  refreshTemplatePreview(revision);
+  requestAnimationFrame(() => refreshTemplatePreview(revision));
+  setStatus(t('templateLoaded', { slot: selectedTemplateSlot + 1, name: templateDisplayName(template.name, selectedTemplateSlot), background: sharedBackground ? `（${t('backgroundKept') || '保留共享底图'}）` : '' }));
 }
 function renderTemplates() {
   const host = $('templatePresets'); host.innerHTML = '';
-  templateSlots.forEach((t, index) => {
-    const b = document.createElement('button'); b.className = `template-card${index === selectedTemplateSlot ? ' selected-template' : ''}`;
+  templateSlots.forEach((templateSlot, index) => {
+    const objects = Array.isArray(templateSlot.objects) ? templateSlot.objects : [];
+    const b = document.createElement('button'); b.type = 'button'; b.className = `template-card${index === selectedTemplateSlot ? ' selected-template' : ''}`;
     const preview = document.createElement('span'); preview.className = 'template-thumb';
-    const textObjects = t.objects.filter(o => !isImageComponent(o));
-    const mainText = document.createElement('b'); mainText.textContent = (textObjects[0]?.text || (t.objects.some(o => isImageComponent(o)) ? 'IMAGE' : (index === 3 ? '空白模板' : 'TEXT'))).replace(/\{[A-Z]+\}/g, '…').slice(0, 16);
-    const secondary = document.createElement('i'); secondary.textContent = textObjects[1]?.text?.replace(/\{[A-Z]+\}/g, '…').slice(0, 18) || (t.objects.some(o => isImageComponent(o)) ? '包含图像组件' : '');
+    const textObjects = objects.filter(o => !isImageComponent(o));
+    const mainText = document.createElement('b'); mainText.textContent = (textObjects[0]?.text || (objects.some(o => isImageComponent(o)) ? 'IMAGE' : (index === 3 ? t('blankTemplate') : 'TEXT'))).replace(/\{[A-Z]+\}/g, '…').slice(0, 16);
+    const secondary = document.createElement('i'); secondary.textContent = textObjects[1]?.text?.replace(/\{[A-Z]+\}/g, '…').slice(0, 18) || (objects.some(o => isImageComponent(o)) ? t('containsImageComponent') : '');
     preview.append(mainText, secondary);
-    const label = document.createElement('span'); label.className = 'template-name'; label.textContent = `${index + 1}. ${t.name || '空白模板'}`;
+    const label = document.createElement('span'); label.className = 'template-name'; label.textContent = `${index + 1}. ${templateDisplayName(templateSlot.name, index)}`;
     b.append(preview, label); b.addEventListener('click', () => loadTemplateAt(index)); host.appendChild(b);
   });
 }
@@ -981,29 +1004,33 @@ function updateAudioState(state) {
   }
   if (!audioState.rxActive) captureTelemetrySeen = false;
   const connected = !!audioState.connected;
-  const label = audioState.rxActive ? `RX 自动运行 · ${(audioState.sampleRate || 48000) / 1000} kHz` : (connected ? '音频已就绪' : '音频待初始化');
-  document.querySelector('.device-state').lastChild.textContent = ` ${label}`;
+  const label = audioState.rxActive ? t('rxAutoRunning', { rate: (audioState.sampleRate || 48000) / 1000 }) : (connected ? t('audioReady') : t('audioInitializing'));
+  $('deviceStateLabel').textContent = label;
   document.querySelector('.device-state i').style.background = audioState.rxActive ? '#5b9f77' : '#c39a55';
   $('rate').disabled = false;
   ['audioInput','audioOutput','pttMode','rigctlAddress','serialPort','pttActiveHigh','pttLead','pttTail'].forEach(id => { if ($(id)) $(id).disabled = false; });
   const txButton = $('txToggle');
   txButton.disabled = !connected || toneActive || (!audioState.txActive && !activeTXMode()?.ready);
-  txButton.textContent = audioState.txActive && !toneActive ? '停止发射' : '开始发射';
+  txButton.textContent = audioState.txActive && !toneActive ? t('txStop') : t('txStart');
   txButton.classList.toggle('tx-running', !!audioState.txActive && !toneActive);
   const toneButton = $('toneToggle');
   toneButton.disabled = !connected || (audioState.txActive && !toneActive);
-  toneButton.textContent = toneActive ? '停止单音' : '1500 Hz 单音';
-  $('audioSettingsStatus').textContent = connected ? `共享模式音频已就绪，${audioState.rxActive ? 'RX 持续接收中' : 'RX 正在恢复'}${audioState.txActive ? '，TX 运行中' : ''}` : '音频设备待初始化，工作台会自动启动 RX';
+  toneButton.textContent = toneActive ? t('toneStop') : t('toneStart');
+  $('audioSettingsStatus').textContent = connected ? `${t('audioReadyStatus')}，${audioState.rxActive ? t('rxContinuous') : t('rxRestoring')}${audioState.txActive ? `，${t('txRunningLabel')}` : ''}` : t('audioPendingStatus');
   $('spectrumState').textContent = !audioState.rxActive ? 'INPUT IDLE' : (captureTelemetrySeen ? 'INPUT ACTIVE · SHARED' : 'WAITING FOR INPUT');
-  $('spectrumOverlay').textContent = !audioState.rxActive ? 'RX 尚未启动' : (captureTelemetrySeen ? '' : 'RX 已启动，正在等待音频设备输入采样…');
+  $('spectrumOverlay').textContent = !audioState.rxActive ? t('audioInputIdle') : (captureTelemetrySeen ? '' : t('rxWaitingSamples'));
   $('spectrumOverlay').style.display = audioState.rxActive && captureTelemetrySeen ? 'none' : 'grid';
-  $('rxHint').textContent = !audioState.rxActive ? (rxEnabled ? 'RX 音频流正在初始化…' : 'RX 已停止') : (captureTelemetrySeen ? '实时音频采集中' : 'RX 已启动，等待输入采样');
-  $('rxStatus').textContent = audioState.rxActive ? (autoSelected ? 'Auto 自动接收中' : '指定模式接收中') : (rxEnabled ? '初始化中' : 'RX 已停止');
-  $('txStatus').textContent = audioState.txActive ? (toneActive ? '1500 Hz 单音发射' : '正在发射') : '草稿';
+  $('rxHint').textContent = !audioState.rxActive ? (rxEnabled ? t('rxInitializingHint') : t('rxStoppedHint')) : (captureTelemetrySeen ? t('rxLiveCapture') : t('audioWaitingSamples'));
+  $('rxStatus').textContent = audioState.rxActive ? (autoSelected ? t('rxAutoReceiving') : t('rxModeReceiving')) : (rxEnabled ? t('rxInitializing') : t('rxStopped'));
+  $('txStatus').textContent = audioState.txActive ? (toneActive ? t('txTone') : t('txTransmitting')) : t('txDraftState');
 }
 function bindRuntimeEvents() {
   if (!window.runtime?.EventsOn) return;
   window.runtime.EventsOn('audio:state', updateAudioState);
+  window.runtime.EventsOn('ptt:test', data => {
+    if (data?.active) renderPTTTestState(true, Date.now() + 15000);
+    else renderPTTTestState(false, 0, data?.error || '');
+  });
   window.runtime.EventsOn('audio:warning', (message) => {
     const warning = String(message || '音频设备提示');
     $('rxHint').textContent = warning;
@@ -1013,14 +1040,14 @@ function bindRuntimeEvents() {
     captureTelemetrySeen = true;
     const peakHz = Number(data?.peakHz || 0);
     const crest = Number(data?.crest || 0);
-    $('spectrumState').textContent = `峰值 ${peakHz.toFixed(0)} Hz · 峰度 ${crest.toFixed(1)}`;
+    $('spectrumState').textContent = t('spectrumPeak', { peak: peakHz.toFixed(0), crest: crest.toFixed(1) });
     const dbfs = Number(data?.dbfs ?? -120);
     currentInputDBFS = dbfs;
     const fill = Math.max(0, Math.min(100, (dbfs + 60) / 60 * 100));
     $('inputLevel').style.width = `${fill}%`;
     $('inputLevelText').textContent = `${dbfs.toFixed(1)} dBFS`;
     const samplesReceived = Number(data?.samplesReceived) || 0;
-    $('rxHint').textContent = data?.droppedBlocks ? `采集队列丢弃 ${data.droppedBlocks} 个音频块` : (dbfs < -90 ? `已收到 ${samplesReceived.toLocaleString()} 个采样，当前输入接近静音` : `实时音频采集中 · ${samplesReceived.toLocaleString()} samples`);
+    $('rxHint').textContent = data?.droppedBlocks ? t('droppedAudioBlocks', { count: data.droppedBlocks }) : (dbfs < -90 ? t('inputNearSilence', { count: samplesReceived.toLocaleString() }) : t('samplesCount', { count: samplesReceived.toLocaleString() }));
     renderLiveSpectrum(data?.spectrum);
     $('spectrumOverlay').style.display = 'none';
   });
@@ -1029,13 +1056,13 @@ function bindRuntimeEvents() {
     $('rxProgressFill').style.width = `${percent}%`;
     $('rxProgressText').textContent = `${Math.round(percent)}%`;
     if (data?.complete) {
-      $('rxProgressLabel').textContent = `${data.mode || 'SSTV'} 解码完成`;
+      $('rxProgressLabel').textContent = t('decodeComplete', { mode: data.mode || 'SSTV' });
     } else if (data?.active) {
       const rows = Number(data.rows) || 0;
       const total = Number(data.totalRows) || 0;
-      $('rxProgressLabel').textContent = `正在接收 ${data.mode || 'SSTV'} · ${rows}/${total} 行`;
+      $('rxProgressLabel').textContent = t('receivingRows', { mode: data.mode || 'SSTV', rows, total });
     } else {
-      $('rxProgressLabel').textContent = '等待 SSTV 信号';
+      $('rxProgressLabel').textContent = t('waitingSignal');
       $('rxProgressFill').style.width = '0%';
       $('rxProgressText').textContent = '0%';
     }
@@ -1045,7 +1072,7 @@ function bindRuntimeEvents() {
     // Reject malformed/empty identities before they can affect the QSO form.
     if (!/^[A-Z0-9/\-]{1,16}$/.test(callsign)) return;
     $('rxCallsign').textContent = callsign;
-    $('rxCallsign').title = `来源：${data?.source || 'FSKID'}`;
+    $('rxCallsign').title = t('callsignSource', { source: data?.source || 'FSKID' });
 
     // Auto-fill HisCall when it is empty, or refresh a value that was itself
     // previously filled by FSKID. A manually edited QSO callsign is preserved.
@@ -1060,8 +1087,8 @@ function bindRuntimeEvents() {
       filledHisCall = true;
     }
     setStatus(filledHisCall
-      ? `已通过 ${data?.source || 'FSKID'} 识别到呼号 ${callsign}，已填入对方呼号`
-      : `已通过 ${data?.source || 'FSKID'} 识别到呼号 ${callsign}；保留了已手动填写的对方呼号`);
+      ? t('callsignFilled', { source: data?.source || 'FSKID', callsign })
+      : t('callsignPreserved', { source: data?.source || 'FSKID', callsign }));
   });
   window.runtime.EventsOn('rx:preview', (data) => {
     const frame = $('rxImageFrame');
@@ -1070,31 +1097,31 @@ function bindRuntimeEvents() {
       frame.innerHTML = '';
       img = document.createElement('img');
       img.id = 'rxLiveImage';
-      img.alt = `${data.mode || 'SSTV'} 实时解码图像`;
+      img.alt = t('liveImageAlt', { mode: data.mode || 'SSTV' });
       frame.appendChild(img);
     }
     img.src = data.image;
     img.alt = `${data.mode || 'SSTV'} 实时解码图像`;
     $('rxDetectedMode').textContent = data.mode || '---';
     $('rxResolution').textContent = `${data.width} × ${data.height}`;
-    $('rxStatus').textContent = '实时图像解码中';
-    $('rxProgressLabel').textContent = `实时显示 ${data.mode || 'SSTV'} · ${data.rows}/${data.totalRows} 行`;
+    $('rxStatus').textContent = t('rxLiveDecoding');
+    $('rxProgressLabel').textContent = t('liveRows', { mode: data.mode || 'SSTV', rows: data.rows, total: data.totalRows });
   });
   window.runtime.EventsOn('rx:frame', async (data) => {
     latestRXImageData = data.image || latestRXImageData;
     templateImageCache.clear();
     renderCanvas();
     const frame = $('rxImageFrame'); frame.innerHTML = '';
-    const img = document.createElement('img'); img.src = data.image; img.alt = `${data.mode} 接收图像`; frame.appendChild(img);
+    const img = document.createElement('img'); img.src = data.image; img.alt = t('receivingImageAlt', { mode: data.mode }); frame.appendChild(img);
     $('rxDetectedMode').textContent = data.mode; $('rxResolution').textContent = `${data.width} × ${data.height}`; $('rxTimestamp').textContent = data.timestamp;
-    $('rxStatus').textContent = '图像接收完成';
-    $('rxProgressFill').style.width = '100%'; $('rxProgressText').textContent = '100%'; $('rxProgressLabel').textContent = '图像接收完成';
-    setStatus(`${data.mode} 图像接收完成${data.albumSaved ? '，已加入相册' : ''}`);
+    $('rxStatus').textContent = t('imageReceivedStatus');
+    $('rxProgressFill').style.width = '100%'; $('rxProgressText').textContent = '100%'; $('rxProgressLabel').textContent = t('imageReceivedStatus');
+    setStatus(`${data.mode} ${t('imageReceivedStatus')}${data.albumSaved ? t('imageAddedAlbum') : ''}`);
     await refreshAlbum();
   });
   window.runtime.EventsOn('rx:error', message => setStatus(`RX 解码提示：${message}`, true));
   window.runtime.EventsOn('tx:state', data => {
-    $('txStatus').textContent = data.state === 'playing' ? '发射中' : data.state === 'encoding' ? '编码中' : data.state === 'completed' ? '完成' : data.state === 'stopped' ? '已停止' : data.state === 'error' ? '错误' : '草稿';
+    $('txStatus').textContent = data.state === 'playing' ? t('txStatePlaying') : data.state === 'encoding' ? t('txStateEncoding') : data.state === 'completed' ? t('txStateCompleted') : data.state === 'stopped' ? t('txStateStopped') : data.state === 'error' ? t('txStateError') : t('txStateDraft');
     $('txProgressLabel').textContent = data.message || data.state;
     if (data.state === 'completed') { $('txProgressFill').style.width = '100%'; $('txProgressText').textContent = '100%'; }
     if (data.state === 'stopped' || data.state === 'error') $('txProgressLabel').textContent = data.message || data.state;
@@ -1108,20 +1135,20 @@ function bindRuntimeEvents() {
     const percent = Math.max(0, Math.min(100, Number(data?.percent) || 0));
     $('txProgressFill').style.width = `${percent}%`;
     $('txProgressText').textContent = `${Math.round(percent)}%`;
-    $('txProgressLabel').textContent = data?.message || (data?.stage === 'playing' ? '正在发射 SSTV' : '正在编码 SSTV');
+    $('txProgressLabel').textContent = data?.message || (data?.stage === 'playing' ? t('txPlaying') : t('txEncoding'));
   });
   window.runtime.EventsOn('tx:complete', () => refreshAlbum());
 }
 
 async function startTX() {
   const mode = activeTXMode();
-  if (!mode || !mode.ready) return setStatus('当前 TX 模式的编码器不可用', true);
-  if (!audioState.connected) return setStatus('TX 音频输出尚未初始化，请在设备设置中选择输出设备并应用', true);
+  if (!mode || !mode.ready) return setStatus(t('txEncoderUnavailable'), true);
+  if (!audioState.connected) return setStatus(t('txOutputNotReady'), true);
   try {
     // Use the current QSO editor identity for the FSKID payload, so the
     // transmitted station ID always matches the visible MYCALL template token.
     const savedStation = await app().SaveStationSettings({ myCall: $('myCall').value, locator: $('locator').value });
-    stationSettings = { myCall: savedStation?.myCall || '', locator: savedStation?.locator || '' };
+    stationSettings = { myCall: savedStation?.myCall || 'N0CALL', locator: savedStation?.locator || 'JJ00' };
     syncStationSettingsForm();
     await app().StartTX(exportCanvasDataURL(), mode.id, Number($('rate').value));
     updateAudioState({ ...audioState, txActive: true });
@@ -1168,7 +1195,7 @@ async function refreshAudioDevices() {
       (items || []).forEach(device => { const option = document.createElement('option'); option.value = device.id; option.textContent = `${device.name}${device.isDefault ? ' · 默认' : ''}`; select.appendChild(option); });
       if ([...select.options].some(o => o.value === previous)) select.value = previous;
     };
-    fill(input, lists.inputs, '系统默认输入设备'); fill(output, lists.outputs, '系统默认输出设备');
+    fill(input, lists.inputs, t('systemDefaultInput')); fill(output, lists.outputs, t('systemDefaultOutput'));
     $('audioSettingsStatus').textContent = `发现 ${lists.inputs.length} 个输入设备和 ${lists.outputs.length} 个输出设备`;
   } catch (e) { $('audioSettingsStatus').textContent = `设备枚举失败：${String(e)}`; }
 }
@@ -1199,7 +1226,7 @@ async function refreshSerialPorts() {
     select.innerHTML = '';
     const empty = document.createElement('option');
     empty.value = '';
-    empty.textContent = ports.length ? '选择串口' : '未发现串口';
+    empty.textContent = ports.length ? t('chooseSerial') : t('serialNotFound');
     select.appendChild(empty);
     (ports || []).forEach(port => {
       const option = document.createElement('option');
@@ -1212,7 +1239,7 @@ async function refreshSerialPorts() {
     select.innerHTML = '';
     const empty = document.createElement('option');
     empty.value = '';
-    empty.textContent = '串口枚举失败';
+    empty.textContent = t('serialEnumFailed');
     select.appendChild(empty);
   }
 }
@@ -1222,16 +1249,90 @@ function updatePTTFields() {
   show($('rigctlField'), mode === 'hamlib');
   show($('serialField'), mode === 'rts' || mode === 'dtr');
   show($('activeHighField'), mode === 'rts' || mode === 'dtr');
+  show($('pttTestRow'), mode !== 'vox');
+  if ($('pttTestButton')) $('pttTestButton').disabled = mode === 'vox';
+  if (mode === 'vox' && pttTestActive) app().StopPTTTest().catch(() => {});
 }
+function pttTestConfigFromForm() {
+  return {
+    sampleRate: Number($('rate').value) || 48000,
+    pttMode: $('pttMode').value,
+    rigctlAddress: $('rigctlAddress').value.trim(),
+    serialPort: $('serialPort').value.trim(),
+    activeHigh: $('pttActiveHigh').checked,
+    pttLeadMs: Number($('pttLead').value) || 0,
+    pttTailMs: Number($('pttTail').value) || 0,
+  };
+}
+function renderPTTTestState(active, deadline = 0, error = '') {
+  pttTestActive = !!active;
+  pttTestDeadline = deadline;
+  const button = $('pttTestButton');
+  const status = $('pttTestStatus');
+  if (pttTestTimer) clearInterval(pttTestTimer);
+  pttTestTimer = null;
+  if (!button || !status) return;
+  button.disabled = $('pttMode').value === 'vox';
+  if (!active) {
+    button.textContent = t('pttTest');
+    status.textContent = error ? t('pttTestFailed', { error }) : '';
+    return;
+  }
+  button.textContent = t('pttTestStop');
+  const update = () => {
+    const seconds = Math.max(0, Math.ceil((pttTestDeadline - Date.now()) / 1000));
+    status.textContent = t('pttTestRunning', { seconds });
+    if (seconds <= 0 && pttTestTimer) {
+      clearInterval(pttTestTimer);
+      pttTestTimer = null;
+    }
+  };
+  update();
+  pttTestTimer = setInterval(update, 200);
+}
+async function togglePTTTest() {
+  const button = $('pttTestButton');
+  const status = $('pttTestStatus');
+  if (pttTestActive) {
+    button.disabled = true;
+    try {
+      await app().StopPTTTest();
+      renderPTTTestState(false);
+    } catch (e) {
+      renderPTTTestState(false, 0, String(e));
+    } finally { button.disabled = false; }
+    return;
+  }
+  if ($('pttMode').value === 'vox') {
+    status.textContent = t('pttVoxUnavailable');
+    return;
+  }
+  button.disabled = true;
+  status.textContent = t('pttTestStarting');
+  try {
+    await app().StartPTTTest(pttTestConfigFromForm());
+    renderPTTTestState(true, Date.now() + 15000);
+  } catch (e) {
+    renderPTTTestState(false, 0, String(e));
+  } finally { button.disabled = false; }
+}
+
 async function saveAllSettings() {
   const button = $('saveAllSettings');
   const status = $('settingsStatus');
+  const closeButton = $('closeSettings');
   button.disabled = true;
-  status.textContent = '正在保存…';
+  closeButton.disabled = true;
+  if ($('pttTestButton')) $('pttTestButton').disabled = true;
+  status.textContent = t('saving');
   status.classList.remove('error');
   try {
+    if (pttTestActive) {
+      await app().StopPTTTest();
+      renderPTTTestState(false);
+    }
     const saved = await app().SaveStationSettings({ myCall: $('settingsMyCall').value, locator: $('settingsLocator').value });
-    stationSettings = { myCall: saved?.myCall || '', locator: saved?.locator || '' };
+    stationSettings = { myCall: saved?.myCall || 'N0CALL', locator: saved?.locator || 'JJ00' };
     $('myCall').value = stationSettings.myCall;
     $('locator').value = stationSettings.locator;
     syncStationSettingsForm();
@@ -1243,13 +1344,18 @@ async function saveAllSettings() {
     };
     await app().ApplyAudioSettings(cfg, currentRXModeID());
     updateAudioState(await app().GetAudioState());
-    status.textContent = '设置已保存并应用';
-    setStatus('音频、PTT 与本站信息已保存并应用');
+    status.textContent = t('settingsSaved');
+    setStatus(t('settingsSaved'));
+    $('settingsDialog').close();
   } catch (e) {
-    status.textContent = `保存失败：${String(e)}`;
+    status.textContent = t('settingsFailed', { error: String(e) });
     status.classList.add('error');
     setStatus(`保存设置失败：${String(e)}`, true);
-  } finally { button.disabled = false; }
+  } finally {
+    button.disabled = false;
+    closeButton.disabled = false;
+    if ($('pttTestButton')) $('pttTestButton').disabled = $('pttMode').value === 'vox' || pttTestActive;
+  }
 }
 
 
@@ -1334,7 +1440,7 @@ function syncStationSettingsForm() {
 async function loadStationSettings() {
   try {
     const saved = await app().GetStationSettings();
-    stationSettings = { myCall: saved?.myCall || '', locator: saved?.locator || '' };
+    stationSettings = { myCall: saved?.myCall || 'N0CALL', locator: saved?.locator || 'JJ00' };
     $('myCall').value = stationSettings.myCall;
     $('locator').value = stationSettings.locator;
     syncStationSettingsForm();
@@ -1355,22 +1461,49 @@ function setupSettings() {
     updatePTTFields();
     dialog.showModal();
   });
-  $('closeSettings').addEventListener('click', () => dialog.close());
+  $('closeSettings').addEventListener('click', async () => {
+    if (pttTestActive) { try { await app().StopPTTTest(); } catch {} }
+    dialog.close();
+  });
   $('saveAllSettings').addEventListener('click', saveAllSettings);
   $('refreshAudioDevices').addEventListener('click', refreshAudioDevices);
   $('refreshSerialPorts').addEventListener('click', refreshSerialPorts);
   $('pttMode').addEventListener('change', updatePTTFields);
-  dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
+  $('pttTestButton').addEventListener('click', togglePTTTest);
+  // Do not close on backdrop clicks or Escape: this prevents losing unsaved edits.
+  dialog.addEventListener('cancel', e => e.preventDefault());
+  $('languageSelect').addEventListener('change', e => window.SATSSTVI18n?.setLanguage(e.target.value));
+  window.addEventListener('satsstv-language-change', () => {
+    updatePTTFields();
+    updateAudioState(audioState);
+    updateModeInfo();
+    if (pttTestActive) renderPTTTestState(true, pttTestDeadline);
+    renderModeSlots(); renderTXModeSlots(); renderTemplates(); renderComponentList();
+  });
   $('closePreview').addEventListener('click', () => $('albumPreviewDialog').close());
 }
 async function initializeAudioRX() {
   try {
-    $('rxStatus').textContent = '正在初始化'; $('spectrumOverlay').textContent = '正在打开共享模式音频输入设备…';
-    await app().SetRXEnabled(rxEnabled, currentRXModeID());
-    updateAudioState(await app().GetAudioState());
-    setStatus(!rxEnabled ? '音频设备已就绪，RX 当前已停止' : (autoSelected ? 'RX 已启动，正在自动识别 SSTV 模式' : `RX 已启动，指定模式：${activeRXMode()?.name || ''}`));
+    $('rxStatus').textContent = t('rxInitializing'); $('spectrumOverlay').textContent = t('audioInputOpening');
+    if (rxEnabled) await app().InitializeAudio(currentRXModeID());
+    else await app().SetRXEnabled(false, '');
+    let state = await app().GetAudioState();
+    // Wails/audio backends can report the pre-start state if the native device
+    // emits its first state event while the window is still initializing.
+    // Retry initialization once when RX was requested but is not actually live.
+    if (rxEnabled && !state?.rxActive) {
+      await new Promise(resolve => setTimeout(resolve, 180));
+      state = await app().GetAudioState();
+      if (!state?.rxActive) {
+        await app().InitializeAudio(currentRXModeID());
+        state = await app().GetAudioState();
+      }
+    }
+    updateAudioState(state);
+    renderModeSlots();
+    setStatus(!rxEnabled ? '音频设备已就绪，RX 当前已停止' : (state?.rxActive ? (autoSelected ? 'RX 已启动，正在自动识别 SSTV 模式' : `RX 已启动，指定模式：${activeRXMode()?.name || ''}`) : '音频设备已连接，RX 正在等待启动'));
   } catch (e) {
-    $('rxStatus').textContent = '音频初始化失败'; $('rxHint').textContent = String(e); $('spectrumOverlay').textContent = `音频初始化失败：${String(e)}。请检查设备设置。`;
+    $('rxStatus').textContent = t('rxInitFailedShort'); $('rxHint').textContent = String(e); $('spectrumOverlay').textContent = t('rxInitFailed', { error: String(e) });
     setStatus(`自动启动 RX 失败：${String(e)}`, true);
   }
 }
@@ -1410,8 +1543,9 @@ document.addEventListener('pointerdown', e => { if (!$('contextMenu').contains(e
 document.addEventListener('keydown', e => { if (e.key === 'Escape') hideContextMenu(); });
 
 window.addEventListener('DOMContentLoaded', async () => {
-  drawIdleSpectrum();
+  window.SATSSTVI18n?.applyTranslations();
   setupSettings();
+  drawIdleSpectrum();
   setupCanvasDrag();
   bindRuntimeEvents();
 

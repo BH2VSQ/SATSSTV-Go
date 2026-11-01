@@ -117,14 +117,12 @@ jobs:
       - name: Check frontend JavaScript syntax
         run: |
           node --check frontend/app.js
+          node --check frontend/i18n.js
           node --check frontend/wailsjs/go/main/App.js
         shell: bash
 
       - name: Run frontend tests
-        run: >-
-          node --test
-          frontend/tests/rx-callsign.test.cjs
-          frontend/tests/waterfall.test.cjs
+        run: node --test frontend/tests/*.test.cjs
         shell: bash
 
       - name: Test repository cleanup script

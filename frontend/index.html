@@ -11,84 +11,84 @@
   <div id="appShell" class="app-shell">
     <header class="topbar">
       <div class="brand"><span class="brand-icon">S</span><strong>SATSSTV-Go</strong><span class="version">Wails Desktop</span></div>
-      <nav class="main-nav" aria-label="主页面">
-        <button class="nav-btn active" data-page="workbench">工作台</button>
-        <button class="nav-btn" data-page="album">相册 <span id="albumCount" class="count">0</span></button>
+      <nav class="main-nav" aria-label="主页面" data-i18n-aria="navWorkbench">
+        <button class="nav-btn active" data-page="workbench" data-i18n="navWorkbench">工作台</button>
+        <button class="nav-btn" data-page="album" data-i18n="navAlbum">相册 <span id="albumCount" class="count">0</span></button>
       </nav>
-      <div class="top-actions"><span class="device-state"><i></i> 音频设备未连接</span><button id="openSettings" class="icon-action" title="设备设置">⚙</button></div>
+      <div class="top-actions"><span class="device-state"><i></i> <span id="deviceStateLabel" data-i18n="audioDisconnected">音频设备未连接</span></span><select id="languageSelect" class="language-select" aria-label="界面语言" data-i18n-aria="language"><option value="zh-CN">简体中文</option><option value="en">English</option><option value="ja">日本語</option></select><button id="openSettings" class="icon-action" title="设备设置" data-i18n-title="settingsTitle">⚙</button></div>
     </header>
 
     <main id="workbenchPage" class="page active-page">
       <div class="workbench-grid">
         <section class="pane rx-pane">
-          <div class="pane-heading"><div class="pane-title"><span class="rx-tag">RX</span><strong>接收监视</strong><small id="rxStatus">待机</small></div><div class="pane-tools"><span class="rx-auto-state" id="rxAutoState">Auto · 自动接收</span></div></div>
+          <div class="pane-heading"><div class="pane-title"><span class="rx-tag">RX</span><strong data-i18n="rxTitle">接收监视</strong><small id="rxStatus">待机</small></div><div class="pane-tools"><span class="rx-auto-state" id="rxAutoState" data-i18n="rxAuto">Auto · 自动接收</span></div></div>
           <div class="modebar rx-modebar">
-            <div class="modebar-label"><b>RX MODE</b><small>右键更换槽位</small></div>
+            <div class="modebar-label"><b>RX MODE</b><small data-i18n="rxSlotHint">右键更换槽位</small></div>
             <div id="modeSlots" class="mode-slots"></div>
-            <div class="modebar-meta"><span id="modeInfo">载入模式中…</span><select id="rate" aria-label="音频采样率"><option value="48000">48 kHz</option><option value="44100">44.1 kHz</option><option value="96000">96 kHz</option></select></div>
+            <div class="modebar-meta"><span id="modeInfo">载入模式中…</span><select id="rate" aria-label="音频采样率" data-i18n-aria="audioRate"><option value="48000">48 kHz</option><option value="44100">44.1 kHz</option><option value="96000">96 kHz</option></select></div>
           </div>
           <div class="rx-image-frame" id="rxImageFrame">
-            <div class="empty-state"><span class="empty-picture">▧</span><b>等待接收图像</b><small>解码完成的图像会显示在这里</small></div>
+            <div class="empty-state"><span class="empty-picture">▧</span><b data-i18n="rxWaitImage">等待接收图像</b><small data-i18n="rxWaitImageHint">解码完成的图像会显示在这里</small></div>
           </div>
-          <div class="image-status"><span>模式 <b id="rxDetectedMode">Auto</b></span><span>尺寸 <b id="rxResolution">---</b></span><span>呼号 <b id="rxCallsign">等待 FSKID</b></span><span>接收时间 <b id="rxTimestamp">--</b></span></div>
-          <div class="rx-decode-progress"><div class="rx-progress-meta"><span id="rxProgressLabel">等待 SSTV 信号</span><b id="rxProgressText">0%</b></div><div class="rx-progress-track"><i id="rxProgressFill"></i></div></div>
-          <div class="spectrum-head"><b>Audio Spectrum / Waterfall</b><span id="spectrumState">INPUT IDLE</span><button id="saveCapture" class="small-btn" title="保存最近约 10 秒采集音频用于诊断">保存采集</button></div>
-          <div class="spectrum-frame"><canvas id="spectrum" width="900" height="230"></canvas><div id="spectrumOverlay">实时显示 900 至 2800 Hz SSTV 音频频谱与瀑布图</div></div>
-          <div class="rx-footer"><span class="level-label">接收电平见频谱左侧</span><div class="level-meter" hidden><i id="inputLevel"></i></div><span id="inputLevelText" hidden>-- dBFS</span><span class="rx-hint" id="rxHint">RX 将随工作台自动启动</span></div>
+          <div class="image-status"><span><span data-i18n="rxMode">模式</span> <b id="rxDetectedMode">Auto</b></span><span><span data-i18n="rxSize">尺寸</span> <b id="rxResolution">---</b></span><span><span data-i18n="rxCallsign">呼号</span> <b id="rxCallsign">等待 FSKID</b></span><span><span data-i18n="rxTime">接收时间</span> <b id="rxTimestamp">--</b></span></div>
+          <div class="rx-decode-progress"><div class="rx-progress-meta"><span id="rxProgressLabel" data-i18n="rxWaitSignal">等待 SSTV 信号</span><b id="rxProgressText">0%</b></div><div class="rx-progress-track"><i id="rxProgressFill"></i></div></div>
+          <div class="spectrum-head"><b>Audio Spectrum / Waterfall</b><span id="spectrumState">INPUT IDLE</span><button id="saveCapture" class="small-btn" title="保存最近约 10 秒采集音频用于诊断" data-i18n="saveCapture">保存采集</button></div>
+          <div class="spectrum-frame"><canvas id="spectrum" width="900" height="230"></canvas><div id="spectrumOverlay" data-i18n="rxSpectrumHint">实时显示 900 至 2800 Hz SSTV 音频频谱与瀑布图</div></div>
+          <div class="rx-footer"><span class="level-label" data-i18n="rxLevel">接收电平见频谱左侧</span><div class="level-meter" hidden><i id="inputLevel"></i></div><span id="inputLevelText" hidden>-- dBFS</span><span class="rx-hint" id="rxHint" data-i18n="rxAutoStart">RX 将随工作台自动启动</span></div>
         </section>
 
         <section class="pane tx-pane">
-          <div class="pane-heading"><div class="pane-title"><span class="tx-tag">TX</span><strong>发送编辑器</strong><small id="txStatus">草稿</small></div><div class="pane-tools"><button class="small-btn" id="encode">生成 WAV</button><button class="small-btn tone-toggle-button" id="toneToggle" disabled>1500 Hz 单音</button><button class="small-btn tx-toggle-button" id="txToggle" disabled>开始发射</button></div></div>
+          <div class="pane-heading"><div class="pane-title"><span class="tx-tag">TX</span><strong data-i18n="txTitle">发送编辑器</strong><small id="txStatus">草稿</small></div><div class="pane-tools"><button class="small-btn" id="encode" data-i18n="encodeWav">生成 WAV</button><button class="small-btn tone-toggle-button" id="toneToggle" disabled data-i18n="toneStart">1500 Hz 单音</button><button class="small-btn tx-toggle-button" id="txToggle" disabled data-i18n="txStart">开始发射</button></div></div>
           <div class="modebar tx-modebar">
-            <div class="modebar-label"><b>TX MODE</b><small>右键更换槽位</small></div>
+            <div class="modebar-label"><b>TX MODE</b><small data-i18n="rxSlotHint">右键更换槽位</small></div>
             <div id="txModeSlots" class="mode-slots"></div>
             <div class="modebar-meta"><span id="txModeInfo">Robot 36</span></div>
           </div>
-          <div class="tx-progress-wrap" aria-live="polite"><div class="tx-progress-meta"><span id="txProgressLabel">发射就绪</span><b id="txProgressText">0%</b></div><div class="tx-progress-track"><i id="txProgressFill"></i></div></div>
+          <div class="tx-progress-wrap" aria-live="polite"><div class="tx-progress-meta"><span id="txProgressLabel" data-i18n="txWait">发射就绪</span><b id="txProgressText">0%</b></div><div class="tx-progress-track"><i id="txProgressFill"></i></div></div>
           <div class="tx-editor-grid">
             <div class="tx-preview-column">
               <div class="tx-canvas-frame"><canvas id="txCanvas" width="320" height="240"></canvas></div>
-              <div class="canvas-meta"><span id="canvasDimensions">320 × 240</span><span>拖动文字或图像可调整位置</span></div>
-              <div class="source-line"><span id="imageName">默认背景，尚未载入图片</span><button id="clearBackground" class="link-btn">清除</button></div>
-              <div class="tx-action-row"><span id="txResult">编辑画面就绪</span></div>
+              <div class="canvas-meta"><span id="canvasDimensions">320 × 240</span><span data-i18n="canvasDragHint">拖动文字或图像可调整位置</span></div>
+              <div class="source-line"><span id="imageName" data-i18n="defaultBackground">默认背景，尚未载入图片</span><button id="clearBackground" class="link-btn" data-i18n="clear">清除</button></div>
+              <div class="tx-action-row"><span id="txResult" data-i18n="txReady">编辑画面就绪</span></div>
             </div>
             <div class="component-editor">
-              <div class="editor-section-head"><b>模板组件</b><div class="component-actions"><button id="addText" class="small-btn add-btn">＋ 文字</button><button id="addImage" class="small-btn add-btn">＋ 图像</button><button id="addLastRX" class="small-btn add-btn">上次 RX 图像组件</button></div></div>
+              <div class="editor-section-head"><b data-i18n="templateComponents">模板组件</b><div class="component-actions"><button id="addText" class="small-btn add-btn" data-i18n="addText">＋ 文字</button><button id="addImage" class="small-btn add-btn" data-i18n="addImage">＋ 图像</button><button id="addLastRX" class="small-btn add-btn" data-i18n="addLastRX">上次 RX 图像组件</button></div></div>
               <div id="componentList" class="component-list"></div>
               <div id="componentProperties" class="component-properties">
-                <div class="property-head"><b>组件属性</b><button id="deleteText" class="link-btn danger-link">删除</button></div>
-                <label class="property-field full-field">文字内容<input id="componentText" type="text" maxlength="220"></label>
+                <div class="property-head"><b data-i18n="componentProps">组件属性</b><button id="deleteText" class="link-btn danger-link" data-i18n="delete">删除</button></div>
+                <label class="property-field full-field" data-i18n="textContent">文字内容<input id="componentText" type="text" maxlength="220"></label>
                 <div class="property-grid">
-                  <label class="property-field">字号 <output id="fontSizeValue">18 px</output><input id="fontSize" type="range" min="6" max="72" value="18"></label>
-                  <label class="property-field">颜色<input id="fontColor" type="color" value="#ffffff"></label>
-                  <label class="property-field">水平位置 <output id="xValue">8%</output><input id="posX" type="range" min="0" max="100" value="8"></label>
-                  <label class="property-field">垂直位置 <output id="yValue">10%</output><input id="posY" type="range" min="0" max="100" value="10"></label>
+                  <label class="property-field" data-i18n="fontSize">字号 <output id="fontSizeValue">18 px</output><input id="fontSize" type="range" min="6" max="72" value="18"></label>
+                  <label class="property-field" data-i18n="color">颜色<input id="fontColor" type="color" value="#ffffff"></label>
+                  <label class="property-field" data-i18n="horizontalPosition">水平位置 <output id="xValue">8%</output><input id="posX" type="range" min="0" max="100" value="8"></label>
+                  <label class="property-field" data-i18n="verticalPosition">垂直位置 <output id="yValue">10%</output><input id="posY" type="range" min="0" max="100" value="10"></label>
                 </div>
-                <label class="check-field"><input id="fontBold" type="checkbox"> 粗体</label>
+                <label class="check-field" data-i18n="bold"><input id="fontBold" type="checkbox"> 粗体</label>
                 <div id="outlineProperties" class="outline-properties">
-                  <label class="check-field"><input id="outlineEnabled" type="checkbox" checked> 显示描边</label>
+                  <label class="check-field" data-i18n="showOutline"><input id="outlineEnabled" type="checkbox" checked> 显示描边</label>
                   <div class="property-grid outline-fields">
-                    <label class="property-field">描边宽度 <output id="outlineWidthValue">1.5 px</output><input id="outlineWidth" type="range" min="0.5" max="8" step="0.5" value="1.5"></label>
-                    <label class="property-field">描边颜色<input id="outlineColor" type="color" value="#17212b"></label>
+                    <label class="property-field" data-i18n="outlineWidth">描边宽度 <output id="outlineWidthValue">1.5 px</output><input id="outlineWidth" type="range" min="0.5" max="8" step="0.5" value="1.5"></label>
+                    <label class="property-field" data-i18n="outlineColor">描边颜色<input id="outlineColor" type="color" value="#17212b"></label>
                   </div>
                 </div>
                 <div id="imageProperties" class="property-grid image-properties" hidden>
-                  <label class="property-field">图像缩放（保持原比例） <output id="imageWidthValue">42%</output><input id="imageWidth" type="range" min="5" max="100" value="42"></label>
+                  <label class="property-field" data-i18n="imageScale">图像缩放（保持原比例） <output id="imageWidthValue">42%</output><input id="imageWidth" type="range" min="5" max="100" value="42"></label>
                 </div>
               </div>
-              <div class="editor-help">支持文字、图像图层和可拖动缩放的持久底图。图像按原图比例缩放；字号上限随 TX 模式分辨率变化。</div>
+              <div class="editor-help" data-i18n="editorHelp">支持文字、图像图层和可拖动缩放的持久底图。图像按原图比例缩放；字号上限随 TX 模式分辨率变化。</div>
             </div>
           </div>
           <div class="template-library">
-            <div class="template-library-head"><b>发送模板</b><input id="templateName" type="text" maxlength="32" value="CQ" aria-label="当前模板名称"><button id="saveTemplate" class="small-btn add-btn">保存当前槽位</button><small>前三个预设可修改，第四个为空白模板</small></div>
+            <div class="template-library-head"><b data-i18n="txTemplates">发送模板</b><input id="templateName" type="text" maxlength="32" value="CQ" aria-label="当前模板名称"><button id="saveTemplate" class="small-btn add-btn" data-i18n="saveSlot">保存当前槽位</button><small data-i18n="presetHint">前三个预设可修改，第四个为空白模板</small></div>
             <div id="templatePresets" class="template-presets"></div>
             <div class="qso-fields">
-              <input id="myCall" class="qso-primary" placeholder="本台呼号" maxlength="24">
-              <input id="hisCall" class="qso-primary" placeholder="对方呼号" maxlength="24">
-              <input id="qth" placeholder="QTH" maxlength="40">
-              <input id="locator" placeholder="网格定位" maxlength="12">
-              <input id="report" value="595" placeholder="RST / 报告" maxlength="16">
-              <input id="message" placeholder="自定义消息" maxlength="100">
+              <input id="myCall" class="qso-primary" value="N0CALL" data-i18n-placeholder="myCallPlaceholder" placeholder="本台呼号" maxlength="24">
+              <input id="hisCall" class="qso-primary" data-i18n-placeholder="hisCallPlaceholder" placeholder="对方呼号" maxlength="24">
+              <input id="qth" data-i18n-placeholder="qthPlaceholder" placeholder="QTH" maxlength="40">
+              <input id="locator" value="JJ00" data-i18n-placeholder="locatorPlaceholder" placeholder="网格定位" maxlength="12">
+              <input id="report" value="595" data-i18n-placeholder="reportPlaceholder" placeholder="RST / 报告" maxlength="16">
+              <input id="message" data-i18n-placeholder="messagePlaceholder" placeholder="自定义消息" maxlength="100">
             </div>
           </div>
         </section>
@@ -96,57 +96,59 @@
     </main>
 
     <main id="albumPage" class="page album-page">
-      <div class="album-toolbar"><div><strong>图像相册</strong><small>历史接收与发送图像，自动记录时间戳</small></div><div class="album-actions"><select id="albumFilter"><option value="all">全部图像</option><option value="rx">仅接收 RX</option><option value="tx">仅发送 TX</option></select><button id="importAlbumTX" class="small-btn">导入 TX 图像</button></div></div>
-      <div id="albumGrid" class="album-grid"><div class="album-empty">相册暂无图像。完成接收或发射后会自动归档。</div></div>
-      <div class="album-footnote">点击缩略图可查看大图；右键可导出带时间戳的 PNG 或删除记录。图像保存在本机用户配置目录。</div>
+      <div class="album-toolbar"><div><strong data-i18n="albumTitle">图像相册</strong><small data-i18n="albumSubtitle">历史接收与发送图像，自动记录时间戳</small></div><div class="album-actions"><select id="albumFilter"><option value="all" data-i18n="albumAll">全部图像</option><option value="rx" data-i18n="albumRX">仅接收 RX</option><option value="tx" data-i18n="albumTX">仅发送 TX</option></select><button id="importAlbumTX" class="small-btn" data-i18n="albumImportTX">导入 TX 图像</button></div></div>
+      <div id="albumGrid" class="album-grid"><div class="album-empty" data-i18n="albumEmpty">相册暂无图像。完成接收或发射后会自动归档。</div></div>
+      <div class="album-footnote" data-i18n="albumFootnote">点击缩略图可查看大图；右键可导出带时间戳的 PNG 或删除记录。图像保存在本机用户配置目录。</div>
     </main>
 
-    <footer class="statusbar"><span>SATSSTV-Go</span><span id="globalStatus">就绪</span><span>RX / TX Workbench</span></footer>
+    <footer class="statusbar"><span>SATSSTV-Go</span><span id="globalStatus" data-i18n="ready">就绪</span><span>RX / TX Workbench</span></footer>
   </div>
 
   <div id="contextMenu" class="context-menu" hidden></div>
 
   <dialog id="settingsDialog" class="settings-dialog">
-    <div class="dialog-title"><strong>设备设置</strong><button id="closeSettings" class="icon-action">×</button></div>
+    <div class="dialog-title"><strong data-i18n="settingsTitle">设备设置</strong><button id="closeSettings" class="icon-action" type="button" data-i18n-title="close">×</button></div>
     <div class="settings-grid">
       <section class="audio-settings">
-        <h3>音频设备</h3>
-        <label>RX 输入设备<select id="audioInput"><option value="">系统默认输入设备</option></select></label>
-        <label>TX 输出设备<select id="audioOutput"><option value="">系统默认输出设备</option></select></label>
-        <div class="settings-button-row"><button id="refreshAudioDevices" class="small-btn">刷新设备</button></div>
-        <p>输入与输出均采用共享模式，不独占系统音频设备。保存设置时会短暂重建音频流并自动恢复 RX。</p>
-        <div id="audioSettingsStatus" class="station-settings-status">启动工作台时自动接收。</div>
+        <h3 data-i18n="audioDevices">音频设备</h3>
+        <label data-i18n="rxInput">RX 输入设备<select id="audioInput"><option value="" data-i18n="systemDefaultInput">系统默认输入设备</option></select></label>
+        <label data-i18n="txOutput">TX 输出设备<select id="audioOutput"><option value="" data-i18n="systemDefaultOutput">系统默认输出设备</option></select></label>
+        <div class="settings-button-row"><button id="refreshAudioDevices" class="small-btn" data-i18n="refreshDevices">刷新设备</button></div>
+        <p data-i18n="audioSharedHint">输入与输出均采用共享模式，不独占系统音频设备。保存设置时会短暂重建音频流并自动恢复 RX。</p>
+        <div id="audioSettingsStatus" class="station-settings-status" data-i18n="audioAutoHint">启动工作台时自动接收。</div>
       </section>
       <section class="radio-settings">
-        <h3>PTT 发射控制</h3>
-        <label>控制方式<select id="pttMode"><option value="vox">VOX（电台自动发射）</option><option value="rts">串口 RTS</option><option value="dtr">串口 DTR</option><option value="hamlib">Hamlib Rigctld</option></select></label>
-        <label id="rigctlField">Rigctl 地址<input id="rigctlAddress" type="text" placeholder="主机名:端口" autocomplete="off"></label>
-        <label id="serialField">串口名称<span class="serial-row"><select id="serialPort"><option value="">选择串口</option></select><button id="refreshSerialPorts" class="small-btn" type="button" title="重新扫描串口">刷新</button></span></label>
-        <label>PTT 前置延时 (ms)<input id="pttLead" type="number" min="0" max="10000" value="300"></label>
-        <label>PTT 释放延时 (ms)<input id="pttTail" type="number" min="0" max="10000" value="250"></label>
-        <label class="settings-check" id="activeHighField"><input id="pttActiveHigh" type="checkbox" checked> RTS/DTR 高电平发射</label>
-        <p>默认使用 VOX，由电台根据 SSTV 音频自动切换发射。也可选择串口 RTS/DTR 或 Hamlib Rigctld 控制电台 PTT。</p>
+        <h3 data-i18n="pttTitle">PTT 发射控制</h3>
+        <label data-i18n="pttMode">控制方式<select id="pttMode"><option value="vox" data-i18n="pttVOX">VOX（电台自动发射）</option><option value="rts" data-i18n="pttRTS">串口 RTS</option><option value="dtr" data-i18n="pttDTR">串口 DTR</option><option value="hamlib" data-i18n="pttHamlib">Hamlib Rigctld</option></select></label>
+        <label id="rigctlField" data-i18n="rigctlAddress">Rigctl 地址<input id="rigctlAddress" type="text" data-i18n-placeholder="hostPort" placeholder="主机名:端口" autocomplete="off"></label>
+        <label id="serialField" data-i18n="serialPort">串口名称<span class="serial-row"><select id="serialPort"><option value="">选择串口</option></select><button id="refreshSerialPorts" class="small-btn" type="button" title="重新扫描串口">刷新</button></span></label>
+        <label data-i18n="pttLead">PTT 前置延时 (ms)<input id="pttLead" type="number" min="0" max="10000" value="300"></label>
+        <label data-i18n="pttTail">PTT 释放延时 (ms)<input id="pttTail" type="number" min="0" max="10000" value="250"></label>
+        <label class="settings-check" id="activeHighField" data-i18n="pttActiveHigh"><input id="pttActiveHigh" type="checkbox" checked> RTS/DTR 高电平发射</label>
+        <p data-i18n="pttHint">默认使用 VOX，由电台根据 SSTV 音频自动切换发射。也可选择串口 RTS/DTR 或 Hamlib Rigctld 控制电台 PTT。</p>
+        <div class="ptt-test-row" id="pttTestRow"><button id="pttTestButton" class="small-btn" type="button" data-i18n="pttTest">测试 PTT（最长 15 秒）</button><span id="pttTestStatus" class="station-settings-status" aria-live="polite"></span></div>
       </section>
       <section class="station-settings">
-        <h3>本站身份信息</h3>
+        <h3 data-i18n="stationIdentity">本站身份信息</h3>
         <div class="station-profile-row">
-          <label>本台呼号<input id="settingsMyCall" type="text" maxlength="24" placeholder="例如 N0CALL" autocomplete="off"></label>
-          <label>本站网格<input id="settingsLocator" type="text" maxlength="12" placeholder="例如 EXAMPLE GRID" autocomplete="off"></label>
+          <label data-i18n="myCallLabel">本台呼号<input id="settingsMyCall" type="text" value="N0CALL" maxlength="24" data-i18n-placeholder="callsignExample" placeholder="例如 N0CALL" autocomplete="off"></label>
+          <label data-i18n="locatorLabel">本站网格<input id="settingsLocator" type="text" value="JJ00" maxlength="12" data-i18n-placeholder="locatorExample" placeholder="例如 JJ00" autocomplete="off"></label>
         </div>
-        <p>保存后会写入 Windows 用户配置目录，下一次启动时自动填入工作台的本台呼号和网格。对方呼号、QTH、报告和消息仍可按每次 QSO 单独填写。</p>
+        <p data-i18n="stationHint">保存后会自动填入工作台。对方呼号、QTH、报告和消息仍可按每次 QSO 单独填写。</p>
       </section>
     </div>
     <div class="settings-footer">
       <div id="settingsStatus" class="station-settings-status" aria-live="polite">尚未保存</div>
-      <button id="saveAllSettings" class="small-btn primary-small">保存设置</button>
+      <button id="saveAllSettings" class="small-btn primary-small" data-i18n="saveSettings">保存设置</button>
     </div>
   </dialog>
 
   <dialog id="imageLibraryDialog" class="image-library-dialog">
-    <div class="dialog-title"><div><strong>模板图片图库</strong><small>图片保存在本机用户配置目录，模板会嵌入自己的副本</small></div><div class="image-library-toolbar"><button id="importLibraryImage" class="small-btn primary-small">导入图片</button><button id="closeImageLibrary" class="icon-action">×</button></div></div>
-    <div id="imageLibraryGrid" class="image-library-grid"><div class="image-library-empty">正在读取图库…</div></div>
+    <div class="dialog-title"><div><strong data-i18n="imageLibrary">模板图片图库</strong><small data-i18n="librarySubtitle">图片保存在本机用户配置目录，模板会嵌入自己的副本</small></div><div class="image-library-toolbar"><button id="importLibraryImage" class="small-btn primary-small" data-i18n="importImage">导入图片</button><button id="closeImageLibrary" class="icon-action" type="button" data-i18n-title="close">×</button></div></div>
+    <div id="imageLibraryGrid" class="image-library-grid"><div class="image-library-empty" data-i18n="readingLibrary">正在读取图库…</div></div>
   </dialog>
   <dialog id="albumPreviewDialog" class="preview-dialog"><button id="closePreview" class="preview-close">×</button><img id="albumPreviewImage" alt="相册图像预览"><div id="albumPreviewCaption"></div></dialog>
+  <script src="i18n.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

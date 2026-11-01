@@ -62,8 +62,12 @@ export function SelectImage():Promise<string>;
 
 export function SetRXEnabled(arg1:boolean,arg2:string):Promise<void>;
 
+export function StartPTTTest(arg1:main.AudioSettings):Promise<void>;
+
 export function StartTX(arg1:string,arg2:string,arg3:number):Promise<void>;
 
 export function StartTone(arg1:number):Promise<void>;
+
+export function StopPTTTest():Promise<void>;
 
 export function StopTX():Promise<void>;

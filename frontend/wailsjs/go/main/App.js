@@ -122,12 +122,20 @@ export function SetRXEnabled(arg1, arg2) {
   return window['go']['main']['App']['SetRXEnabled'](arg1, arg2);
 }
 
+export function StartPTTTest(arg1) {
+  return window['go']['main']['App']['StartPTTTest'](arg1);
+}
+
 export function StartTX(arg1, arg2, arg3) {
   return window['go']['main']['App']['StartTX'](arg1, arg2, arg3);
 }
 
 export function StartTone(arg1) {
   return window['go']['main']['App']['StartTone'](arg1);
+}
+
+export function StopPTTTest() {
+  return window['go']['main']['App']['StopPTTTest']();
 }
 
 export function StopTX() {

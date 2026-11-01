@@ -221,6 +221,9 @@ func (a *App) SetRXEnabled(enabled bool, rxModeID string) error {
 // ApplyAudioSettings saves updated device/PTT preferences, recreates the
 // streams, and immediately resumes RX with the currently selected RX mode.
 func (a *App) ApplyAudioSettings(input AudioSettings, rxModeID string) error {
+	if err := a.StopPTTTest(); err != nil {
+		return fmt.Errorf("停止 PTT 测试失败：%w", err)
+	}
 	a.audioMu.Lock()
 	txActive := a.txCancel != nil
 	wasRXActive := a.rxCancel != nil
@@ -292,6 +295,8 @@ func (a *App) disconnectAudio() error {
 	defer a.rxOpMu.Unlock()
 	a.txOpMu.Lock()
 	defer a.txOpMu.Unlock()
+	// A PTT test may have started just before the shutdown flag was observed.
+	_ = a.StopPTTTest()
 	a.audioMu.Lock()
 	session, rxCancel, txCancel := a.audioSession, a.rxCancel, a.txCancel
 	a.audioSession, a.rxCancel, a.txCancel = nil, nil, nil
@@ -1115,6 +1120,10 @@ func (a *App) StartTX(dataURL, modeID string, sampleRate int) error {
 		return fmt.Errorf("%s 尚未实现编码器", spec.Name)
 	}
 	a.txOpMu.Lock()
+	if a.isPTTTestActive() {
+		a.txOpMu.Unlock()
+		return errors.New("PTT 测试正在运行，请先停止测试")
+	}
 	a.audioMu.Lock()
 	session := a.audioSession
 	if session == nil {
@@ -1211,6 +1220,10 @@ func (a *App) StartTX(dataURL, modeID string, sampleRate int) error {
 // the normal PTT lifecycle and can be cancelled through StopTX.
 func (a *App) StartTone(sampleRate int) error {
 	a.txOpMu.Lock()
+	if a.isPTTTestActive() {
+		a.txOpMu.Unlock()
+		return errors.New("PTT 测试正在运行，请先停止测试")
+	}
 	a.audioMu.Lock()
 	session := a.audioSession
 	if session == nil {
@@ -1307,10 +1320,14 @@ func (a *App) emitTXState(state, message string) {
 }
 
 func (a *App) shutdown(context.Context) {
+	a.shuttingDown.Store(true)
+	_ = a.StopPTTTest()
 	a.rxOpMu.Lock()
 	defer a.rxOpMu.Unlock()
 	a.txOpMu.Lock()
 	defer a.txOpMu.Unlock()
+	// A PTT test may have started just before the shutdown flag was observed.
+	_ = a.StopPTTTest()
 	a.audioMu.Lock()
 	session, rxCancel, txCancel := a.audioSession, a.rxCancel, a.txCancel
 	a.audioSession, a.rxCancel, a.txCancel = nil, nil, nil

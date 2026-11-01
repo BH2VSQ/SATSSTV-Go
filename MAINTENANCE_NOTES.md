@@ -195,3 +195,50 @@ wails build
 - `python -m unittest discover -s scripts -p 'test_*.py' -v`：3/3 通过；Python `py_compile` 通过。
 - `node --test frontend/tests/*.test.cjs`：5/5 通过；`node --check frontend/app.js` 和 `node --check frontend/wailsjs/go/main/App.js` 通过。
 - 清理脚本 dry-run 在移除测试生成的 `__pycache__` 后显示仓库无待清理项；dry-run 不执行删除。
+
+## UI usability, PTT self-test, and localization update
+
+- Added global non-selectable UI text while keeping `input`, `textarea`, `select`, and contenteditable values selectable/editable.
+- Added a PTT self-test for RTS, DTR, and Hamlib Rigctld. The user can stop it early; the Go backend independently enforces a 15-second maximum and releases/closes the PTT controller on timeout, settings application, or application shutdown. VOX mode does not show a software PTT test control.
+- Prevented the settings dialog from closing via backdrop click or Escape. The Save Settings action closes the dialog only after station settings and audio/PTT settings have both been successfully saved/applied. The explicit close button remains available.
+- Added persistent Chinese (Simplified), English, and Japanese localization with a language selector in the top bar. Static UI strings are translated from `data-i18n` attributes, and PTT/settings/device status strings use the selected locale.
+- Added frontend tests for locale switching/persistence, PTT test UI/watchdog contract, and settings-dialog dismissal/save behavior.
+
+Validation in this environment: Node syntax checks passed; 12 frontend tests passed; HTML parser and locale-key completeness checks passed; Go PTT/Rigctl/serialptt package tests passed using the locally available Go 1.23.2 with a temporary `go.mod` toolchain directive, which was restored to Go 1.25.0. A full root-package build/test could not complete because Wails v2.17.0 and Malgo are not cached and the environment cannot reach `proxy.golang.org`.
+
+## 2026-11-02 UI 防误触、PTT 测试及三语 i18n
+
+### 界面交互
+
+- 对整个应用界面启用 `user-select: none`，避免按钮、状态栏、标签、普通文本和图表标题被鼠标拖选；`input`、`textarea`、`select`、`contenteditable` 及 `.selectable-text` 仍明确允许选择和编辑。
+- 设置对话框移除通过背景空白区域关闭的逻辑，并拦截 Escape `cancel` 事件，防止未保存表单因误触关闭。右上角显式关闭按钮仍可关闭；点击“保存设置”时先持久化本站资料、再应用音频/PTT 配置，全部成功后才关闭对话框，失败则保留页面并显示错误。
+
+### PTT 自检
+
+- RTS、DTR、Hamlib Rigctld 三种硬件控制方式增加同一个 PTT 测试按钮；VOX 模式隐藏该按钮。
+- 前端显示 15 秒倒计时，可提前按同一按钮停止。Go 后端独立执行 15 秒 watchdog，执行 PTT 释放和控制器关闭，不依赖前端计时器或窗口是否仍然打开。
+- 测试与 TX 启动通过 `txOpMu` 串行化，避免 PTT 自检与正常发射同时控制线路；关闭应用、重新应用音频设置时也会释放正在进行的测试。
+- 增加 `StartPTTTest` / `StopPTTTest` Wails 绑定，并同步更新 `frontend/wailsjs/go/main/App.js` 和 `.d.ts`。
+
+### 简体中文 / English / 日本語
+
+- 新增 `frontend/i18n.js`，语言选择位于顶部栏，支持 `zh-CN`、`en`、`ja`，通过 `localStorage` 持久化。
+- HTML 使用 `data-i18n`、`data-i18n-placeholder`、`data-i18n-title` 和 `data-i18n-aria`；应用动态 RX/TX 状态、音频遥测、进度、FSKID 呼号提示、图库动作和模板编辑属性也使用对应语言词条。
+- 新增/扩展前端测试，覆盖语言切换和持久化、动态插值、PTT 自检限制/15 秒 watchdog、设置对话框 backdrop/Escape 行为和保存后关闭。
+
+### 验证
+
+- `node --check frontend/app.js`、`node --check frontend/i18n.js`、Wails JS 绑定语法检查：通过。
+- `node --test frontend/tests/*.test.cjs`：12/12 通过。
+- HTML 解析通过；98 个 HTML i18n 属性引用均能找到词条；app.js 使用的动态 i18n key 在简体中文、英文、日文三套字典中均存在。
+- `.github/workflows/go.yml` YAML 解析通过，并已将 Node 测试步骤改为运行全部 `frontend/tests/*.test.cjs`。
+- `go test ./internal/radio/ptt ./internal/radio/rigctl ./internal/radio/serialptt`：通过。测试期间临时把本地 `go.mod` 的 `go 1.25.0` 改为 `go 1.23.0` 以适配当前容器，结束后已恢复 `go 1.25.0`。
+- 根 Wails app 包及完整桌面构建未能在此容器执行：本机只有 Go 1.23.2，且 Wails v2.17.0 / Malgo 依赖未缓存，外网模块下载受限。未进行真实串口 PTT 硬件测试。
+
+
+## 2026-11-02 UI/Station Defaults Fix
+
+- RX Auto selection now checks the actual backend `audioState.rxActive` value. If the UI persisted an Auto selection while the native receiver is inactive, one click starts the receiver instead of toggling the stale selection off. Startup calls the explicit `InitializeAudio` API and retries once if RX is still not active after the initial state query.
+- Template switching now has a single revision-guarded refresh path: update font limits and property controls, draw immediately, and draw again on the next animation frame. `renderTemplates` previously named its loop parameter `t`, shadowing the translation function `t()`; the fourth blank template invoked `t('blankTemplate')` and threw, aborting the template-switch handler before the canvas redraw. The loop variable is now `templateSlot`, and a regression test renders all four presets.
+- Station defaults are now `N0CALL` and `JJ00` in the UI and Go settings backend. Missing or blank legacy settings are normalized to these defaults. QSO token `{HISCALL}` resolves to `ToCall` when the HisCall input is empty.
+- Added frontend regression tests for stale Auto state, canvas refresh, all four template slots, station defaults, and `{HISCALL}` fallback. Added Go station settings tests for first-run defaults, legacy blank-value migration, and saving defaults.

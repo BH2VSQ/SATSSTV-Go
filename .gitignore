@@ -18,6 +18,7 @@ go.work.sum
 build/bin
 bin/
 dist/
+artifacts/
 
 # Local settings and logs
 *.local.json
