@@ -1,27 +1,221 @@
-name: Go
+name: CI - Test, Build & Package
 
 on:
+  # Run for every pushed commit on every branch.
   push:
-    branches: [main, "feat/**"]
   pull_request:
-    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: satsstv-go-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
+  test-build-package:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CGO_ENABLED: "1"
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - name: Windows x64
+            os: windows-latest
+            platform: windows/amd64
+            artifact: windows-amd64
+          - name: Linux x64
+            os: ubuntu-24.04
+            platform: linux/amd64
+            artifact: linux-amd64
+          - name: macOS Apple Silicon
+            os: macos-latest
+            platform: darwin/arm64
+            artifact: macos-arm64
+          - name: macOS Intel
+            os: macos-15-intel
+            platform: darwin/amd64
+            artifact: macos-amd64
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Wails and Malgo use CGO. Windows therefore needs a MinGW-w64 compiler.
+      - name: Install Windows C compiler
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc
+
+      # Wails v2 on Ubuntu 24.04 uses the WebKit2GTK 4.1 ABI.
+      - name: Install Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev
+        shell: bash
+
+      - name: Verify macOS toolchain
+        if: runner.os == 'macOS'
+        run: |
+          xcode-select -p
+          clang --version
+        shell: bash
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25.x"
+          go-version-file: go.mod
           cache: true
-      - name: Test
-        run: go test ./...
-      - name: Build CLI
-        run: go build ./cmd/sstv-go
+          cache-dependency-path: go.sum
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify native C compiler
+        run: gcc --version
+        shell: bash
+
+      - name: Run Go tests (Linux / WebKit2GTK 4.1)
+        if: runner.os == 'Linux'
+        run: go test -tags webkit2_41 -count=1 ./...
+        shell: bash
+
+      - name: Run Go tests (Windows / macOS)
+        if: runner.os != 'Linux'
+        run: go test -count=1 ./...
+        shell: bash
+
+      - name: Run Go vet (Linux / WebKit2GTK 4.1)
+        if: runner.os == 'Linux'
+        run: go vet -tags webkit2_41 ./...
+        shell: bash
+
+      - name: Run Go vet (Windows / macOS)
+        if: runner.os != 'Linux'
+        run: go vet ./...
+        shell: bash
+
+      - name: Check frontend JavaScript syntax
+        run: |
+          node --check frontend/app.js
+          node --check frontend/wailsjs/go/main/App.js
+        shell: bash
+
+      - name: Run frontend tests
+        run: >-
+          node --test
+          frontend/tests/rx-callsign.test.cjs
+          frontend/tests/waterfall.test.cjs
+        shell: bash
+
+      - name: Test repository cleanup script
+        run: python -m unittest scripts.test_cleanup_repo -v
+        shell: bash
+
+      - name: Install matching Wails CLI
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.17.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+        shell: bash
+
+      - name: Build desktop application (Linux / WebKit2GTK 4.1)
+        if: runner.os == 'Linux'
+        run: >-
+          wails build -clean -m -nosyncgomod
+          -platform "${{ matrix.platform }}"
+          -tags "webkit2_41"
+        shell: bash
+
+      - name: Build desktop application (Windows / macOS)
+        if: runner.os != 'Linux'
+        run: >-
+          wails build -clean -m -nosyncgomod
+          -platform "${{ matrix.platform }}"
+        shell: bash
+
+      - name: Build command-line application (Windows)
+        if: runner.os == 'Windows'
+        run: go build -trimpath -o build/bin/sstv-go.exe ./cmd/sstv-go
+        shell: bash
+
+      - name: Build command-line application (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: go build -trimpath -o build/bin/sstv-go ./cmd/sstv-go
+        shell: bash
+
+      - name: Package Windows artifacts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts/package | Out-Null
+          Copy-Item build/bin/SATSSTV-Go.exe artifacts/package/
+          Copy-Item build/bin/sstv-go.exe artifacts/package/
+          Copy-Item README.md, LICENSE artifacts/package/
+          Set-Content artifacts/package/RUNTIME.txt -Encoding UTF8 -Value @(
+            'SATSSTV-Go Windows runtime note',
+            'The desktop application uses Microsoft Edge WebView2.',
+            'Install the Evergreen WebView2 Runtime from Microsoft if needed.'
+          )
+          Compress-Archive -Path artifacts/package/* `
+            -DestinationPath artifacts/SATSSTV-Go-${{ matrix.artifact }}.zip -Force
+
+      - name: Package Linux artifacts
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="artifacts/package/SATSSTV-Go-${{ matrix.artifact }}"
+          mkdir -p "$stage"
+          cp build/bin/SATSSTV-Go "$stage/"
+          cp build/bin/sstv-go "$stage/"
+          cp README.md LICENSE "$stage/"
+          cat > "$stage/RUNTIME.txt" <<'RUNTIME'
+          Linux runtime dependencies
+          ---------------------------
+          GTK 3 and WebKit2GTK 4.1 are required by the Wails desktop application.
+          On Ubuntu/Debian, install: libgtk-3-0 libwebkit2gtk-4.1-0
+          RUNTIME
+          tar -C artifacts/package -czf \
+            "artifacts/SATSSTV-Go-${{ matrix.artifact }}.tar.gz" \
+            "SATSSTV-Go-${{ matrix.artifact }}"
+
+      - name: Package macOS artifacts
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="artifacts/package/SATSSTV-Go-${{ matrix.artifact }}"
+          mkdir -p "$stage"
+          cp -R build/bin/SATSSTV-Go.app "$stage/"
+          cp build/bin/sstv-go "$stage/"
+          cp README.md LICENSE "$stage/"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$stage" "artifacts/SATSSTV-Go-${{ matrix.artifact }}.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SATSSTV-Go-${{ matrix.artifact }}
+          path: artifacts/SATSSTV-Go-${{ matrix.artifact }}.*
+          if-no-files-found: error
+          retention-days: 14
