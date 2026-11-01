@@ -170,6 +170,9 @@ export namespace main {
 	    fontSize?: number;
 	    color?: string;
 	    bold?: boolean;
+	    outlineEnabled?: boolean;
+	    outlineWidth?: number;
+	    outlineColor?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new TemplateObject(source);
@@ -188,6 +191,9 @@ export namespace main {
 	        this.fontSize = source["fontSize"];
 	        this.color = source["color"];
 	        this.bold = source["bold"];
+	        this.outlineEnabled = source["outlineEnabled"];
+	        this.outlineWidth = source["outlineWidth"];
+	        this.outlineColor = source["outlineColor"];
 	    }
 	}
 	export class TemplateSlot {

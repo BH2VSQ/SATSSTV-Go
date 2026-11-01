@@ -168,6 +168,11 @@
 .settings-grid .settings-check input{width:13px;height:13px;margin:0}
 .settings-grid .radio-settings input[type="number"]{width:100%}
 .settings-grid .radio-settings button{align-self:flex-start;margin-top:2px}
+.settings-footer{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px;padding-top:8px;border-top:1px solid #c3c9ce}
+.settings-footer .small-btn{height:30px;padding:0 16px;flex:none}
+.serial-row{display:flex;gap:4px;align-items:center}
+.serial-row select{flex:1;min-width:0}
+.serial-row .small-btn{flex:none;height:25px}
 .device-state{max-width:340px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 @media(max-width:760px){
   .settings-grid{grid-template-columns:1fr}
@@ -263,3 +268,33 @@
   .pane .modebar-meta{width:78px;flex-basis:78px}
   .pane .modebar-meta select{max-width:68px}
 }
+
+/* Two-row mode strips: each row scrolls independently when the mode list is
+   wider than its pane, while keeping the original selection behavior. */
+.pane .modebar{
+  height:64px;
+  flex:0 0 64px;
+  align-items:center;
+}
+.pane .mode-slots{
+  display:flex;
+  flex:1 1 auto;
+  flex-direction:column;
+  gap:2px;
+  height:56px;
+  min-width:0;
+  overflow:hidden;
+  padding:0 1px;
+}
+.pane .mode-slot-row{
+  display:flex;
+  flex:1 1 0;
+  align-items:center;
+  gap:3px;
+  min-width:0;
+  min-height:0;
+  overflow-x:auto;
+  overflow-y:hidden;
+  scrollbar-width:thin;
+}
+.pane .mode-slot-row .mode-slot{flex:none}

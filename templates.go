@@ -21,6 +21,12 @@ type TemplateObject struct {
 	FontSize  int     `json:"fontSize,omitempty"`
 	Color     string  `json:"color,omitempty"`
 	Bold      bool    `json:"bold,omitempty"`
+
+	// Outline (stroke) rendering. OutlineEnabled is a pointer so a disabled
+	// outline (false) round-trips distinctly from the default-enabled state.
+	OutlineEnabled *bool   `json:"outlineEnabled,omitempty"`
+	OutlineWidth   float64 `json:"outlineWidth,omitempty"`
+	OutlineColor   string  `json:"outlineColor,omitempty"`
 }
 
 // TemplateSlot is a persistent one-of-four template position.

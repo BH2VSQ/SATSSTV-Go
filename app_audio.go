@@ -441,7 +441,7 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 	var receivedSamples uint64
 	lastProgress := time.Time{}
 	lastCaptureError := ""
-	spectrumWindow := make([]float32, 0, 2048)
+	spectrumWindow := make([]float32, 0, spectrumFFTSize)
 	for {
 		select {
 		case <-ctx.Done():
@@ -453,12 +453,20 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 			receivedSamples += uint64(len(block))
 			pcm := audio.Float32ToPCM16(block)
 			spectrumWindow = append(spectrumWindow, block...)
-			if len(spectrumWindow) > 2048 {
-				spectrumWindow = append(spectrumWindow[:0], spectrumWindow[len(spectrumWindow)-2048:]...)
+			if len(spectrumWindow) > spectrumFFTSize {
+				spectrumWindow = append(spectrumWindow[:0], spectrumWindow[len(spectrumWindow)-spectrumFFTSize:]...)
 			}
+			// Keep a rolling window of raw captured samples for diagnostics.
+			a.dumpMu.Lock()
+			a.dumpBuf = append(a.dumpBuf, block...)
+			if len(a.dumpBuf) > sampleRate*10 {
+				a.dumpBuf = append([]float32(nil), a.dumpBuf[len(a.dumpBuf)-sampleRate*10:]...)
+			}
+			a.dumpMu.Unlock()
 			if time.Since(lastTelemetry) >= 80*time.Millisecond {
 				level := rmsDBFS(block)
 				spectrum := makeSpectrum(spectrumWindow, sampleRate)
+				peakHz, crest := spectrumPeak(spectrum)
 				droppedBlocks := dropped.Load()
 				if diagnostics, ok := session.(captureDiagnostics); ok {
 					droppedBlocks += diagnostics.DroppedCaptureBlocks()
@@ -470,7 +478,7 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 					}
 				}
 				if a.ctx != nil {
-					runtime.EventsEmit(a.ctx, "audio:telemetry", map[string]any{"dbfs": level, "spectrum": spectrum, "droppedBlocks": droppedBlocks, "samplesReceived": receivedSamples, "blockSamples": len(block)})
+					runtime.EventsEmit(a.ctx, "audio:telemetry", map[string]any{"dbfs": level, "spectrum": spectrum, "peakHz": peakHz, "crest": crest, "droppedBlocks": droppedBlocks, "samplesReceived": receivedSamples, "blockSamples": len(block)})
 				}
 				lastTelemetry = time.Now()
 			}
@@ -554,39 +562,100 @@ func rmsDBFS(samples []float32) float64 {
 // makeSpectrum computes a Hann-windowed FFT trace over 900..2800 Hz.
 // Magnitudes are normalized in dBFS so weak SSTV tones remain visible while
 // the waterfall keeps a useful noise floor.
+// makeSpectrum computes a Hann-windowed FFT trace over 900..2800 Hz.
+// An 8192-sample window gives 5.86 Hz raw-bin spacing at 48 kHz — comparable
+// to MMSSTV's ~5.4 Hz — so a clean tone shows a narrow, tall peak.
+// Magnitudes are normalized in dBFS so weak SSTV tones remain visible while
+// the waterfall keeps a useful noise floor.
+// spectrumScratch is a reusable FFT workspace. makeSpectrum is only ever
+// called from the single RX worker goroutine, so it is safe to share the
+// buffer across calls instead of allocating a fresh 128 KiB every telemetry
+// tick.
+const (
+	spectrumFFTSize = 8192
+	spectrumBins    = 512
+)
+
+var spectrumScratch = make([]complex128, spectrumFFTSize)
+
 func makeSpectrum(samples []float32, sampleRate int) []float64 {
-	const bins = 72
-	const fftSize = 2048
-	const floorDBFS = -90.0
+	const floorDBFS = -60.0
 	const ceilingDBFS = 0.0
-	out := make([]float64, bins)
+	out := make([]float64, spectrumBins)
 	if len(samples) < 16 || sampleRate <= 0 {
 		return out
 	}
-	count := min(len(samples), fftSize)
+	count := min(len(samples), spectrumFFTSize)
 	start := len(samples) - count
-	window := make([]complex128, fftSize)
+	// AGC: normalize the window's peak to a consistent level so a weak input
+	// still produces a clear spectral peak rather than being lost in the noise.
+	var peak float64
+	for i := start; i < start+count; i++ {
+		if a := math.Abs(float64(samples[i])); a > peak {
+			peak = a
+		}
+	}
+	gain := 1.0
+	if peak > 1e-4 {
+		gain = 0.7 / peak
+		if gain > 100 {
+			gain = 100
+		}
+	}
+	window := spectrumScratch[:spectrumFFTSize]
 	var windowSum float64
 	for i := 0; i < count; i++ {
+		// Hann window: a narrow main lobe, so a clean tone shows a tall, sharp
+		// peak rather than a broad hump.
 		weight := 0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(max(1, count-1)))
 		windowSum += weight
-		window[i] = complex(float64(samples[start+i])*weight, 0)
+		window[i] = complex(float64(samples[start+i])*gain*weight, 0)
 	}
+	clear(window[count:])
 	if windowSum <= 0 {
 		return out
 	}
 	fftInPlace(window)
-	for bin := 0; bin < bins; bin++ {
-		frequency := 900.0 + float64(bin)*(1900.0/float64(bins-1))
-		index := int(math.Round(frequency * float64(fftSize) / float64(sampleRate)))
-		if index < 1 || index >= fftSize/2 {
+	for bin := 0; bin < spectrumBins; bin++ {
+		frequency := 900.0 + float64(bin)*(1900.0/float64(spectrumBins-1))
+		fftPosition := frequency * float64(spectrumFFTSize) / float64(sampleRate)
+		lower := int(math.Floor(fftPosition))
+		if lower < 1 || lower+1 >= spectrumFFTSize/2 {
 			continue
 		}
-		amplitude := 2 * math.Hypot(real(window[index]), imag(window[index])) / windowSum
+		fraction := fftPosition - float64(lower)
+		lowerMagnitude := math.Hypot(real(window[lower]), imag(window[lower]))
+		upperMagnitude := math.Hypot(real(window[lower+1]), imag(window[lower+1]))
+		magnitude := lowerMagnitude + (upperMagnitude-lowerMagnitude)*fraction
+		amplitude := 2 * magnitude / windowSum
 		dbfs := 20 * math.Log10(math.Max(1e-8, amplitude))
 		out[bin] = math.Max(0, math.Min(1, (dbfs-floorDBFS)/(ceilingDBFS-floorDBFS)))
 	}
 	return out
+}
+
+// spectrumPeak reports the dominant frequency and a "peakiness" crest factor
+// (peak bin divided by the mean bin). A clean narrow-band tone has a crest well
+// above 5, while broadband noise sits near 1; this distinguishes a genuine SSTV
+// tone from a flat noise floor for diagnostics.
+func spectrumPeak(spectrum []float64) (peakHz, crest float64) {
+	if len(spectrum) == 0 {
+		return 0, 0
+	}
+	peakIdx := 0
+	var sum float64
+	for i, v := range spectrum {
+		sum += v
+		if v > spectrum[peakIdx] {
+			peakIdx = i
+		}
+	}
+	mean := sum / float64(len(spectrum))
+	peakHz = 900.0 + float64(peakIdx)*(1900.0/float64(len(spectrum)-1))
+	if mean > 0 {
+		crest = spectrum[peakIdx] / mean
+	}
+	return peakHz, crest
 }
 
 func fftInPlace(values []complex128) {
@@ -848,4 +917,46 @@ func (a *App) shutdown(context.Context) {
 	a.rxDecoderMu.Lock()
 	a.rxDecoder = nil
 	a.rxDecoderMu.Unlock()
+}
+
+// SaveCapturedAudio writes the last few seconds of raw captured audio to a WAV
+// file in the settings directory. It is a diagnostic helper: the exported file
+// shows exactly what the capture device produced, so capture/level/sample-rate
+// issues can be separated from decode bugs.
+func (a *App) SaveCapturedAudio() (string, error) {
+	a.audioMu.Lock()
+	rate := a.audioConfig.SampleRate
+	a.audioMu.Unlock()
+	if rate <= 0 {
+		rate = 48_000
+	}
+	a.dumpMu.Lock()
+	buf := append([]float32(nil), a.dumpBuf...)
+	a.dumpMu.Unlock()
+	if len(buf) < rate/10 {
+		return "", fmt.Errorf("采集缓冲不足（仅 %d 采样）", len(buf))
+	}
+	samples := make([]int16, len(buf))
+	for i, v := range buf {
+		if v > 1 {
+			v = 1
+		} else if v < -1 {
+			v = -1
+		}
+		samples[i] = int16(v * 32767)
+	}
+	dir, err := a.settingsDir()
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "capture.wav")
+	f, err := os.Create(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if err := sstv.WriteWAV(f, samples, rate); err != nil {
+		return "", err
+	}
+	return path, nil
 }

@@ -42,6 +42,9 @@ type App struct {
 	rxDecoderMu  sync.Mutex
 	rxDecoder    *sstv.StreamDecoder
 	albumMu      sync.Mutex
+
+	dumpMu  sync.Mutex
+	dumpBuf []float32 // rolling window of raw captured float samples
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -80,6 +83,9 @@ func (a *App) GetModes() []Mode {
 	}
 	return out
 }
+
+// ListSerialPorts returns the COM ports currently available for serial PTT.
+func (a *App) ListSerialPorts() []string { return listSerialPorts() }
 
 func (a *App) SelectImage() string {
 	p, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{

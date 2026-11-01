@@ -3,7 +3,9 @@
 const $ = (id) => document.getElementById(id);
 const app = () => window.go.main.App;
 const SLOT_STORAGE = 'satsstv.modeSlots.v1';
-const TX_MODE_STORAGE = 'satsstv.txMode.v1';
+const TX_SLOT_STORAGE = 'satsstv.txModeSlots.v1';
+const TX_SLOT_ACTIVE_STORAGE = 'satsstv.txModeSlotActive.v1';
+const TX_MODE_STORAGE = 'satsstv.txMode.v1'; // legacy single-mode TX selection
 const RX_MODE_STORAGE = 'satsstv.rxMode.v1';
 const VALUE_IDS = ['myCall', 'hisCall', 'qth', 'locator', 'report', 'message'];
 const tokenDefaults = { MYCALL: 'N0CALL', HISCALL: 'N0TEST', QTH: 'EXAMPLE QTH', LOCATOR: 'AA00AA', REPORT: '595', MESSAGE: 'TEST MESSAGE', DATE: 'YYYY-MM-DD', TIME: 'HH:MM:SS' };
@@ -34,7 +36,8 @@ let autoSelected = true;
 let rxEnabled = true;
 let toneActive = false;
 let peakSpectrum = [];
-let txModeID = 'robot36';
+let txSlots = [];
+let activeTXSlot = 0;
 let selectedImagePath = '';
 let sourceImage = null;
 let components = [];
@@ -66,7 +69,7 @@ function resolveTokens(text) {
   return String(text).replace(/\{([A-Z]+)\}/g, (whole, key) => vals[key] || whole);
 }
 function activeRXMode() { return modes.find((m) => m.id === slots[activeSlot]) || modes.find((m) => m.ready) || modes[0]; }
-function activeTXMode() { return modes.find((m) => m.id === txModeID) || modes.find((m) => m.id === 'robot36') || modes.find((m) => m.ready) || modes[0]; }
+function activeTXMode() { return modes.find((m) => m.id === txSlots[activeTXSlot]) || modes.find((m) => m.id === 'robot36') || modes.find((m) => m.ready) || modes[0]; }
 function setStatus(message, error = false) {
   $('txResult').textContent = message;
   $('txResult').classList.toggle('error', error);
@@ -74,22 +77,39 @@ function setStatus(message, error = false) {
 }
 function niceMode(id) { return modes.find((m) => m.id === id)?.name || id || '空'; }
 
+const DEFAULT_MODE_SLOTS = ['robot36', 'robot72', 'scottie_s1', 'scottie_s2', 'martin_m1', 'martin_m2', 'sc2_180', 'pd120'];
+
 function loadSlots() {
-  const fallback = ['robot36', 'robot72', 'scottie_s1', 'scottie_s2', 'martin_m1', 'martin_m2', 'sc2_180', 'pd120'];
   try {
     const parsed = JSON.parse(localStorage.getItem(SLOT_STORAGE) || 'null');
-    slots = Array.isArray(parsed) && parsed.length === 8 ? parsed : fallback;
-  } catch { slots = fallback; }
+    slots = Array.isArray(parsed) && parsed.length === 8 ? parsed : DEFAULT_MODE_SLOTS.slice();
+  } catch { slots = DEFAULT_MODE_SLOTS.slice(); }
   try {
     const savedRX = JSON.parse(localStorage.getItem(RX_MODE_STORAGE) || 'null');
     rxEnabled = savedRX?.enabled !== false;
     autoSelected = savedRX?.auto !== false;
     activeSlot = Math.max(0, Math.min(7, Number(savedRX?.slot) || 0));
     if (!rxEnabled) { autoSelected = false; activeSlot = -1; }
-    const savedTX = localStorage.getItem(TX_MODE_STORAGE);
-    txModeID = savedTX || 'robot36';
-  } catch { autoSelected = true; rxEnabled = true; activeSlot = 0; txModeID = 'robot36'; }
+  } catch { autoSelected = true; rxEnabled = true; activeSlot = 0; }
 }
+function loadTXSlots() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(TX_SLOT_STORAGE) || 'null');
+    txSlots = Array.isArray(parsed) && parsed.length === 8 ? parsed : DEFAULT_MODE_SLOTS.slice();
+  } catch { txSlots = DEFAULT_MODE_SLOTS.slice(); }
+  const savedActive = localStorage.getItem(TX_SLOT_ACTIVE_STORAGE);
+  const activeNumber = Number(savedActive);
+  if (savedActive !== null && Number.isInteger(activeNumber) && activeNumber >= 0 && activeNumber < 8) {
+    activeTXSlot = activeNumber;
+  } else {
+    // Migrate the former single-mode TX selection into the slot set.
+    const legacy = localStorage.getItem(TX_MODE_STORAGE);
+    const idx = legacy ? txSlots.indexOf(legacy) : -1;
+    activeTXSlot = idx >= 0 ? idx : 0;
+  }
+}
+function saveTXSlots() { localStorage.setItem(TX_SLOT_STORAGE, JSON.stringify(txSlots)); }
+function saveTXActiveSlot() { localStorage.setItem(TX_SLOT_ACTIVE_STORAGE, String(activeTXSlot)); }
 function saveRXModeSelection() { localStorage.setItem(RX_MODE_STORAGE, JSON.stringify({ enabled: rxEnabled, auto: autoSelected, slot: activeSlot })); }
 function saveSlots() { localStorage.setItem(SLOT_STORAGE, JSON.stringify(slots)); }
 function currentRXModeID() { return !rxEnabled || autoSelected ? '' : (slots[activeSlot] || ''); }
@@ -104,6 +124,12 @@ async function applyRXSelection(message) {
 }
 function renderModeSlots() {
   const host = $('modeSlots'); host.innerHTML = '';
+  const rows = [0, 1].map(() => {
+    const row = document.createElement('div');
+    row.className = 'mode-slot-row';
+    host.appendChild(row);
+    return row;
+  });
   const auto = document.createElement('button');
   auto.className = `mode-slot auto-slot${rxEnabled && autoSelected ? ' active' : ''}`;
   auto.textContent = 'Auto';
@@ -118,7 +144,7 @@ function renderModeSlots() {
     updateModeInfo();
     await applyRXSelection(selectingAuto ? 'RX 已启用 Auto 自动识别' : 'RX 已停止');
   });
-  host.appendChild(auto);
+  rows[0].appendChild(auto);
   slots.forEach((id, i) => {
     const selected = rxEnabled && !autoSelected && activeSlot === i;
     const button = document.createElement('button');
@@ -141,7 +167,7 @@ function renderModeSlots() {
       await applyRXSelection(rxEnabled ? `RX 已切换为 ${niceMode(id)} 指定接收` : 'RX 已停止');
     });
     button.addEventListener('contextmenu', (e) => { e.preventDefault(); openModeMenu(e.clientX, e.clientY, i); });
-    host.appendChild(button);
+    (i < 4 ? rows[0] : rows[1]).appendChild(button);
   });
   updateModeInfo();
 }
@@ -185,28 +211,55 @@ function updateModeInfo() {
   }
   renderCanvas();
 }
-function renderTXModeOptions() {
+function renderTXModeSlots() {
   const host = $('txModeSlots');
   host.innerHTML = '';
-  txModeID = modes.some(m => m.id === txModeID && m.ready) ? txModeID : 'robot36';
-  modes.forEach((mode) => {
-    const button = document.createElement('button');
-    button.className = `mode-slot${mode.id === txModeID ? ' active' : ''}`;
-    button.textContent = mode.name.replace('Wraase ', '').replace('Scottie ', 'Scottie');
-    button.title = `${mode.name}${mode.ready ? '' : ' · 编码器尚未实现'}`;
-    button.disabled = !mode.ready;
-    button.addEventListener('click', () => {
-      if (!mode.ready || mode.id === txModeID) return;
-      txModeID = mode.id;
-      localStorage.setItem(TX_MODE_STORAGE, txModeID);
-      renderTXModeOptions();
-      renderCanvas();
-      setStatus(`TX 模式已设为 ${mode.name}`);
-    });
-    host.appendChild(button);
+  const rows = [0, 1].map(() => {
+    const row = document.createElement('div');
+    row.className = 'mode-slot-row';
+    host.appendChild(row);
+    return row;
   });
-  $('txModeInfo').textContent = activeTXMode()?.name || txModeID;
+  txSlots.forEach((id, i) => {
+    const selected = activeTXSlot === i;
+    const button = document.createElement('button');
+    button.className = `mode-slot${selected ? ' active' : ''}`;
+    button.textContent = niceMode(id).replace('Wraase ', '').replace('Scottie ', 'Scottie');
+    button.title = selected ? `槽位 ${i + 1}：${niceMode(id)}，右键更换模式` : `槽位 ${i + 1}：${niceMode(id)}，右键更换`;
+    button.addEventListener('click', () => {
+      if (selected) return;
+      activeTXSlot = i;
+      saveTXActiveSlot();
+      renderTXModeSlots();
+      renderCanvas();
+      setStatus(`TX 模式已切换为 ${niceMode(id)}`);
+    });
+    button.addEventListener('contextmenu', (e) => { e.preventDefault(); openTXModeMenu(e.clientX, e.clientY, i); });
+    (i < 4 ? rows[0] : rows[1]).appendChild(button);
+  });
+  $('txModeInfo').textContent = activeTXMode()?.name || niceMode(txSlots[activeTXSlot]);
   $('encode').disabled = !activeTXMode()?.ready;
+}
+function openTXModeMenu(x, y, slotIndex) {
+  contextTarget = { type: 'txmode', slotIndex };
+  const menu = $('contextMenu'); menu.innerHTML = '';
+  const title = document.createElement('div'); title.className = 'context-title'; title.textContent = `设置 TX 模式槽位 ${slotIndex + 1}`; menu.appendChild(title);
+  modes.forEach((m) => {
+    const item = document.createElement('button'); item.className = 'context-item';
+    item.textContent = `${m.name}${m.ready ? '' : ' · 尚未完成编解码'}`;
+    item.addEventListener('click', () => {
+      txSlots[slotIndex] = m.id;
+      saveTXSlots();
+      activeTXSlot = slotIndex;
+      saveTXActiveSlot();
+      hideContextMenu();
+      renderTXModeSlots();
+      renderCanvas();
+      setStatus(`TX 槽位 ${slotIndex + 1} 已设为 ${m.name}`);
+    });
+    menu.appendChild(item);
+  });
+  showContextMenu(x, y);
 }
 function withOutlineDefaults(component) {
   const width = Number(component?.outlineWidth);
@@ -514,10 +567,54 @@ function setupCanvasDrag() {
   canvas.addEventListener('pointerup', end); canvas.addEventListener('pointercancel', end);
 }
 
-function spectrumColor(value) {
+let waterfallImageData = null;
+let waterfallOff = null;
+
+function spectrumColorRGB(value) {
   const strength = Math.max(0, Math.min(1, (Number(value) - 0.16) / 0.84));
   const gray = Math.round(255 * (1 - Math.pow(strength, 0.82)));
+  return [gray, gray, gray];
+}
+function spectrumColor(value) {
+  const [gray] = spectrumColorRGB(value);
   return `rgb(${gray},${gray},${gray})`;
+}
+function drawWaterfall(ctx, w, waterfallY, waterfallH) {
+  const rows = waterfallHistory.slice(-MAX_WATERFALL_ROWS);
+  if (!rows.length) return;
+  const bins = rows[0].length;
+  const rowCount = MAX_WATERFALL_ROWS;
+  if (!waterfallOff || waterfallOff.width !== bins || waterfallOff.height !== rowCount) {
+    waterfallOff = document.createElement('canvas');
+    waterfallOff.width = bins;
+    waterfallOff.height = rowCount;
+    waterfallImageData = waterfallOff.getContext('2d').createImageData(bins, rowCount);
+  }
+  const data = waterfallImageData.data;
+  const emptyRows = rowCount - rows.length;
+  // Clear the (still empty) leading rows so a partial waterfall never leaves
+  // stale pixels after an RX restart.
+  for (let r = 0; r < emptyRows; r++) {
+    const base = r * bins * 4;
+    for (let b = 0; b < bins; b++) {
+      const p = base + b * 4;
+      data[p] = 247; data[p + 1] = 247; data[p + 2] = 244; data[p + 3] = 255;
+    }
+  }
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    const base = (emptyRows + r) * bins * 4;
+    for (let b = 0; b < bins; b++) {
+      const [gray] = spectrumColorRGB(row[b]);
+      const p = base + b * 4;
+      data[p] = gray; data[p + 1] = gray; data[p + 2] = gray; data[p + 3] = 255;
+    }
+  }
+  waterfallOff.getContext('2d').putImageData(waterfallImageData, 0, 0);
+  const prevSmoothing = ctx.imageSmoothingEnabled;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(waterfallOff, 0, 0, bins, rowCount, 0, waterfallY, w, waterfallH);
+  ctx.imageSmoothingEnabled = prevSmoothing;
 }
 function drawIdleSpectrum() {
   const canvas = $('spectrum'), ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
@@ -558,18 +655,7 @@ function drawIdleSpectrum() {
 
   ctx.fillStyle = '#f7f7f4';
   ctx.fillRect(0, waterfallY, w, waterfallH);
-  const rows = waterfallHistory.slice(-MAX_WATERFALL_ROWS);
-  if (rows.length) {
-    const rowH = waterfallH / MAX_WATERFALL_ROWS;
-    const binW = w / rows[0].length;
-    rows.forEach((row, rowIndex) => {
-      const y = waterfallY + waterfallH - (rows.length - rowIndex) * rowH;
-      row.forEach((value, bin) => {
-        ctx.fillStyle = spectrumColor(value);
-        ctx.fillRect(bin * binW, y, Math.ceil(binW) + 1, Math.ceil(rowH) + 1);
-      });
-    });
-  }
+  drawWaterfall(ctx, w, waterfallY, waterfallH);
   ctx.strokeStyle = '#65717b';
   ctx.beginPath(); ctx.moveTo(0, waterfallY); ctx.lineTo(w, waterfallY); ctx.stroke();
 }
@@ -635,7 +721,9 @@ function bindRuntimeEvents() {
   window.runtime.EventsOn('audio:state', updateAudioState);
   window.runtime.EventsOn('audio:telemetry', (data) => {
     captureTelemetrySeen = true;
-    $('spectrumState').textContent = 'INPUT ACTIVE · SHARED';
+    const peakHz = Number(data?.peakHz || 0);
+    const crest = Number(data?.crest || 0);
+    $('spectrumState').textContent = `峰值 ${peakHz.toFixed(0)} Hz · 峰度 ${crest.toFixed(1)}`;
     const dbfs = Number(data?.dbfs ?? -120);
     const fill = Math.max(0, Math.min(100, (dbfs + 60) / 60 * 100));
     $('inputLevel').style.width = `${fill}%`;
@@ -782,28 +870,78 @@ async function loadAudioSettings() {
     const cfg = await app().GetAudioSettings();
     $('rate').value = String(cfg.sampleRate || 48000);
     $('audioInput').value = cfg.captureDeviceId || ''; $('audioOutput').value = cfg.playbackDeviceId || '';
-    $('pttMode').value = cfg.pttMode || 'vox'; $('rigctlAddress').value = cfg.rigctlAddress || ''; $('serialPort').value = cfg.serialPort || '';
+    $('pttMode').value = cfg.pttMode || 'vox'; $('rigctlAddress').value = cfg.rigctlAddress || '';
+    const portSelect = $('serialPort');
+    if (cfg.serialPort && ![...portSelect.options].some(o => o.value === cfg.serialPort)) {
+      const option = document.createElement('option');
+      option.value = cfg.serialPort;
+      option.textContent = `${cfg.serialPort}（已断开）`;
+      portSelect.appendChild(option);
+    }
+    portSelect.value = cfg.serialPort || '';
     $('pttActiveHigh').checked = cfg.activeHigh !== false;
     $('pttLead').value = cfg.pttLeadMs ?? 300; $('pttTail').value = cfg.pttTailMs ?? 250;
-  } catch (e) { $('audioSettingsStatus').textContent = `读取音频设置失败：${String(e)}`; }
+    updatePTTFields();
+  } catch (e) { $('settingsStatus').textContent = `读取音频设置失败：${String(e)}`; $('settingsStatus').classList.add('error'); }
 }
-async function saveAudioSettings() {
-  const cfg = {
-    sampleRate: Number($('rate').value), captureDeviceId: $('audioInput').value, playbackDeviceId: $('audioOutput').value,
-    pttMode: $('pttMode').value, rigctlAddress: $('rigctlAddress').value.trim(), serialPort: $('serialPort').value.trim(),
-    activeHigh: $('pttActiveHigh').checked, pttLeadMs: Number($('pttLead').value), pttTailMs: Number($('pttTail').value),
-  };
-  const button = $('saveAudioSettings'); button.disabled = true;
+async function refreshSerialPorts() {
+  const select = $('serialPort');
+  const previous = select.value;
   try {
+    const ports = await app().ListSerialPorts();
+    select.innerHTML = '';
+    const empty = document.createElement('option');
+    empty.value = '';
+    empty.textContent = ports.length ? '选择串口' : '未发现串口';
+    select.appendChild(empty);
+    (ports || []).forEach(port => {
+      const option = document.createElement('option');
+      option.value = port;
+      option.textContent = port;
+      select.appendChild(option);
+    });
+    if (previous && [...select.options].some(o => o.value === previous)) select.value = previous;
+  } catch (e) {
+    select.innerHTML = '';
+    const empty = document.createElement('option');
+    empty.value = '';
+    empty.textContent = '串口枚举失败';
+    select.appendChild(empty);
+  }
+}
+function updatePTTFields() {
+  const mode = $('pttMode').value;
+  const show = (el, visible) => { el.style.display = visible ? '' : 'none'; };
+  show($('rigctlField'), mode === 'hamlib');
+  show($('serialField'), mode === 'rts' || mode === 'dtr');
+  show($('activeHighField'), mode === 'rts' || mode === 'dtr');
+}
+async function saveAllSettings() {
+  const button = $('saveAllSettings');
+  const status = $('settingsStatus');
+  button.disabled = true;
+  status.textContent = '正在保存…';
+  status.classList.remove('error');
+  try {
+    const saved = await app().SaveStationSettings({ myCall: $('settingsMyCall').value, locator: $('settingsLocator').value });
+    stationSettings = { myCall: saved?.myCall || '', locator: saved?.locator || '' };
+    $('myCall').value = stationSettings.myCall;
+    $('locator').value = stationSettings.locator;
+    syncStationSettingsForm();
+    renderCanvas();
+    const cfg = {
+      sampleRate: Number($('rate').value), captureDeviceId: $('audioInput').value, playbackDeviceId: $('audioOutput').value,
+      pttMode: $('pttMode').value, rigctlAddress: $('rigctlAddress').value.trim(), serialPort: $('serialPort').value.trim(),
+      activeHigh: $('pttActiveHigh').checked, pttLeadMs: Number($('pttLead').value), pttTailMs: Number($('pttTail').value),
+    };
     await app().ApplyAudioSettings(cfg, currentRXModeID());
     updateAudioState(await app().GetAudioState());
-    $('audioSettingsStatus').textContent = '音频设置已应用，RX 已自动恢复';
-    setStatus('音频与 PTT 设置已保存并应用，RX 持续接收');
-    return true;
+    status.textContent = '设置已保存并应用';
+    setStatus('音频、PTT 与本站信息已保存并应用');
   } catch (e) {
-    $('audioSettingsStatus').textContent = `应用失败：${String(e)}`;
-    setStatus(`应用音频设置失败：${String(e)}`, true);
-    return false;
+    status.textContent = `保存失败：${String(e)}`;
+    status.classList.add('error');
+    setStatus(`保存设置失败：${String(e)}`, true);
   } finally { button.disabled = false; }
 }
 
@@ -904,43 +1042,26 @@ async function loadStationSettings() {
     syncStationSettingsForm();
     renderCanvas();
   } catch (e) {
-    $('stationSettingsStatus').textContent = `读取本站信息失败：${String(e)}`;
-    $('stationSettingsStatus').classList.add('error');
-  }
-}
-
-async function saveStationSettings() {
-  const button = $('saveStationSettings');
-  button.disabled = true;
-  $('stationSettingsStatus').textContent = '正在保存…';
-  $('stationSettingsStatus').classList.remove('error');
-  try {
-    const saved = await app().SaveStationSettings({
-      myCall: $('settingsMyCall').value,
-      locator: $('settingsLocator').value,
-    });
-    stationSettings = { myCall: saved.myCall || '', locator: saved.locator || '' };
-    $('myCall').value = stationSettings.myCall;
-    $('locator').value = stationSettings.locator;
-    syncStationSettingsForm();
-    renderCanvas();
-    $('stationSettingsStatus').textContent = `已保存：${stationSettings.myCall || '未设置呼号'} · ${stationSettings.locator || '未设置网格'}`;
-    setStatus('本站呼号和网格已保存');
-  } catch (e) {
-    $('stationSettingsStatus').textContent = `保存失败：${String(e)}`;
-    $('stationSettingsStatus').classList.add('error');
-  } finally {
-    button.disabled = false;
+    $('settingsStatus').textContent = `读取本站信息失败：${String(e)}`;
+    $('settingsStatus').classList.add('error');
   }
 }
 
 function setupSettings() {
   const dialog = $('settingsDialog');
-  $('openSettings').addEventListener('click', async () => { syncStationSettingsForm(); await refreshAudioDevices(); await loadAudioSettings(); dialog.showModal(); });
+  $('openSettings').addEventListener('click', async () => {
+    syncStationSettingsForm();
+    await refreshAudioDevices();
+    await refreshSerialPorts();
+    await loadAudioSettings();
+    updatePTTFields();
+    dialog.showModal();
+  });
   $('closeSettings').addEventListener('click', () => dialog.close());
-  $('saveStationSettings').addEventListener('click', saveStationSettings);
-  $('saveAudioSettings').addEventListener('click', saveAudioSettings);
+  $('saveAllSettings').addEventListener('click', saveAllSettings);
   $('refreshAudioDevices').addEventListener('click', refreshAudioDevices);
+  $('refreshSerialPorts').addEventListener('click', refreshSerialPorts);
+  $('pttMode').addEventListener('change', updatePTTFields);
   dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
   $('closePreview').addEventListener('click', () => $('albumPreviewDialog').close());
 }
@@ -975,6 +1096,14 @@ VALUE_IDS.forEach(id => $(id).addEventListener('input', () => {
   renderCanvas();
 }));
 $('importAlbumTX').addEventListener('click', () => importAlbum('tx'));
+$('saveCapture').addEventListener('click', async () => {
+  try {
+    const path = await app().SaveCapturedAudio();
+    setStatus(`采集音频已保存：${path}`);
+  } catch (e) {
+    setStatus(`保存采集失败：${String(e)}`, true);
+  }
+});
 $('albumFilter').addEventListener('change', renderAlbum);
 document.querySelectorAll('.nav-btn').forEach(b => b.addEventListener('click', () => showPage(b.dataset.page)));
 document.addEventListener('pointerdown', e => { if (!$('contextMenu').contains(e.target)) hideContextMenu(); });
@@ -989,10 +1118,12 @@ window.addEventListener('DOMContentLoaded', async () => {
   try {
     modes = await app().GetModes();
     loadSlots();
+    loadTXSlots();
     slots = slots.map(id => modes.some(m => m.id === id) ? id : 'robot36');
-    if (!modes.some(m => m.id === txModeID && m.ready)) txModeID = 'robot36';
+    txSlots = txSlots.map(id => modes.some(m => m.id === id) ? id : 'robot36');
+    activeTXSlot = Math.max(0, Math.min(7, activeTXSlot));
     renderModeSlots();
-    renderTXModeOptions();
+    renderTXModeSlots();
     $('modeInfo').textContent = rxEnabled ? `${modes.length} 种 RX 模式` : 'RX 已停止';
   } catch (e) {
     $('modeInfo').textContent = `模式读取失败：${String(e)}`;

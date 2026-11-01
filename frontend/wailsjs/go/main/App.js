@@ -58,6 +58,10 @@ export function ListAlbum() {
   return window['go']['main']['App']['ListAlbum']();
 }
 
+export function ListSerialPorts() {
+  return window['go']['main']['App']['ListSerialPorts']();
+}
+
 export function LoadAlbumPreview(arg1) {
   return window['go']['main']['App']['LoadAlbumPreview'](arg1);
 }
@@ -68,6 +72,10 @@ export function LoadImagePreview(arg1) {
 
 export function SaveAlbumImage(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['SaveAlbumImage'](arg1, arg2, arg3, arg4);
+}
+
+export function SaveCapturedAudio() {
+  return window['go']['main']['App']['SaveCapturedAudio']();
 }
 
 export function SaveStationSettings(arg1) {

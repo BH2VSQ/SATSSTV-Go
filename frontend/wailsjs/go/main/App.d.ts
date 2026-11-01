@@ -30,11 +30,15 @@ export function InitializeAudio(arg1:string):Promise<void>;
 
 export function ListAlbum():Promise<Array<main.AlbumEntry>>;
 
+export function ListSerialPorts():Promise<Array<string>>;
+
 export function LoadAlbumPreview(arg1:string):Promise<string>;
 
 export function LoadImagePreview(arg1:string):Promise<string>;
 
 export function SaveAlbumImage(arg1:string,arg2:string,arg3:string,arg4:string):Promise<main.AlbumEntry>;
+
+export function SaveCapturedAudio():Promise<string>;
 
 export function SaveStationSettings(arg1:main.StationSettings):Promise<main.StationSettings>;
 

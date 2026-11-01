@@ -15,11 +15,12 @@ const (
 // DetectModeHeader detects standard VIS, MMSSTV extended VIS, N-VIS and AVT90
 // headers. The returned bodyStart points at the first image sample.
 func DetectModeHeader(samples []int16, sampleRate int) (ModeSpec, uint8, int, error) {
-	spec, vis, bodyStart, _, _, err := detectModeHeaderFrom(samples, sampleRate, 0)
+	freq := instantaneousFrequency(samples, sampleRate)
+	spec, vis, bodyStart, _, _, err := detectModeHeaderFrom(samples, freq, sampleRate, 0)
 	return spec, vis, bodyStart, err
 }
 
-func detectModeHeaderFrom(samples []int16, sampleRate, startAt int) (spec ModeSpec, vis uint8, bodyStart, headerStart, nextStart int, retErr error) {
+func detectModeHeaderFrom(samples []int16, freq []float64, sampleRate, startAt int) (spec ModeSpec, vis uint8, bodyStart, headerStart, nextStart int, retErr error) {
 	if sampleRate < 8_000 || sampleRate > 192_000 {
 		return ModeSpec{}, 0, 0, startAt, startAt, fmt.Errorf("invalid sample rate %d", sampleRate)
 	}
@@ -28,7 +29,7 @@ func detectModeHeaderFrom(samples []int16, sampleRate, startAt int) (spec ModeSp
 
 	// Probe ordinary VIS first, then verify any registered code against the
 	// longer MMSSTV header families before committing to Auto mode selection.
-	visCode, afterVIS, nextVIS, visErr := detectVISFrom(samples, sampleRate, startAt)
+	visCode, afterVIS, nextVIS, visErr := detectVISFrom(samples, freq, sampleRate, startAt)
 	if visErr == nil {
 		headerStart = afterVIS - int(math.Round(0.910*float64(sampleRate)))
 		if found, ok := ModeFromVIS(visCode); ok {

@@ -32,7 +32,7 @@
           </div>
           <div class="image-status"><span>模式 <b id="rxDetectedMode">Auto</b></span><span>尺寸 <b id="rxResolution">---</b></span><span>呼号 <b id="rxCallsign">等待 FSKID</b></span><span>接收时间 <b id="rxTimestamp">--</b></span></div>
           <div class="rx-decode-progress"><div class="rx-progress-meta"><span id="rxProgressLabel">等待 SSTV 信号</span><b id="rxProgressText">0%</b></div><div class="rx-progress-track"><i id="rxProgressFill"></i></div></div>
-          <div class="spectrum-head"><b>Audio Spectrum / Waterfall</b><span id="spectrumState">INPUT IDLE</span></div>
+          <div class="spectrum-head"><b>Audio Spectrum / Waterfall</b><span id="spectrumState">INPUT IDLE</span><button id="saveCapture" class="small-btn" title="保存最近约 10 秒采集音频用于诊断">保存采集</button></div>
           <div class="spectrum-frame"><canvas id="spectrum" width="900" height="230"></canvas><div id="spectrumOverlay">实时显示 900 至 2800 Hz SSTV 音频频谱与瀑布图</div></div>
           <div class="rx-footer"><span class="level-label">输入电平</span><div class="level-meter"><i id="inputLevel"></i></div><span id="inputLevelText">-- dBFS</span><span class="rx-hint" id="rxHint">RX 将随工作台自动启动</span></div>
         </section>
@@ -40,7 +40,7 @@
         <section class="pane tx-pane">
           <div class="pane-heading"><div class="pane-title"><span class="tx-tag">TX</span><strong>发送编辑器</strong><small id="txStatus">草稿</small></div><div class="pane-tools"><button class="small-btn" id="chooseImage">载入图片</button><button class="small-btn" id="encode">生成 WAV</button><button class="small-btn tone-toggle-button" id="toneToggle" disabled>1500 Hz 单音</button><button class="small-btn tx-toggle-button" id="txToggle" disabled>开始发射</button></div></div>
           <div class="modebar tx-modebar">
-            <div class="modebar-label"><b>TX MODE</b><small>独立发送模式</small></div>
+            <div class="modebar-label"><b>TX MODE</b><small>右键更换槽位</small></div>
             <div id="txModeSlots" class="mode-slots"></div>
             <div class="modebar-meta"><span id="txModeInfo">Robot 36</span></div>
           </div>
@@ -114,29 +114,32 @@
         <h3>音频设备</h3>
         <label>RX 输入设备<select id="audioInput"><option value="">系统默认输入设备</option></select></label>
         <label>TX 输出设备<select id="audioOutput"><option value="">系统默认输出设备</option></select></label>
-        <div class="settings-button-row"><button id="refreshAudioDevices" class="small-btn">刷新设备</button><button id="saveAudioSettings" class="small-btn primary-small">保存并应用</button></div>
-        <div id="audioSettingsStatus" class="station-settings-status">启动工作台时自动接收，输入与输出均采用共享模式，不独占系统音频设备。</div>
+        <div class="settings-button-row"><button id="refreshAudioDevices" class="small-btn">刷新设备</button></div>
+        <p>输入与输出均采用共享模式，不独占系统音频设备。保存设置时会短暂重建音频流并自动恢复 RX。</p>
+        <div id="audioSettingsStatus" class="station-settings-status">启动工作台时自动接收。</div>
       </section>
       <section class="radio-settings">
         <h3>PTT 发射控制</h3>
         <label>控制方式<select id="pttMode"><option value="vox">VOX（电台自动发射）</option><option value="rts">串口 RTS</option><option value="dtr">串口 DTR</option><option value="hamlib">Hamlib Rigctld</option></select></label>
-        <label>Rigctl 地址<input id="rigctlAddress" type="text" placeholder="主机名:端口" autocomplete="off"></label>
-        <label>串口名称<input id="serialPort" type="text" placeholder="COMx" autocomplete="off"></label>
+        <label id="rigctlField">Rigctl 地址<input id="rigctlAddress" type="text" placeholder="主机名:端口" autocomplete="off"></label>
+        <label id="serialField">串口名称<span class="serial-row"><select id="serialPort"><option value="">选择串口</option></select><button id="refreshSerialPorts" class="small-btn" type="button" title="重新扫描串口">刷新</button></span></label>
         <label>PTT 前置延时 (ms)<input id="pttLead" type="number" min="0" max="10000" value="300"></label>
         <label>PTT 释放延时 (ms)<input id="pttTail" type="number" min="0" max="10000" value="250"></label>
-        <label class="settings-check"><input id="pttActiveHigh" type="checkbox" checked> RTS/DTR 高电平发射</label>
-        <p>默认使用 VOX，由电台根据 SSTV 音频自动切换发射。也可选择串口 RTS/DTR 或 Hamlib Rigctld 控制电台 PTT。保存并应用时会短暂重建音频流，随后自动恢复当前 RX 模式。</p>
+        <label class="settings-check" id="activeHighField"><input id="pttActiveHigh" type="checkbox" checked> RTS/DTR 高电平发射</label>
+        <p>默认使用 VOX，由电台根据 SSTV 音频自动切换发射。也可选择串口 RTS/DTR 或 Hamlib Rigctld 控制电台 PTT。</p>
       </section>
       <section class="station-settings">
         <h3>本站身份信息</h3>
         <div class="station-profile-row">
           <label>本台呼号<input id="settingsMyCall" type="text" maxlength="24" placeholder="例如 N0CALL" autocomplete="off"></label>
           <label>本站网格<input id="settingsLocator" type="text" maxlength="12" placeholder="例如 EXAMPLE GRID" autocomplete="off"></label>
-          <button id="saveStationSettings" class="small-btn primary-small">保存并应用</button>
         </div>
         <p>保存后会写入 Windows 用户配置目录，下一次启动时自动填入工作台的本台呼号和网格。对方呼号、QTH、报告和消息仍可按每次 QSO 单独填写。</p>
-        <div id="stationSettingsStatus" class="station-settings-status" aria-live="polite">尚未修改本站身份信息</div>
       </section>
+    </div>
+    <div class="settings-footer">
+      <div id="settingsStatus" class="station-settings-status" aria-live="polite">尚未保存</div>
+      <button id="saveAllSettings" class="small-btn primary-small">保存设置</button>
     </div>
   </dialog>
 

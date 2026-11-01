@@ -392,7 +392,7 @@ func (m *MalgoDuplex) newPlaybackDeviceLocked() (*malgo.Device, error) {
 		cfg.Playback.DeviceID = deviceID
 		defer freeMalgoDeviceID(deviceID)
 	}
-	dev, err := malgo.InitDevice(m.ctx.Context, cfg, malgo.DeviceCallbacks{Data: func(output, _ []byte, frameCount uint32) {
+	callbacks := malgo.DeviceCallbacks{Data: func(output, _ []byte, frameCount uint32) {
 		m.playbackMu.Lock()
 		defer m.playbackMu.Unlock()
 		job := m.playbackJob
@@ -415,11 +415,27 @@ func (m *MalgoDuplex) newPlaybackDeviceLocked() (*malgo.Device, error) {
 				m.playbackJob = nil
 			}
 		}
-	}})
-	if err != nil {
-		return nil, fmt.Errorf("initialize playback device: %w", err)
+	}}
+
+	// The output endpoint can report AUDCLNT_E_DEVICE_IN_USE while another
+	// application holds it exclusively or the audio service is still
+	// renegotiating the shared stream. Retry a few times before giving up.
+	const attempts = 5
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		dev, err := malgo.InitDevice(m.ctx.Context, cfg, callbacks)
+		if err == nil {
+			return dev, nil
+		}
+		if !errors.Is(err, malgo.ErrBusy) && !errors.Is(err, malgo.ErrAccessDenied) {
+			return nil, fmt.Errorf("initialize playback device: %w", err)
+		}
+		lastErr = err
+		if attempt < attempts {
+			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+		}
 	}
-	return dev, nil
+	return nil, fmt.Errorf("initialize playback device after %d attempts: %w (output device is busy or held in exclusive mode by another application; close other audio programs or select a different TX output device)", attempts, lastErr)
 }
 
 func (m *MalgoDuplex) finishPlaybackJob(job *malgoPlaybackJob, reason error) {

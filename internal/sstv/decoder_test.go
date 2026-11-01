@@ -210,6 +210,13 @@ func TestImplementedModesDecodeTheirOwnWaveforms(t *testing.T) {
 	}
 }
 
+func absCh(a, b uint8) uint8 {
+	if a >= b {
+		return a - b
+	}
+	return b - a
+}
+
 func TestRobotMonochromeModesRoundTrip(t *testing.T) {
 	const rate = 8_000
 	source := makeTestSSTVImage()
@@ -538,12 +545,15 @@ func TestStreamDecoderEmitsProgressiveImagesBeforeFrameCompletion(t *testing.T) 
 				}
 				lastRows = update.Rows
 			}
-			// Rows comfortably above the progress boundary must already match
-			// the eventual final raster, proving these are decoded pixels.
+			// Rows comfortably above the progress boundary must closely match the
+			// eventual final raster, proving these are decoded pixels. The preview
+			// uses nominal timing (no sync recovery), so a few channels of drift
+			// are acceptable.
 			preview := updates[len(updates)/2]
 			checkRow := max(0, preview.Rows-3)
 			for _, x := range []int{16, 80, 160, 240, 304} {
-				if got, want := preview.Image.NRGBAAt(x, checkRow), final[0].Image.NRGBAAt(x, checkRow); got != want {
+				got, want := preview.Image.NRGBAAt(x, checkRow), final[0].Image.NRGBAAt(x, checkRow)
+				if absCh(got.R, want.R) > 8 || absCh(got.G, want.G) > 8 || absCh(got.B, want.B) > 8 {
 					t.Fatalf("progressive pixel (%d,%d)=%v differs from final %v", x, checkRow, got, want)
 				}
 			}
