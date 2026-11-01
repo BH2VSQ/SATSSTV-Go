@@ -1,8 +1,13 @@
 package main
 
 import (
+	"context"
+	"image"
+	"image/color"
 	"math"
 	"testing"
+
+	"github.com/BH2VSQ/SATSSTV-Go/internal/sstv"
 )
 
 func TestMakeSpectrumDetects1500HzTone(t *testing.T) {
@@ -151,5 +156,79 @@ func TestSetRXModePublishesCanonicalRequestWithoutDecoderLock(t *testing.T) {
 	}
 	if got := app.rxModeRequest.Load(); got == nil || *got != "" {
 		t.Fatalf("auto mode request = %v, want empty ID", got)
+	}
+}
+
+func TestProcessRXFSKIDWorkDisarmsAfterIdentity(t *testing.T) {
+	const rate = 48_000
+	decoder, err := sstv.NewFSKIDDecoder(rate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wave, err := sstv.AppendMMSSTVFSKID(nil, rate, "BH2VSQ", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	armed := false
+	events := processRXFSKIDWork(decoder, &armed, rxFSKIDWork{reset: true, armed: true, samples: wave})
+	if len(events) != 1 || events[0].Callsign != "BH2VSQ" || armed {
+		t.Fatalf("first FSKID work = %+v, armed=%v; want BH2VSQ and disarmed", events, armed)
+	}
+	// Regular queued blocks carry the desired listening state for overflow
+	// recovery, but must not re-arm after a successful decode unless reset=true.
+	events = processRXFSKIDWork(decoder, &armed, rxFSKIDWork{armed: true, samples: wave})
+	if len(events) != 0 || armed {
+		t.Fatalf("worker re-armed after a successful FSKID: events=%+v armed=%v", events, armed)
+	}
+	processRXFSKIDWork(decoder, &armed, rxFSKIDWork{reset: true, armed: false})
+	if armed {
+		t.Fatal("discontinuity reset should disarm FSKID")
+	}
+}
+
+func TestEnqueueRXFSKIDWorkResetsOnlySideChannelOnOverflow(t *testing.T) {
+	queue := make(chan rxFSKIDWork, 2)
+	queue <- rxFSKIDWork{armed: true, samples: []int16{1}}
+	queue <- rxFSKIDWork{armed: true, samples: []int16{2}}
+	enqueueRXFSKIDWork(queue, rxFSKIDWork{armed: true, samples: []int16{3}})
+	work := <-queue
+	if !work.reset || !work.armed || len(work.samples) != 1 || work.samples[0] != 3 {
+		t.Fatalf("overflow recovery work = %+v, want reset+armed with newest sample", work)
+	}
+	if len(queue) != 0 {
+		t.Fatalf("stale FSKID work remains queued: %d", len(queue))
+	}
+}
+
+func TestMaterializeRXFrameEventDecodesDeferredRaster(t *testing.T) {
+	const rate = 48_000
+	source := image.NewNRGBA(image.Rect(0, 0, 320, 240))
+	for y := 0; y < source.Bounds().Dy(); y++ {
+		for x := 0; x < source.Bounds().Dx(); x++ {
+			source.SetNRGBA(x, y, color.NRGBA{R: uint8(x), G: uint8(y), B: uint8(x ^ y), A: 255})
+		}
+	}
+	wave, err := sstv.NewEncoder(rate).Encode(context.Background(), source, sstv.Robot36ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder, err := sstv.NewStreamDecoder(rate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder.SetDeferredFrameDecode(true)
+	frames, err := decoder.Feed(context.Background(), wave)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 1 || frames[0].Image != nil || frames[0].DecodeRequest == nil {
+		t.Fatalf("Feed returned unexpected deferred frame: %+v", frames)
+	}
+	materialized, err := materializeRXFrameEvent(context.Background(), frames[0])
+	if err != nil {
+		t.Fatalf("materialize frame event: %v", err)
+	}
+	if materialized.Image == nil || materialized.Image.Bounds().Dx() != materialized.Mode.Width || materialized.Image.Bounds().Dy() != materialized.Mode.Height {
+		t.Fatalf("materialized image bounds = %v, want %dx%d", materialized.Image.Bounds(), materialized.Mode.Width, materialized.Mode.Height)
 	}
 }

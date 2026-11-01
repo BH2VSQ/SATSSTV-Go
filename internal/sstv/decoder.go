@@ -1169,6 +1169,10 @@ type StreamEvent struct {
 	Mode    ModeSpec
 	VIS     uint8
 	FrameID uint64
+	// DecodeRequest is populated when deferred final-frame decoding is enabled.
+	// It owns immutable frequency chunk headers and can be decoded by a worker
+	// after Feed has returned, keeping the real-time audio path short.
+	DecodeRequest *StreamUpdate
 }
 
 // StreamDecoder accepts arbitrary-sized PCM chunks and automatically detects
@@ -1176,24 +1180,26 @@ type StreamEvent struct {
 // bounded idle search window. Progressive snapshots are available during the
 // frame through DrainUpdates; completed frames are returned from Feed.
 type StreamDecoder struct {
-	rate            int
-	pending         []int16
-	freq            []float64
-	tracker         *frequencyTracker
-	idleFreq        []float64
-	idleTracker     *frequencyTracker
-	mode            *ModeSpec
-	bodyStart       int
-	maxIdle         int
-	visSearchFrom   int
-	skipUntil       int // end offset of a complete frame rejected by fixed-mode filtering
-	fixedMode       string
-	activeVIS       uint8
-	offset          float64
-	lastPreviewRows int
-	frameID         uint64
-	previewSequence uint64
-	updates         []StreamUpdate
+	rate             int
+	pending          []int16
+	freqChunks       [][]float64
+	freqLen          int
+	tracker          *frequencyTracker
+	idleFreq         []float64
+	idleTracker      *frequencyTracker
+	mode             *ModeSpec
+	bodyStart        int
+	maxIdle          int
+	visSearchFrom    int
+	skipUntil        int // end offset of a complete frame rejected by fixed-mode filtering
+	fixedMode        string
+	activeVIS        uint8
+	offset           float64
+	lastPreviewRows  int
+	frameID          uint64
+	previewSequence  uint64
+	updates          []StreamUpdate
+	deferFrameDecode bool
 }
 
 // StreamUpdate is an immutable request to reconstruct a progressive raster.
@@ -1211,18 +1217,98 @@ type StreamUpdate struct {
 	Offset     float64
 	FrameID    uint64
 	Sequence   uint64
-	Frequency  []float64
+	// FrequencyChunks references immutable per-Feed discriminator blocks.
+	// Copying only the slice headers avoids repeatedly copying the entire
+	// accumulated image track on the real-time audio goroutine.
+	FrequencyChunks [][]float64
+	FrequencyLength int
+	// PCM references the completed frame's immutable original samples when this
+	// request represents a final raster, preserving all mode-specific fallback
+	// paths used by the synchronous decoder. Progressive previews leave it nil.
+	PCM []int16
 }
 
 // Decode reconstructs the currently received rows represented by this update.
+// It is intended for standalone callers/tests. The production preview worker
+// should use DecodeWithFrequency and append only unseen chunks between updates.
 func (u StreamUpdate) Decode(ctx context.Context) (*image.NRGBA, error) {
 	if u.Image != nil {
 		return u.Image, nil
 	}
-	if u.Mode.ID == "" || u.SampleRate <= 0 || len(u.Frequency) == 0 {
+	freq := flattenFrequencyChunks(u.FrequencyChunks, u.FrequencyLength)
+	return u.DecodeWithFrequency(ctx, freq)
+}
+
+// DecodeFinal reconstructs a completed frame with the same raw-PCM fallback as
+// the synchronous StreamDecoder path. The PCM slice is an immutable view owned
+// by the request, so a frame worker can safely decode it after Feed returns.
+func (u StreamUpdate) DecodeFinal(ctx context.Context) (*image.NRGBA, error) {
+	if u.Image != nil {
+		return u.Image, nil
+	}
+	if u.Mode.ID == "" || u.SampleRate <= 0 || u.FrequencyLength <= 0 {
+		return nil, errors.New("invalid completed SSTV frame request")
+	}
+	frequency := flattenFrequencyChunks(u.FrequencyChunks, u.FrequencyLength)
+	if len(u.PCM) == 0 {
+		return u.DecodeWithFrequency(ctx, frequency)
+	}
+	return decodeModeFromFrequency(ctx, frequency, u.SampleRate, u.Mode, u.BodyStart, u.PCM, u.Offset)
+}
+
+// DecodeWithFrequency reconstructs a preview from a caller-maintained,
+// contiguous frequency track. The supplied slice must contain at least the
+// FrequencyLength samples referenced by this update.
+func (u StreamUpdate) DecodeWithFrequency(ctx context.Context, frequency []float64) (*image.NRGBA, error) {
+	if u.Image != nil {
+		return u.Image, nil
+	}
+	if u.Mode.ID == "" || u.SampleRate <= 0 || u.FrequencyLength <= 0 || len(frequency) < u.FrequencyLength {
 		return nil, errors.New("invalid progressive SSTV preview request")
 	}
-	return decodeModeRowsFromFrequency(ctx, u.Frequency, u.SampleRate, u.Mode, u.BodyStart, nil, u.Offset, u.Rows)
+	return decodeModeRowsFromFrequency(ctx, frequency[:u.FrequencyLength:u.FrequencyLength], u.SampleRate, u.Mode, u.BodyStart, nil, u.Offset, u.Rows)
+}
+
+func flattenFrequencyChunks(chunks [][]float64, limit int) []float64 {
+	if limit <= 0 {
+		for _, chunk := range chunks {
+			limit += len(chunk)
+		}
+	}
+	if limit <= 0 {
+		return nil
+	}
+	out := make([]float64, 0, limit)
+	for _, chunk := range chunks {
+		if len(out) >= limit {
+			break
+		}
+		remaining := limit - len(out)
+		if len(chunk) > remaining {
+			chunk = chunk[:remaining]
+		}
+		out = append(out, chunk...)
+	}
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func frequencyChunksTail(chunks [][]float64, skip int) []float64 {
+	if skip < 0 {
+		skip = 0
+	}
+	out := make([]float64, 0)
+	for _, chunk := range chunks {
+		if skip >= len(chunk) {
+			skip -= len(chunk)
+			continue
+		}
+		out = append(out, chunk[skip:]...)
+		skip = 0
+	}
+	return out
 }
 
 func NewStreamDecoder(sampleRate int) (*StreamDecoder, error) {
@@ -1246,7 +1332,11 @@ func (d *StreamDecoder) Feed(ctx context.Context, samples []int16) ([]StreamEven
 	if len(samples) > 0 {
 		d.pending = append(d.pending, samples...)
 		if wasActive {
-			d.freq = append(d.freq, d.tracker.Process(samples)...)
+			chunk := d.tracker.Process(samples)
+			if len(chunk) > 0 {
+				d.freqChunks = append(d.freqChunks, chunk)
+				d.freqLen += len(chunk)
+			}
 		} else {
 			// Idle: maintain an incremental frequency track for header detection
 			// instead of re-demodulating the whole pending buffer every feed.
@@ -1329,15 +1419,20 @@ func (d *StreamDecoder) Feed(ctx context.Context, samples []int16) ([]StreamEven
 			d.mode, d.bodyStart, d.activeVIS = &spec, bodyStart, vis
 			d.frameID++
 			d.tracker = newFrequencyTracker(d.rate)
-			d.freq = d.tracker.Process(d.pending)
+			initialFrequency := d.tracker.Process(d.pending)
+			d.freqChunks = nil
+			if len(initialFrequency) > 0 {
+				d.freqChunks = append(d.freqChunks, initialFrequency)
+			}
+			d.freqLen = len(initialFrequency)
 			d.idleFreq = nil
 			d.idleTracker = nil
 			// The header now begins at offset zero, so its 300 ms leader is the
 			// first window. Measure its average frequency from the demodulated
 			// track to compensate the receiver's offset.
 			d.offset = 0
-			if leaderN := int(math.Round(0.300 * float64(d.rate))); leaderN <= len(d.freq) {
-				if f := meanFreq(d.freq, 0, leaderN); f >= 1_700 && f <= 2_100 {
+			if leaderN := int(math.Round(0.300 * float64(d.rate))); leaderN <= d.freqLen {
+				if f := meanFreq(d.freqChunks[0], 0, leaderN); f >= 1_700 && f <= 2_100 {
 					d.offset = f - 1_900
 				}
 			}
@@ -1351,29 +1446,49 @@ func (d *StreamDecoder) Feed(ctx context.Context, samples []int16) ([]StreamEven
 			d.prepareProgressiveUpdate(ctx, frameEnd)
 			return events, nil
 		}
-		img, err := decodeModeFromFrequency(ctx, d.freq[:frameEnd], d.rate, *d.mode, d.bodyStart, d.pending[:frameEnd], d.offset)
-		if err != nil {
-			if ctxErr(ctx) != nil {
-				return events, err
+		if d.deferFrameDecode {
+			// Snapshot only immutable chunk headers. The actual raster reconstruction
+			// and image encoding happen on the frame worker, never on the PCM worker.
+			request := &StreamUpdate{
+				Mode:            *d.mode,
+				Rows:            d.mode.Height,
+				TotalRows:       d.mode.Height,
+				SampleRate:      d.rate,
+				BodyStart:       d.bodyStart,
+				Offset:          d.offset,
+				FrameID:         d.frameID,
+				Sequence:        d.previewSequence + 1,
+				FrequencyChunks: append([][]float64(nil), d.freqChunks...),
+				FrequencyLength: frameEnd,
+				PCM:             d.pending[:frameEnd:frameEnd],
 			}
-			failedMode := d.mode.Name
-			d.finishActiveFrame(frameEnd)
-			return events, fmt.Errorf("decode streamed %s frame: %w", failedMode, err)
+			events = append(events, StreamEvent{Mode: *d.mode, VIS: d.activeVIS, FrameID: d.frameID, DecodeRequest: request})
+		} else {
+			frameFrequency := flattenFrequencyChunks(d.freqChunks, frameEnd)
+			img, err := decodeModeFromFrequency(ctx, frameFrequency, d.rate, *d.mode, d.bodyStart, d.pending[:frameEnd], d.offset)
+			if err != nil {
+				if ctxErr(ctx) != nil {
+					return events, err
+				}
+				failedMode := d.mode.Name
+				d.finishActiveFrame(frameEnd)
+				return events, fmt.Errorf("decode streamed %s frame: %w", failedMode, err)
+			}
+			events = append(events, StreamEvent{Image: img, Mode: *d.mode, VIS: d.activeVIS, FrameID: d.frameID})
 		}
-		events = append(events, StreamEvent{Image: img, Mode: *d.mode, VIS: d.activeVIS, FrameID: d.frameID})
 		d.finishActiveFrame(frameEnd)
 	}
 }
 
 func (d *StreamDecoder) prepareProgressiveUpdate(ctx context.Context, frameEnd int) {
-	if d.mode == nil || d.bodyStart < 0 || len(d.freq) <= d.bodyStart {
+	if d.mode == nil || d.bodyStart < 0 || d.freqLen <= d.bodyStart {
 		return
 	}
 	bodySamples := frameEnd - d.bodyStart
 	if bodySamples <= 0 {
 		return
 	}
-	received := min(max(0, len(d.freq)-d.bodyStart), bodySamples)
+	received := min(max(0, d.freqLen-d.bodyStart), bodySamples)
 	rows := int(float64(received) / float64(bodySamples) * float64(d.mode.Height))
 	if rows <= d.lastPreviewRows || rows <= 0 {
 		return
@@ -1397,19 +1512,23 @@ func (d *StreamDecoder) prepareProgressiveUpdate(ctx context.Context, frameEnd i
 	previewSpec := *d.mode
 	previewSpec.Height = previewRows
 	neededSamples := d.bodyStart + int(math.Round(BodyDurationMS(previewSpec)*float64(d.rate)/1000))
-	freqEnd := min(len(d.freq), max(d.bodyStart+1, neededSamples))
-	freqSnapshot := append([]float64(nil), d.freq[:freqEnd]...)
+	freqEnd := min(d.freqLen, max(d.bodyStart+1, neededSamples))
+	// The chunk payload is a shallow immutable snapshot. The audio worker only
+	// allocates one small slice of headers per preview instead of copying up to
+	// several megabytes of accumulated per-sample frequencies every few rows.
+	chunkSnapshot := append([][]float64(nil), d.freqChunks...)
 	d.previewSequence++
 	d.updates = append(d.updates, StreamUpdate{
-		Mode:       *d.mode,
-		Rows:       previewRows,
-		TotalRows:  d.mode.Height,
-		SampleRate: d.rate,
-		BodyStart:  d.bodyStart,
-		Offset:     d.offset,
-		FrameID:    d.frameID,
-		Sequence:   d.previewSequence,
-		Frequency:  freqSnapshot,
+		Mode:            *d.mode,
+		Rows:            previewRows,
+		TotalRows:       d.mode.Height,
+		SampleRate:      d.rate,
+		BodyStart:       d.bodyStart,
+		Offset:          d.offset,
+		FrameID:         d.frameID,
+		Sequence:        d.previewSequence,
+		FrequencyChunks: chunkSnapshot,
+		FrequencyLength: freqEnd,
 	})
 	d.lastPreviewRows = previewRows
 }
@@ -1427,8 +1546,8 @@ func (d *StreamDecoder) finishActiveFrame(frameEnd int) {
 	remaining := append([]int16(nil), d.pending[frameEnd:]...)
 	d.pending = remaining
 
-	if frameEnd <= len(d.freq) {
-		d.idleFreq = append([]float64(nil), d.freq[frameEnd:]...)
+	if frameEnd <= d.freqLen {
+		d.idleFreq = frequencyChunksTail(d.freqChunks, frameEnd)
 		d.idleTracker = d.tracker
 	} else {
 		d.idleTracker = newFrequencyTracker(d.rate)
@@ -1439,7 +1558,8 @@ func (d *StreamDecoder) finishActiveFrame(frameEnd int) {
 	d.bodyStart = 0
 	d.activeVIS = 0
 	d.offset = 0
-	d.freq = nil
+	d.freqChunks = nil
+	d.freqLen = 0
 	d.tracker = nil
 	d.lastPreviewRows = 0
 	d.visSearchFrom = 0
@@ -1468,6 +1588,17 @@ func (d *StreamDecoder) DrainUpdates() []StreamUpdate {
 	return updates
 }
 
+// SetDeferredFrameDecode moves completed-raster reconstruction out of Feed.
+// It must be configured before receiving samples. Callers then decode each
+// StreamEvent.DecodeRequest on a separate worker; default behavior remains
+// synchronous for library users that rely on Image being populated in Feed.
+func (d *StreamDecoder) SetDeferredFrameDecode(enabled bool) {
+	if d == nil {
+		return
+	}
+	d.deferFrameDecode = enabled
+}
+
 // SetMode selects a fixed receive mode. An empty string restores Auto detection.
 func (d *StreamDecoder) SetMode(modeID string) error {
 	if d == nil {
@@ -1485,7 +1616,8 @@ func (d *StreamDecoder) SetMode(modeID string) error {
 		d.visSearchFrom = 0
 		d.activeVIS = 0
 		d.offset = 0
-		d.freq = nil
+		d.freqChunks = nil
+		d.freqLen = 0
 		d.tracker = nil
 		d.idleFreq = nil
 		d.idleTracker = nil
@@ -1508,7 +1640,8 @@ func (d *StreamDecoder) SetMode(modeID string) error {
 	d.visSearchFrom = 0
 	d.activeVIS = 0
 	d.offset = 0
-	d.freq = nil
+	d.freqChunks = nil
+	d.freqLen = 0
 	d.tracker = nil
 	d.idleFreq = nil
 	d.idleTracker = nil
@@ -1529,12 +1662,25 @@ func (d *StreamDecoder) Reset() {
 	d.visSearchFrom = 0
 	d.activeVIS = 0
 	d.offset = 0
-	d.freq = nil
+	d.freqChunks = nil
+	d.freqLen = 0
 	d.tracker = nil
 	d.idleFreq = nil
 	d.idleTracker = nil
 	d.lastPreviewRows = 0
 	d.updates = nil
+}
+
+// PendingAudio returns a copy of audio samples buffered after the most recently
+// completed frame. It is useful for protocols appended immediately after an
+// SSTV raster (such as MMSSTV FSKID): callers can seed their side-channel
+// decoder with only the true post-frame tail instead of rescanning hundreds
+// of milliseconds of the preceding image.
+func (d *StreamDecoder) PendingAudio() []int16 {
+	if d == nil || len(d.pending) == 0 {
+		return nil
+	}
+	return append([]int16(nil), d.pending...)
 }
 
 // ActiveMode reports the currently detected in-progress image, if any.

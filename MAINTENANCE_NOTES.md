@@ -110,3 +110,49 @@ wails build
 
 - The fixed-mode synchronization-prefix fallback now uses the same approximately ±350 Hz leader offset window as Auto mode (previously ±220 Hz), so manual mode selection does not lose lock at offsets that Auto can accept.
 - Added `TestFixedModePrefixSupportsWideFrequencyOffsets` for -300 Hz and +300 Hz; the test allows one fine-search step of timing tolerance.
+
+
+## 2026-11-01 FSKID 互操作与 RX 尾部过载修复
+
+### 音频处理偶发积压
+
+- 对 48 kHz Robot 36、10 ms 音频块的实时路径做逐块耗时剖析，确认完整帧到达的最后一个 `Feed()` 曾同步执行整幅图像的像素重建，峰值约 56 ms，远高于一个采集块的时长。
+- `StreamDecoder` 新增可选的 deferred-final-decode 模式。Wails RX 启用该模式后，`Feed()` 在帧结束时只返回 `DecodeRequest`（不可变频率块头快照、帧元数据和原始 PCM 视图），由独立帧工作线程执行 `DecodeFinal()`、PNG 编码和相册归档。通用库调用默认仍保留原先同步返回 `Image` 的行为。
+- 相同基准下，启用 deferred 模式后帧尾 `Feed()` 降至约 27 µs；该结果说明已移除可复现的同步重建尖峰，但不能保证所有 Windows 音频驱动在任意系统负载下永不丢块。采集驱动/操作系统长时间调度停顿仍可能触发有界队列的断流保护。
+
+### MMSSTV FSKID
+
+- 对照随仓库提供的 MMSSTV C++ 源码：`OutputFSKID()` 依次输出 2100 Hz、100 ms guard；1900 Hz、22 ms start；`WriteFSK()` 按 B0→B5 输出 6 bit；标记为 `0x2A`；呼号字符减 `0x20`；`0x01` EOT；最后输出字符 XOR 校验。符号时长使用 C++ 累积采样位置的 `int(m_dPos)`，而不是逐段四舍五入。
+- FSKID 接收器按 MMSSTV `DecodeFSK()` 的实际状态机工作：直接捕获 2100 Hz guard，估算 AFC，再检测 1900 Hz 起始位和 22 ms 数据符号。可选的 300 ms 1500 Hz（普通）或 1900 Hz（窄带）leader 不再是捕获前提；截断 leader 或环路尾部只保留 guard 时仍可识别。
+- 完整图像结束后，主 RX worker 从 `StreamDecoder.PendingAudio()` 取得当前采集块中剩余的真实图像后音频，并将它与后续 PCM 顺序送至独立 FSKID worker。FSKID 不在图像解调线程运行；侧通道队列溢出只影响 FSKID 识别，不会重置 SSTV 图像接收。
+- 前端 `rx:callsign` 事件会将合法呼号自动写入 `hisCall`，并分发 `input` 事件；如果输入框为空，或当前值是 FSKID 上次自动写入的值，可以填入/更新；用户手动修改后不会被后续识别覆盖。
+
+### 本轮回归
+
+- `CGO_ENABLED=0 go test ./internal/sstv -run 'FSKID|TestStreamDecoderCanDeferFinalRasterDecode|TestStreamDecoderReceivesRobot36At48k10msBlocks|TestStreamDecoderReceivesAllImplementedModesInChunks|TestStreamDecoderAutoAcceptsVISWithDamagedParity|TestStreamDecoderFixedModeFallbackSupportsMMSSTVAndNarrowVIS' -count=1`: passed.
+- FSKID end-to-end regression combines a full Robot 36 SSTV transmission and MMSSTV-reference FSKID in one continuous PCM stream, deliberately splits the stream into 1024-sample blocks, and checks both Auto and fixed Robot 36 modes. It verifies only the post-frame tail is passed to FSKID and that the trailer does not falsely activate another SSTV frame.
+- Existing FSKID tests cover normal/narrow leaders, direct guard acquisition without leader, sample rates 8/12/44.1/48/96 kHz, irregular capture chunks, receiver frequency offsets, deterministic broadband noise with reduced signal level, malformed candidates, resets, checksum, and MMSSTV LSB-first symbols.
+- `CGO_ENABLED=0 go vet ./internal/sstv ./internal/audio ./internal/radio/... ./cmd/sstv-go`: passed.
+- `node --check frontend/app.js`: passed. `node --test frontend/tests/*.test.cjs`: 5/5 passed, including four `rx:callsign`/HisCall integration-handler tests and the waterfall regression.
+- The root Wails app package could not be fully tested in this container because required Wails v2.17.0 and malgo v0.11.26 modules are not cached and external module download is unavailable. The app changes were formatted and statically reviewed, but a real Windows Wails build and physical audio/RF validation remain outstanding.
+
+## 2026-11-01 MMSSTV FSKID 反向互操作修复
+
+### 根因与协议修正
+
+- 进一步核对 MMSSTV 的 `CVCO::SetSampleFreq()`、`CVCO::Do()` 和 `CSSTVMOD::Write()` 后，纠正了此前对 `TxSampOffset` 的错误假设：它改变的是每个 FSK 音调写入的采样数量/持续时间；VCO 仍按音频设备的标称采样率产生 1900 Hz、2100 Hz 音调。不能从 2100 Hz guard 的频率偏移推算符号时钟。
+- MMSSTV 窄带模式可在真正 FSKID guard 前输出 1900 Hz、300 ms leader。旧的宽 AFC Guard 粗捕获会把该 leader 当作 2100 Hz guard，或把 leader/guard 交界的混合 40 ms 窗口当作 Guard，随后锁错起点并跳过真实 FSKID。
+- FSKID Guard 粗捕获与稳定窗的频率差门限收紧至 120 Hz，起点精修使用 90 Hz 容差，避免混合过渡窗被接受；测试覆盖 ±80 Hz 接收频偏。普通 1500 Hz leader 和窄带 1900 Hz leader 均不再作为 Guard 本身。
+- 符号时钟从实际 MMSSTV 固定前导恢复：2100 Hz Guard 后 1900 Hz start，再跟随 `0x2A` 的六个 LSB-first 位，形成七个交替的 1900/2100 Hz 符号。对七个已知音调边界使用 Hann 加窗 Goertzel 能量比寻找转折点，再以七个边界的最小二乘拟合得到符号周期和起始相位。AFC 仅校正载波判决，不影响波特率估算。
+- 载荷解码使用前导拟合得到的实际符号周期，不再用 `2100 Hz + offset` 推算时钟。附近的相位候选中只要有完整、校验正确的包即可确认；不再因末尾的其他相位窗口尚未收齐而无限保持“等待 FSKID”。
+- 完整 SSTV 帧结束后，即使接收器暂时把窄带 1900 Hz leader 视为新的 SSTV 同步候选，也持续把剩余 PCM 顺序送到独立 FSKID worker；该监听仍具有 8 秒上限，并在输入断流时复位。
+
+### 回归测试
+
+- `go test ./internal/sstv -run 'FSKID' -count=1`: passed。覆盖普通/窄带 leader、无 leader 直接 Guard 捕获、8/12/44.1/48/96 kHz、任意 PCM 分块、±80 Hz 接收频偏、低电平叠加确定性噪声、损坏候选后恢复、呼号空格裁剪、XOR 校验、完整 Robot 36 后紧接 FSKID，以及 `TxSampOffset` 仅改变持续时间的 ±1.5% 时钟偏差。
+- 增加最长 16 字符呼号在 48 kHz、±1.5% `TxSampOffset` 下的测试，验证长数据包不会因位周期误差累计而错位。
+- 根包 `TestProcessRXFSKIDWorkDisarmsAfterIdentity`、`TestEnqueueRXFSKIDWorkResetsOnlySideChannelOnOverflow`、`TestMaterializeRXFrameEventDecodesDeferredRaster` 使用本机临时 Wails API stub 定向通过；这不是完整 Wails GUI 构建。
+- `go test ./internal/audio ./internal/radio/... ./cmd/sstv-go`: passed。
+- `go vet ./internal/sstv ./internal/audio ./internal/radio/... ./cmd/sstv-go`: passed。
+- `node --test frontend/tests/*.test.cjs`: 5/5 passed；`node --check frontend/app.js` 和 Wails JS 绑定语法检查通过。
+- 测试运行期间临时将本地工作副本 `go.mod` 中的 Go 版本改为 1.23.0，完成后恢复为项目声明的 `go 1.25.0`。当前容器没有实际 Windows 声卡，也没有用户侧 MMSSTV FSKID 录音；参考向量由仓库内 MMSSTV C++ 发送逻辑生成。因此这些结果证明源代码级协议回归通过，但仍需用实际 MMSSTV 发射录音做最终互操作确认。

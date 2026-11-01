@@ -369,6 +369,10 @@ func (a *App) startRX(modeID string) error {
 	if err != nil {
 		return err
 	}
+	// Completed raster reconstruction is CPU-heavy and must not execute on
+	// the ordered capture/decoder goroutine. Progressive and final frames are
+	// both reconstructed by the dedicated frame worker.
+	decoder.SetDeferredFrameDecode(true)
 	baseCtx := a.ctx
 	if baseCtx == nil {
 		baseCtx = context.Background()
@@ -378,7 +382,7 @@ func (a *App) startRX(modeID string) error {
 	// sensitive, but multi-second buffering is worse: it makes RX appear frozen
 	// and eventually overflows the native queue. If this short queue fills, the
 	// sender inserts an explicit discontinuity marker and keeps the newest data.
-	queue := make(chan []float32, 8)
+	queue := make(chan []float32, 16)
 	a.rxQueueDrops.Store(0)
 
 	a.rxDecoderMu.Lock()
@@ -488,21 +492,32 @@ type rxTelemetryBlock struct {
 	Discontinuity   bool
 }
 
+// rxFSKIDWork is routed to its own worker so the sliding one-millisecond
+// FSKID search can never hold the ordered SSTV PCM decoder. Samples are
+// immutable after enqueue; reset/armed state is serialized by the worker.
+type rxFSKIDWork struct {
+	reset   bool
+	armed   bool
+	samples []int16
+}
+
 func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *sstv.StreamDecoder, fskidDecoder *sstv.FSKIDDecoder, sampleRate int, session appAudioRuntime, initialMode string) {
 	var receivedSamples uint64
 	lastProgress := time.Time{}
 	telemetryQueue := make(chan rxTelemetryBlock, 8)
 	previewQueue := make(chan sstv.StreamUpdate, 1) // latest preview wins; never back-pressure DSP
 	frameQueue := make(chan sstv.StreamEvent, 2)
+	fskidQueue := make(chan rxFSKIDWork, 512) // bounded side-channel audio; never blocks SSTV
 	var latestPreviewSequence atomic.Uint64
 	var completedPreviewFrame atomic.Uint64
+	var fskidDecoded atomic.Bool
 	go a.runRXTelemetryWorker(ctx, telemetryQueue, sampleRate, session)
 	go a.runRXPreviewWorker(ctx, previewQueue, &latestPreviewSequence, &completedPreviewFrame)
 	go a.runRXFrameWorker(ctx, frameQueue)
+	go a.runRXFSKIDWorker(ctx, fskidQueue, fskidDecoder, &fskidDecoded)
 	activeMode := initialMode
-	var recentPCM []int16
-	recentLimit := max(sampleRate/2, 1) // retain 500 ms so an FSKID preamble at frame end is not clipped
 	fskidArmed := false
+	var fskidListenUntil time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -514,9 +529,10 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 				// sequence across missing samples.
 				decoder.Reset()
 				latestPreviewSequence.Add(1) // invalidate any preview already decoding
-				fskidDecoder.Reset()
-				recentPCM = nil
 				fskidArmed = false
+				fskidListenUntil = time.Time{}
+				fskidDecoded.Store(false)
+				enqueueRXFSKIDWork(fskidQueue, rxFSKIDWork{reset: true, armed: false})
 				enqueueRXTelemetry(telemetryQueue, rxTelemetryBlock{Discontinuity: true})
 				lastProgress = time.Time{}
 				if a.ctx != nil {
@@ -530,12 +546,6 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 			}
 			receivedSamples += uint64(len(block))
 			pcm := audio.Float32ToPCM16(block)
-			recentPCM = append(recentPCM, pcm...)
-			if len(recentPCM) > recentLimit {
-				trim := len(recentPCM) - recentLimit
-				copy(recentPCM, recentPCM[trim:])
-				recentPCM = recentPCM[:recentLimit]
-			}
 			var droppedBlocks uint64
 			if diagnostics, ok := session.(captureDiagnostics); ok {
 				droppedBlocks = diagnostics.DroppedCaptureBlocks()
@@ -546,10 +556,9 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 			a.appendCaptureDump(block, sampleRate*10)
 
 			// FSKID is transmitted after the analog picture. Scanning every live
-			// SSTV pixel as a possible FSKID preamble used to run two 300 ms
-			// Goertzel windows at 1 ms offsets, creating large CPU spikes on long
-			// 1500/1900 Hz image tones. Arm it only after a complete picture and
-			// seed it with the retained tail so the first 300 ms preamble is intact.
+			// SSTV pixel as a possible preamble is expensive and can false-lock on
+			// long image tones. Arm only after a completed frame and seed the FSKID
+			// scanner with StreamDecoder's exact unconsumed post-frame audio tail.
 			a.rxDecoderMu.Lock()
 			if requested := a.rxModeRequest.Load(); requested != nil && *requested != activeMode {
 				if modeErr := decoder.SetMode(*requested); modeErr != nil {
@@ -565,26 +574,38 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 			events, err := decoder.Feed(ctx, pcm)
 			progress, progressActive := decoder.Progress()
 			progressiveUpdates := decoder.DrainUpdates()
-			_, decoderActive := decoder.ActiveMode()
+			var trailingFrameAudio []int16
+			if len(events) > 0 {
+				// A completed frame can share its final capture block with the next
+				// protocol preamble. Preserve every post-raster sample even if the
+				// SSTV detector has tentatively locked onto a narrowband FSKID leader.
+				trailingFrameAudio = decoder.PendingAudio()
+			}
 			a.rxDecoderMu.Unlock()
 
-			if decoderActive {
-				fskidDecoder.Reset()
+			// Process the completion signal before checking ActiveMode. Feed may
+			// finish one frame and detect the next frame from the tail of the same
+			// capture block; the old branch order silently ignored the completed
+			// frame in that case and never armed FSKID for its following trailer.
+			if fskidDecoded.Swap(false) {
 				fskidArmed = false
-			} else if len(events) > 0 {
-				fskidDecoder.Reset()
-				for _, identity := range fskidDecoder.Feed(recentPCM) {
-					if a.ctx != nil {
-						runtime.EventsEmit(a.ctx, "rx:callsign", map[string]any{"callsign": identity.Callsign, "source": "MMSSTV FSKID"})
-					}
-				}
+				fskidListenUntil = time.Time{}
+			}
+			if len(events) > 0 {
 				fskidArmed = true
+				fskidListenUntil = time.Now().Add(8 * time.Second)
+				enqueueRXFSKIDWork(fskidQueue, rxFSKIDWork{reset: true, armed: true, samples: trailingFrameAudio})
 			} else if fskidArmed {
-				for _, identity := range fskidDecoder.Feed(pcm) {
-					if a.ctx != nil {
-						runtime.EventsEmit(a.ctx, "rx:callsign", map[string]any{"callsign": identity.Callsign, "source": "MMSSTV FSKID"})
-					}
+				// Keep scanning independently of a tentative SSTV lock: a narrowband
+				// MMSSTV FSKID leader is itself a 1900 Hz / 300 ms tone and can look
+				// like the beginning of another SSTV frame. The side channel is
+				// bounded to eight seconds, long enough for the maximum FSKID payload.
+				if !fskidListenUntil.IsZero() && time.Now().After(fskidListenUntil) {
 					fskidArmed = false
+					fskidListenUntil = time.Time{}
+					enqueueRXFSKIDWork(fskidQueue, rxFSKIDWork{reset: true, armed: false})
+				} else {
+					enqueueRXFSKIDWork(fskidQueue, rxFSKIDWork{armed: true, samples: pcm})
 				}
 			}
 
@@ -620,6 +641,64 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 	}
 }
 
+func enqueueRXFSKIDWork(queue chan rxFSKIDWork, work rxFSKIDWork) {
+	select {
+	case queue <- work:
+		return
+	default:
+	}
+	// FSKID is optional metadata. If its side-channel queue ever fills, discard
+	// only stale FSKID work, reset its timing state, and keep the newest block;
+	// never block or reset the SSTV image decoder because of this queue.
+	for {
+		select {
+		case <-queue:
+		default:
+			work.reset = true
+			work.armed = work.armed || len(work.samples) > 0
+			queue <- work
+			return
+		}
+	}
+}
+
+func processRXFSKIDWork(decoder *sstv.FSKIDDecoder, armed *bool, work rxFSKIDWork) []sstv.FSKIDEvent {
+	if decoder == nil || armed == nil {
+		return nil
+	}
+	if work.reset {
+		decoder.Reset()
+		*armed = work.armed
+	}
+	if !*armed || len(work.samples) == 0 {
+		return nil
+	}
+	events := decoder.Feed(work.samples)
+	if len(events) > 0 {
+		*armed = false
+	}
+	return events
+}
+
+func (a *App) runRXFSKIDWorker(ctx context.Context, queue <-chan rxFSKIDWork, decoder *sstv.FSKIDDecoder, decoded *atomic.Bool) {
+	armed := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case work := <-queue:
+			for _, identity := range processRXFSKIDWork(decoder, &armed, work) {
+				if decoded != nil {
+					decoded.Store(true)
+				}
+				if a.ctx != nil {
+					runtime.EventsEmit(a.ctx, "rx:callsign", map[string]any{"callsign": identity.Callsign, "source": "MMSSTV FSKID"})
+				}
+			}
+		}
+	}
+}
+
 func enqueueLatestRXPreview(queue chan sstv.StreamUpdate, update sstv.StreamUpdate) {
 	select {
 	case queue <- update:
@@ -637,6 +716,13 @@ func enqueueLatestRXPreview(queue chan sstv.StreamUpdate, update sstv.StreamUpda
 }
 
 func (a *App) runRXPreviewWorker(ctx context.Context, queue <-chan sstv.StreamUpdate, latestSequence, completedFrame *atomic.Uint64) {
+	// Reassemble immutable frequency chunks incrementally. Every update carries
+	// the full slice of chunk headers (not sample copies), so if the latest-wins
+	// queue replaces an older update, this worker can still append all missing
+	// chunks without forcing the RX/audio worker to clone a multi-megabyte track.
+	var previewFrameID uint64
+	var nextChunk int
+	var previewFrequency []float64
 	for {
 		select {
 		case <-ctx.Done():
@@ -645,7 +731,16 @@ func (a *App) runRXPreviewWorker(ctx context.Context, queue <-chan sstv.StreamUp
 			if a.ctx == nil || update.FrameID <= completedFrame.Load() || update.Sequence != latestSequence.Load() {
 				continue
 			}
-			img, err := update.Decode(ctx)
+			if previewFrameID != update.FrameID {
+				previewFrameID = update.FrameID
+				nextChunk = 0
+				previewFrequency = previewFrequency[:0]
+			}
+			for nextChunk < len(update.FrequencyChunks) {
+				previewFrequency = append(previewFrequency, update.FrequencyChunks[nextChunk]...)
+				nextChunk++
+			}
+			img, err := update.DecodeWithFrequency(ctx, previewFrequency)
 			if err != nil || img == nil {
 				continue
 			}
@@ -664,13 +759,32 @@ func (a *App) runRXPreviewWorker(ctx context.Context, queue <-chan sstv.StreamUp
 	}
 }
 
+func materializeRXFrameEvent(ctx context.Context, event sstv.StreamEvent) (sstv.StreamEvent, error) {
+	if event.Image == nil && event.DecodeRequest != nil {
+		img, err := event.DecodeRequest.DecodeFinal(ctx)
+		if err != nil {
+			return event, err
+		}
+		event.Image = img
+	}
+	if event.Image == nil {
+		return event, errors.New("completed RX frame has neither an image nor a decode request")
+	}
+	return event, nil
+}
+
 func (a *App) runRXFrameWorker(ctx context.Context, queue <-chan sstv.StreamEvent) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case event := <-queue:
-			if event.Image == nil {
+			var materializeErr error
+			event, materializeErr = materializeRXFrameEvent(ctx, event)
+			if materializeErr != nil {
+				if ctx.Err() == nil && a.ctx != nil {
+					runtime.EventsEmit(a.ctx, "rx:error", "SSTV 图像重建失败："+materializeErr.Error())
+				}
 				continue
 			}
 			var buf bytes.Buffer

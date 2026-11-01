@@ -1041,11 +1041,27 @@ function bindRuntimeEvents() {
     }
   });
   window.runtime.EventsOn('rx:callsign', (data) => {
-    const callsign = String(data?.callsign || '').trim();
-    if (!callsign) return;
+    const callsign = String(data?.callsign || '').trim().toUpperCase();
+    // Reject malformed/empty identities before they can affect the QSO form.
+    if (!/^[A-Z0-9/\-]{1,16}$/.test(callsign)) return;
     $('rxCallsign').textContent = callsign;
     $('rxCallsign').title = `来源：${data?.source || 'FSKID'}`;
-    setStatus(`已通过 ${data?.source || 'FSKID'} 识别到呼号 ${callsign}`);
+
+    // Auto-fill HisCall when it is empty, or refresh a value that was itself
+    // previously filled by FSKID. A manually edited QSO callsign is preserved.
+    const hisCall = $('hisCall');
+    let filledHisCall = false;
+    if (hisCall && (!hisCall.value.trim() || hisCall.dataset.fskidAuto === 'true')) {
+      if (hisCall.value.trim().toUpperCase() !== callsign) {
+        hisCall.value = callsign;
+        hisCall.dataset.fskidAuto = 'true';
+        hisCall.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      filledHisCall = true;
+    }
+    setStatus(filledHisCall
+      ? `已通过 ${data?.source || 'FSKID'} 识别到呼号 ${callsign}，已填入对方呼号`
+      : `已通过 ${data?.source || 'FSKID'} 识别到呼号 ${callsign}；保留了已手动填写的对方呼号`);
   });
   window.runtime.EventsOn('rx:preview', (data) => {
     const frame = $('rxImageFrame');
@@ -1374,8 +1390,9 @@ $('deleteText').addEventListener('click', deleteSelectedComponent);
 $('saveTemplate').addEventListener('click', saveCurrentTemplate);
 $('componentText').addEventListener('input', updateSelectedComponent);
 ['fontSize', 'fontColor', 'posX', 'posY', 'fontBold', 'imageWidth', 'outlineEnabled', 'outlineWidth', 'outlineColor'].forEach(id => $(id).addEventListener('input', updateSelectedComponent));
-VALUE_IDS.forEach(id => $(id).addEventListener('input', () => {
+VALUE_IDS.forEach(id => $(id).addEventListener('input', (event) => {
   if (id === 'myCall' || id === 'locator') syncStationSettingsForm();
+  if (id === 'hisCall' && event.isTrusted) delete $('hisCall').dataset.fskidAuto;
   renderCanvas();
 }));
 $('importAlbumTX').addEventListener('click', () => importAlbum('tx'));

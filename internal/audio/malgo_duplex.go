@@ -169,10 +169,11 @@ func (m *MalgoDuplex) StartCapture(ctx context.Context, onSamples func([]float32
 		defer freeMalgoDeviceID(deviceID)
 	}
 
-	// Keep native-side latency bounded. The application worker has a separate
-	// short queue and explicit discontinuity handling; a 64-block native queue
-	// could hide seconds of backlog before the receiver noticed an overrun.
-	queue := make(chan []float32, 8)
+	// Keep a modest jitter buffer on the native callback side. The application
+	// worker has its own 16-block queue; 16 blocks absorb short scheduler/UI
+	// pauses without hiding seconds of stale audio. Sustained overload still
+	// produces an explicit discontinuity marker rather than unbounded latency.
+	queue := make(chan []float32, 16)
 	workerCtx, cancel := context.WithCancel(context.Background())
 	dev, err := malgo.InitDevice(m.ctx.Context, cfg, malgo.DeviceCallbacks{Data: func(_, input []byte, _ uint32) {
 		defer func() {

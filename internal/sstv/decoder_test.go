@@ -1,6 +1,7 @@
 package sstv
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"image"
@@ -904,6 +905,34 @@ func TestNarrowBandMPUsesNarrowSyncAndPorch(t *testing.T) {
 	}
 }
 
+func TestStreamUpdateDecodeDoesNotOverwriteFrequencyBufferTail(t *testing.T) {
+	const rate = 8_000
+	mode, err := LookupMode(Robot36ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frequency := make([]float64, 64, rate*2)
+	backing := frequency[:cap(frequency)]
+	for i := range backing {
+		backing[i] = VideoCenterHz
+	}
+	for i := len(frequency); i < len(backing); i++ {
+		backing[i] = 98765.0 // sentinel beyond the published immutable prefix
+	}
+	update := StreamUpdate{
+		Mode: mode, Rows: 1, TotalRows: mode.Height, SampleRate: rate,
+		BodyStart: 0, FrequencyLength: len(frequency), Offset: 0,
+	}
+	if _, err := update.DecodeWithFrequency(context.Background(), frequency); err != nil {
+		t.Fatalf("decode one-row preview: %v", err)
+	}
+	for i := len(frequency); i < len(backing); i++ {
+		if backing[i] != 98765.0 {
+			t.Fatalf("preview padding overwrote shared frequency buffer at index %d: %.1f", i, backing[i])
+		}
+	}
+}
+
 func TestStreamDecoderEmitsProgressiveImagesBeforeFrameCompletion(t *testing.T) {
 	const rate = 48_000
 	for _, modeID := range []string{Robot36ID, "martin_m1", "pd120"} {
@@ -931,8 +960,8 @@ func TestStreamDecoderEmitsProgressiveImagesBeforeFrameCompletion(t *testing.T) 
 					if update.Image != nil {
 						t.Fatal("Feed decoded preview pixels synchronously; preview work must stay off the audio path")
 					}
-					if len(update.Frequency) == 0 || update.SampleRate != rate {
-						t.Fatalf("preview request is missing an immutable frequency snapshot: %+v", update)
+					if len(update.FrequencyChunks) == 0 || update.FrequencyLength <= 0 || update.SampleRate != rate {
+						t.Fatalf("preview request is missing an immutable frequency chunk snapshot: %+v", update)
 					}
 					if update.Rows <= lastRows || update.Rows >= update.TotalRows {
 						t.Fatalf("progressive row count did not advance monotonically: previous=%d update=%d/%d", lastRows, update.Rows, update.TotalRows)
@@ -969,6 +998,57 @@ func TestStreamDecoderEmitsProgressiveImagesBeforeFrameCompletion(t *testing.T) 
 				}
 			}
 		})
+	}
+}
+
+func TestProgressiveSnapshotsShareImmutableFrequencyChunks(t *testing.T) {
+	const rate = 48_000
+	encoded, err := NewEncoder(rate).Encode(context.Background(), makeTestSSTVImage(), Robot36ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder, err := NewStreamDecoder(rate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var previous *StreamUpdate
+	var last StreamUpdate
+	for start := 0; start < len(encoded); start += 4096 {
+		end := min(start+4096, len(encoded))
+		if _, err := decoder.Feed(context.Background(), encoded[start:end]); err != nil {
+			t.Fatal(err)
+		}
+		for _, update := range decoder.DrainUpdates() {
+			if previous != nil && previous.FrameID == update.FrameID {
+				if len(update.FrequencyChunks) < len(previous.FrequencyChunks) {
+					t.Fatalf("chunk count moved backwards: %d -> %d", len(previous.FrequencyChunks), len(update.FrequencyChunks))
+				}
+				if len(previous.FrequencyChunks) > 0 && len(update.FrequencyChunks) > 0 {
+					if &previous.FrequencyChunks[0][0] != &update.FrequencyChunks[0][0] {
+						t.Fatal("progressive update copied old frequency samples instead of sharing immutable chunks")
+					}
+				}
+			}
+			copyOfUpdate := update
+			previous = &copyOfUpdate
+			last = update
+		}
+	}
+	if len(last.FrequencyChunks) == 0 || last.FrequencyLength <= 0 {
+		t.Fatal("no frequency chunks in latest progressive update")
+	}
+	// Simulate the production preview worker receiving only the newest update
+	// after older latest-wins queue entries were replaced.
+	var assembled []float64
+	for _, chunk := range last.FrequencyChunks {
+		assembled = append(assembled, chunk...)
+	}
+	preview, err := last.DecodeWithFrequency(context.Background(), assembled)
+	if err != nil {
+		t.Fatalf("decode latest-only chunk snapshot: %v", err)
+	}
+	if preview.Bounds().Dx() != last.Mode.Width || preview.Bounds().Dy() != last.Mode.Height {
+		t.Fatalf("preview dimensions = %v", preview.Bounds())
 	}
 }
 
@@ -1088,5 +1168,46 @@ func TestFrequencyTrackerMatchesSingleBufferDemodulation(t *testing.T) {
 		if got[index] != want[index] {
 			t.Fatalf("frequency at sample %d = %.6f, whole-buffer %.6f", index, got[index], want[index])
 		}
+	}
+}
+
+func TestStreamDecoderCanDeferFinalRasterDecode(t *testing.T) {
+	const rate = 48_000
+	wave, err := NewEncoder(rate).Encode(context.Background(), makeTestSSTVImage(), Robot36ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncDecoder, err := NewStreamDecoder(rate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	synchronous, err := syncDecoder.Feed(context.Background(), wave)
+	if err != nil || len(synchronous) != 1 || synchronous[0].Image == nil {
+		t.Fatalf("synchronous reference decode failed: frames=%d err=%v", len(synchronous), err)
+	}
+	decoder, err := NewStreamDecoder(rate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder.SetDeferredFrameDecode(true)
+	frames, err := decoder.Feed(context.Background(), wave)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("deferred Feed returned %d frames, want 1", len(frames))
+	}
+	if frames[0].Image != nil || frames[0].DecodeRequest == nil {
+		t.Fatalf("deferred event = %+v, want DecodeRequest and no synchronous Image", frames[0])
+	}
+	img, err := frames[0].DecodeRequest.DecodeFinal(context.Background())
+	if err != nil {
+		t.Fatalf("decode deferred raster: %v", err)
+	}
+	if img == nil || img.Bounds().Dx() != frames[0].Mode.Width || img.Bounds().Dy() != frames[0].Mode.Height {
+		t.Fatalf("deferred image bounds = %v, want %dx%d", img.Bounds(), frames[0].Mode.Width, frames[0].Mode.Height)
+	}
+	if !bytes.Equal(img.Pix, synchronous[0].Image.Pix) {
+		t.Fatal("deferred final decode differs from the original synchronous decoder output")
 	}
 }
