@@ -572,13 +572,31 @@ let waterfallOff = null;
 let currentInputDBFS = -120;
 
 function spectrumColorRGB(value) {
-  const strength = Math.max(0, Math.min(1, (Number(value) - 0.16) / 0.84));
-  const gray = Math.round(255 * (1 - Math.pow(strength, 0.82)));
-  return [gray, gray, gray];
+  const level = Math.max(0, Math.min(1, (Number(value) - 0.10) / 0.72));
+  const stops = [
+    [0.00, [5, 10, 22]],
+    [0.28, [12, 43, 78]],
+    [0.52, [0, 132, 160]],
+    [0.76, [238, 181, 48]],
+    [1.00, [255, 255, 238]],
+  ];
+
+  const position = Math.pow(level, 0.78);
+  let upper = 1;
+  while (upper < stops.length - 1 && position > stops[upper][0]) upper++;
+
+  const [lowAt, low] = stops[upper - 1];
+  const [highAt, high] = stops[upper];
+  const t = Math.max(0, Math.min(1, (position - lowAt) / (highAt - lowAt)));
+
+  return low.map((channel, index) =>
+    Math.round(channel + (high[index] - channel) * t)
+  );
 }
+
 function spectrumColor(value) {
-  const [gray] = spectrumColorRGB(value);
-  return `rgb(${gray},${gray},${gray})`;
+  const [red, green, blue] = spectrumColorRGB(value);
+  return `rgb(${red},${green},${blue})`;
 }
 function drawWaterfall(ctx, w, waterfallY, waterfallH, xOffset = 0) {
   const rows = waterfallHistory.slice(-MAX_WATERFALL_ROWS);
@@ -599,7 +617,7 @@ function drawWaterfall(ctx, w, waterfallY, waterfallH, xOffset = 0) {
     const base = r * bins * 4;
     for (let b = 0; b < bins; b++) {
       const p = base + b * 4;
-      data[p] = 247; data[p + 1] = 247; data[p + 2] = 244; data[p + 3] = 255;
+      data[p] = 5; data[p + 1] = 10; data[p + 2] = 22; data[p + 3] = 255;
     }
   }
   for (let r = 0; r < rows.length; r++) {
@@ -681,10 +699,10 @@ function drawIdleSpectrum() {
   ctx.strokeStyle = '#36414a';
   ctx.beginPath(); ctx.moveTo(plotX, plotH - 1); ctx.lineTo(w, plotH - 1); ctx.stroke();
 
-  ctx.fillStyle = '#f7f7f4';
+  ctx.fillStyle = '#050a16';
   ctx.fillRect(plotX, waterfallY, plotW, waterfallH);
   drawWaterfall(ctx, plotW, waterfallY, waterfallH, plotX);
-  ctx.strokeStyle = '#65717b';
+  ctx.strokeStyle = '#31465c';
   ctx.beginPath(); ctx.moveTo(plotX, waterfallY); ctx.lineTo(w, waterfallY); ctx.stroke();
 }
 function renderLiveSpectrum(values) {

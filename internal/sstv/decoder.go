@@ -1171,23 +1171,11 @@ func (d *StreamDecoder) Feed(ctx context.Context, samples []int16) ([]StreamEven
 				return events, err
 			}
 			failedMode := d.mode.Name
-			d.pending = append([]int16(nil), d.pending[frameEnd:]...)
-			if len(d.freq) >= frameEnd {
-				d.freq = append([]float64(nil), d.freq[frameEnd:]...)
-			} else {
-				d.freq = nil
-			}
-			d.clearActiveFrame()
+			d.finishActiveFrame(frameEnd)
 			return events, fmt.Errorf("decode streamed %s frame: %w", failedMode, err)
 		}
 		events = append(events, StreamEvent{Image: img, Mode: *d.mode, VIS: d.activeVIS})
-		d.pending = append([]int16(nil), d.pending[frameEnd:]...)
-		if len(d.freq) >= frameEnd {
-			d.freq = append([]float64(nil), d.freq[frameEnd:]...)
-		} else {
-			d.freq = nil
-		}
-		d.clearActiveFrame()
+		d.finishActiveFrame(frameEnd)
 	}
 }
 
@@ -1225,6 +1213,36 @@ func (d *StreamDecoder) prepareProgressiveUpdate(ctx context.Context, frameEnd i
 	d.updates = append(d.updates, StreamUpdate{Image: img, Mode: *d.mode, Rows: rows, TotalRows: d.mode.Height})
 }
 
+// finishActiveFrame preserves the remaining audio and frequency track
+// for detecting the next VIS header after the current frame.
+func (d *StreamDecoder) finishActiveFrame(frameEnd int) {
+	if frameEnd < 0 {
+		frameEnd = 0
+	}
+	if frameEnd > len(d.pending) {
+		frameEnd = len(d.pending)
+	}
+
+	remaining := append([]int16(nil), d.pending[frameEnd:]...)
+	d.pending = remaining
+
+	if frameEnd <= len(d.freq) {
+		d.idleFreq = append([]float64(nil), d.freq[frameEnd:]...)
+		d.idleTracker = d.tracker
+	} else {
+		d.idleTracker = newFrequencyTracker(d.rate)
+		d.idleFreq = d.idleTracker.Process(remaining)
+	}
+
+	d.mode = nil
+	d.bodyStart = 0
+	d.activeVIS = 0
+	d.offset = 0
+	d.freq = nil
+	d.tracker = nil
+	d.lastPreviewRows = 0
+	d.visSearchFrom = 0
+}
 func (d *StreamDecoder) clearActiveFrame() {
 	d.mode = nil
 	d.bodyStart = 0
