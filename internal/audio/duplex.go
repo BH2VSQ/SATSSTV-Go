@@ -20,6 +20,8 @@ var (
 
 // CaptureStream owns an input device. Its callback must not block on DSP or UI
 // work. Implementations should copy/reuse buffers safely before returning.
+// A nil sample slice is an ordered marker that input samples were discarded;
+// consumers must discard partial decoder state before processing later audio.
 type CaptureStream interface {
 	StartCapture(ctx context.Context, onSamples func([]float32)) error
 	StopCapture() error
@@ -30,6 +32,35 @@ type CaptureStream interface {
 type PlaybackStream interface {
 	Play(ctx context.Context, samples []float32, sampleRate int) error
 	StopPlayback() error
+}
+
+// enqueueCaptureBlock keeps recent audio bounded. When the queue is full it
+// replaces the stale backlog with a discontinuity marker followed by the newest
+// block. The queue must have capacity for at least two entries.
+func enqueueCaptureBlock(queue chan []float32, block []float32) uint64 {
+	select {
+	case queue <- block:
+		return 0
+	default:
+	}
+	var discarded uint64
+	for {
+		select {
+		case stale := <-queue:
+			if stale != nil {
+				discarded++
+			}
+		default:
+			if discarded == 0 {
+				// The consumer may have drained the queue between the initial
+				// full check and this loop. Still flag an uncertain discontinuity.
+				discarded = 1
+			}
+			queue <- nil
+			queue <- block
+			return discarded
+		}
+	}
 }
 
 // TxTiming configures PTT lead-in and tail intervals.
@@ -156,7 +187,8 @@ func (d *FullDuplex) StopReceive() error {
 	return d.capture.StopCapture()
 }
 
-// Transmit keys the uplink, waits for the configured lead-in, plays one SSTV
+// Transmit keys the uplink, waits for the configured lead-in when the selected
+// PTT controller actually keys hardware, plays one SSTV
 // waveform and releases PTT after the audio tail. RX is never stopped here.
 func (d *FullDuplex) Transmit(ctx context.Context, samples []float32) error {
 	return d.TransmitWithProgress(ctx, samples, nil)
@@ -229,8 +261,14 @@ func (d *FullDuplex) TransmitWithProgress(ctx context.Context, samples []float32
 		}
 	}()
 
-	if err := waitContext(txCtx, d.timing.PTTLead); err != nil {
-		return err
+	// VOX has no software keying line: the radio keys from the first audio
+	// sample. Waiting for a hardware PTT lead in this mode would create a silent
+	// delay before every test tone and SSTV transmission. Hardware PTT modes
+	// continue to honor the configured lead interval.
+	if policy, ok := d.ptt.(interface{ RequiresPTTLeadTime() bool }); !ok || policy.RequiresPTTLeadTime() {
+		if err := waitContext(txCtx, d.timing.PTTLead); err != nil {
+			return err
+		}
 	}
 	var playErr error
 	if progressPlayback, ok := d.playback.(interface {

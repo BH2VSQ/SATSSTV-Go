@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// TemplateObject is one editable text, static image, or dynamic last-RX layer on the SSTV canvas.
+// TemplateObject is one editable text, image, persistent background, or dynamic last-RX layer on the SSTV canvas.
 type TemplateObject struct {
 	Type      string  `json:"type"`
 	Text      string  `json:"text,omitempty"`
@@ -139,46 +139,63 @@ func validateTemplateSlots(slots []TemplateSlot) error {
 		if len(slot.Objects) > 100 {
 			return fmt.Errorf("模板 %q 的组件数量不能超过 100", slot.Name)
 		}
+		backgroundCount := 0
 		for j := range slot.Objects {
 			obj := &slot.Objects[j]
 			if obj.Type == "" {
 				obj.Type = "text" // Backward compatibility with v3.4 text-only templates.
 			}
-			if obj.X < 0 || obj.X > 100 || obj.Y < 0 || obj.Y > 100 {
-				return fmt.Errorf("模板 %q 的组件 %d 位置超出画布范围", slot.Name, j+1)
-			}
 			switch obj.Type {
 			case "text":
-				if len(obj.Text) > 4096 || obj.FontSize < 0 || obj.FontSize > 160 {
+				if obj.X < 0 || obj.X > 100 || obj.Y < 0 || obj.Y > 100 || len(obj.Text) > 4096 || obj.FontSize < 0 || obj.FontSize > 160 {
 					return fmt.Errorf("模板 %q 的文字组件 %d 参数无效", slot.Name, j+1)
 				}
-			case "image", "last_rx":
-				if obj.Width <= 0 || obj.Width > 100 || obj.Height <= 0 || obj.Height > 100 {
-					return fmt.Errorf("模板 %q 的图像组件 %d 尺寸无效", slot.Name, j+1)
+			case "image":
+				if obj.X < 0 || obj.X > 100 || obj.Y < 0 || obj.Y > 100 || obj.Width <= 0 || obj.Width > 100 || obj.Height < 0 || obj.Height > 100 {
+					return fmt.Errorf("模板 %q 的图像组件 %d 尺寸或位置无效", slot.Name, j+1)
 				}
-				if obj.Type == "last_rx" {
-					// The previous-RX object intentionally stores no image bytes.
-					// It resolves to the latest received frame at render time.
-					obj.ImageData = ""
-					if obj.ImageName == "" {
-						obj.ImageName = "上一次 RX 图像"
-					}
-					continue
+				if err := validateTemplateImage(slot.Name, j, obj.ImageData, &totalImageBytes); err != nil {
+					return err
 				}
-				totalImageBytes += len(obj.ImageData)
-				if len(obj.ImageData) > 16<<20 || totalImageBytes > 48<<20 {
-					return fmt.Errorf("模板图片数据过大，请压缩图片后再保存")
+			case "last_rx":
+				if obj.X < 0 || obj.X > 100 || obj.Y < 0 || obj.Y > 100 || obj.Width <= 0 || obj.Width > 100 || obj.Height < 0 || obj.Height > 100 {
+					return fmt.Errorf("模板 %q 的上次 RX 图像组件 %d 参数无效", slot.Name, j+1)
 				}
-				if !strings.HasPrefix(obj.ImageData, "data:image/") || !strings.Contains(obj.ImageData, ";base64,") {
-					return fmt.Errorf("模板 %q 的图像组件 %d 数据无效", slot.Name, j+1)
+				// The previous-RX object intentionally stores no image bytes.
+				// It resolves to the latest received frame at render time.
+				obj.ImageData = ""
+				if obj.ImageName == "" {
+					obj.ImageName = "上一次 RX 图像"
 				}
-				if _, err := decodeDataURL(obj.ImageData); err != nil {
-					return fmt.Errorf("模板 %q 的图像组件 %d 无法解码：%w", slot.Name, j+1, err)
+			case "background":
+				backgroundCount++
+				if obj.X < -150 || obj.X > 150 || obj.Y < -150 || obj.Y > 150 || obj.Width < 100 || obj.Width > 400 {
+					return fmt.Errorf("模板 %q 的底图组件 %d 缩放或偏移参数无效", slot.Name, j+1)
+				}
+				if err := validateTemplateImage(slot.Name, j, obj.ImageData, &totalImageBytes); err != nil {
+					return err
 				}
 			default:
 				return fmt.Errorf("模板 %q 包含未知组件类型 %q", slot.Name, obj.Type)
 			}
 		}
+		if backgroundCount > 1 {
+			return fmt.Errorf("模板 %q 只能包含一个底图", slot.Name)
+		}
+	}
+	return nil
+}
+
+func validateTemplateImage(slotName string, objectIndex int, dataURL string, totalImageBytes *int) error {
+	*totalImageBytes += len(dataURL)
+	if len(dataURL) > 20<<20 || *totalImageBytes > 60<<20 {
+		return fmt.Errorf("模板图片数据过大，请压缩图片后再保存")
+	}
+	if !strings.HasPrefix(dataURL, "data:image/") || !strings.Contains(dataURL, ";base64,") {
+		return fmt.Errorf("模板 %q 的图像组件 %d 数据无效", slotName, objectIndex+1)
+	}
+	if _, err := decodeDataURL(dataURL); err != nil {
+		return fmt.Errorf("模板 %q 的图像组件 %d 无法解码：%w", slotName, objectIndex+1, err)
 	}
 	return nil
 }

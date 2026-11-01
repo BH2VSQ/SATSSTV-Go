@@ -4,7 +4,11 @@ import {main} from '../models';
 
 export function ApplyAudioSettings(arg1:main.AudioSettings,arg2:string):Promise<void>;
 
+export function ClearTXBackground():Promise<void>;
+
 export function DeleteAlbumImage(arg1:string):Promise<void>;
+
+export function DeleteImageLibraryImage(arg1:string):Promise<void>;
 
 export function EncodeImageData(arg1:string,arg2:string,arg3:string,arg4:number):Promise<string>;
 
@@ -22,17 +26,25 @@ export function GetModes():Promise<Array<main.Mode>>;
 
 export function GetStationSettings():Promise<main.StationSettings>;
 
+export function GetTXBackground():Promise<main.TemplateObject>;
+
 export function GetTemplateSlots():Promise<Array<main.TemplateSlot>>;
 
 export function ImportAlbumImage(arg1:string):Promise<main.AlbumEntry>;
+
+export function ImportImageToLibrary():Promise<main.ImageLibraryEntry>;
 
 export function InitializeAudio(arg1:string):Promise<void>;
 
 export function ListAlbum():Promise<Array<main.AlbumEntry>>;
 
+export function ListImageLibrary():Promise<Array<main.ImageLibraryEntry>>;
+
 export function ListSerialPorts():Promise<Array<string>>;
 
 export function LoadAlbumPreview(arg1:string):Promise<string>;
+
+export function LoadImageLibraryImage(arg1:string):Promise<string>;
 
 export function LoadImagePreview(arg1:string):Promise<string>;
 
@@ -41,6 +53,8 @@ export function SaveAlbumImage(arg1:string,arg2:string,arg3:string,arg4:string):
 export function SaveCapturedAudio():Promise<string>;
 
 export function SaveStationSettings(arg1:main.StationSettings):Promise<main.StationSettings>;
+
+export function SaveTXBackground(arg1:main.TemplateObject):Promise<main.TemplateObject>;
 
 export function SaveTemplateSlots(arg1:Array<main.TemplateSlot>):Promise<Array<main.TemplateSlot>>;
 

@@ -7,6 +7,7 @@ import (
 	"image/color"
 	"math"
 	"testing"
+	"time"
 )
 
 func makeTestSSTVImage() *image.NRGBA {
@@ -84,6 +85,85 @@ func TestDecodeAutomaticallyDetectsVIS(t *testing.T) {
 	}
 }
 
+func TestDetectAllModeHeaderFamiliesAt48k(t *testing.T) {
+	const rate = 48_000
+	for _, spec := range Modes() {
+		if !spec.CodecReady {
+			continue
+		}
+		t.Run(spec.ID, func(t *testing.T) {
+			g, err := NewToneGenerator(rate, 0.35)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch spec.Header {
+			case HeaderVIS:
+				err = WriteVIS(g, spec.VIS)
+			case HeaderMMSSTV:
+				err = WriteMMSSTVHeader(g, spec.ExtendedVIS)
+			case HeaderNarrowVIS:
+				err = WriteNarrowVIS(g, spec.NarrowVIS)
+			case HeaderAVT:
+				err = WriteAVT90Header(g)
+			default:
+				t.Fatalf("unsupported header family %q", spec.Header)
+			}
+			if err != nil {
+				t.Fatalf("write header: %v", err)
+			}
+			samples := append(g.Samples(), make([]int16, rate*2)...)
+			detected, _, _, err := DetectModeHeader(samples, rate)
+			if err != nil {
+				t.Fatalf("detect header: %v", err)
+			}
+			if detected.ID != spec.ID {
+				t.Fatalf("detected %q, want %q", detected.ID, spec.ID)
+			}
+		})
+	}
+}
+
+func TestStreamDecoderReceivesRobot36At48k10msBlocks(t *testing.T) {
+	const rate = 48_000
+	const chunk = rate / 100 // 10 ms native audio callback blocks.
+	encoded, err := NewEncoder(rate).Encode(context.Background(), makeTestSSTVImage(), Robot36ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Include an arbitrary leading offset and a short quiet interval, as a live
+	// receiver does not necessarily start exactly on the VIS leader boundary.
+	samples := append(make([]int16, 317), make([]int16, rate/2)...)
+	samples = append(samples, encoded...)
+	for _, fixedMode := range []string{"", Robot36ID} {
+		name := "auto"
+		if fixedMode != "" {
+			name = "fixed"
+		}
+		t.Run(name, func(t *testing.T) {
+			decoder, err := NewStreamDecoder(rate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := decoder.SetMode(fixedMode); err != nil {
+				t.Fatal(err)
+			}
+			var events []StreamEvent
+			for start := 0; start < len(samples); start += chunk {
+				end := min(start+chunk, len(samples))
+				batch, feedErr := decoder.Feed(context.Background(), samples[start:end])
+				decoder.DrainUpdates()
+				if feedErr != nil {
+					t.Fatalf("feed at sample %d: %v", start, feedErr)
+				}
+				events = append(events, batch...)
+			}
+			if len(events) != 1 || events[0].Mode.ID != Robot36ID {
+				t.Fatalf("received %+v, want one Robot 36 image", events)
+			}
+		})
+	}
+}
+
 func TestStreamDecoderReceivesFrameInChunks(t *testing.T) {
 	const rate = 48_000
 	encoded, err := NewEncoder(rate).Encode(context.Background(), makeTestSSTVImage(), Robot36ID)
@@ -98,6 +178,7 @@ func TestStreamDecoderReceivesFrameInChunks(t *testing.T) {
 	for start := 0; start < len(encoded); start += 4096 {
 		end := min(start+4096, len(encoded))
 		got, feedErr := decoder.Feed(context.Background(), encoded[start:end])
+		decoder.DrainUpdates()
 		if feedErr != nil {
 			t.Fatal(feedErr)
 		}
@@ -111,6 +192,98 @@ func TestStreamDecoderReceivesFrameInChunks(t *testing.T) {
 	}
 	if events[0].Image.Bounds().Dx() != 320 || events[0].Image.Bounds().Dy() != 240 {
 		t.Fatalf("unexpected frame size %v", events[0].Image.Bounds())
+	}
+}
+
+func TestStreamDecoderIdle1900HzLeaderToneStaysRealtime(t *testing.T) {
+	const rate = 48_000
+	samples := make([]int16, rate*3)
+	for i := range samples {
+		samples[i] = int16(0.30 * 32767 * math.Sin(2*math.Pi*1900*float64(i)/float64(rate)))
+	}
+	decoder, err := NewStreamDecoder(rate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	for offset := 0; offset < len(samples); offset += 480 {
+		end := min(offset+480, len(samples))
+		if _, err := decoder.Feed(context.Background(), samples[offset:end]); err != nil {
+			t.Fatalf("feed idle leader tone at %d: %v", offset, err)
+		}
+	}
+	elapsed := time.Since(started)
+	t.Logf("3 seconds of idle 1900 Hz leader audio processed in %s", elapsed)
+	if elapsed >= 2*time.Second {
+		t.Fatalf("3 seconds of idle 1900 Hz audio took %s; VIS search must remain real-time", elapsed)
+	}
+}
+
+func TestStreamDecoderIdle1500HzToneStaysRealtime(t *testing.T) {
+	const rate = 48_000
+	const durationSeconds = 3
+	samples := make([]int16, rate*durationSeconds)
+	for i := range samples {
+		samples[i] = int16(0.35 * 32767 * math.Sin(2*math.Pi*1500*float64(i)/float64(rate)))
+	}
+	decoder, err := NewStreamDecoder(rate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	for offset := 0; offset < len(samples); offset += 1024 {
+		end := min(offset+1024, len(samples))
+		if _, err := decoder.Feed(context.Background(), samples[offset:end]); err != nil {
+			t.Fatalf("feed idle tone at %d: %v", offset, err)
+		}
+	}
+	elapsed := time.Since(started)
+	t.Logf("3 seconds of idle 1500 Hz audio processed in %s", elapsed)
+	if elapsed >= 2*time.Second {
+		t.Fatalf("3 seconds of idle 1500 Hz audio took %s to process; receiver must stay below realtime budget", elapsed)
+	}
+}
+
+func TestStreamDecoderReceivesAllImplementedModesInChunks(t *testing.T) {
+	// Exercise the live path, not only Decode/DecodeMode. The production RX
+	// worker feeds small arbitrary blocks and must preserve detector state for
+	// every standard, extended, narrow-band and AVT header family.
+	const rate = 8_000
+	source := makeTestSSTVImage()
+	encoder := NewEncoder(rate)
+	for _, spec := range Modes() {
+		if !spec.CodecReady {
+			continue
+		}
+		t.Run(spec.ID, func(t *testing.T) {
+			samples, err := encoder.Encode(context.Background(), source, spec.ID)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			decoder, err := NewStreamDecoder(rate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var events []StreamEvent
+			for offset := 0; offset < len(samples); offset += 2048 {
+				end := min(offset+2048, len(samples))
+				batch, feedErr := decoder.Feed(context.Background(), samples[offset:end])
+				decoder.DrainUpdates()
+				if feedErr != nil {
+					t.Fatalf("feed at sample %d: %v", offset, feedErr)
+				}
+				events = append(events, batch...)
+			}
+			if len(events) != 1 {
+				t.Fatalf("stream returned %d frames, want exactly one", len(events))
+			}
+			if events[0].Mode.ID != spec.ID {
+				t.Fatalf("stream detected %q, want %q", events[0].Mode.ID, spec.ID)
+			}
+			if bounds := events[0].Image.Bounds(); bounds.Dx() != spec.Width || bounds.Dy() != spec.Height {
+				t.Fatalf("decoded bounds = %v, want %dx%d", bounds, spec.Width, spec.Height)
+			}
+		})
 	}
 }
 
@@ -134,6 +307,7 @@ func TestStreamDecoderFindsVISAfterLongIdle(t *testing.T) {
 	for start := 0; start < len(encoded); start += 2048 {
 		end := min(start+2048, len(encoded))
 		batch, feedErr := decoder.Feed(context.Background(), encoded[start:end])
+		decoder.DrainUpdates()
 		if feedErr != nil {
 			t.Fatal(feedErr)
 		}
@@ -295,6 +469,203 @@ func TestStreamDecoderFixedModeSkipsWholeMismatchedFrame(t *testing.T) {
 	}
 }
 
+func TestStreamDecoderFixedModeFallsBackWhenVISBitsAreDamaged(t *testing.T) {
+	const rate = 8_000
+	const modeID = "robot36"
+	spec, err := LookupMode(modeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := NewEncoder(rate).Encode(context.Background(), makeTestSSTVImage(), modeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Rebuild the 610 ms synchronization prefix and the VIS payload, but invert
+	// the parity symbol. A fixed-mode receiver knows the selected raster and
+	// should still lock to the valid leader/break/leader prefix.
+	header, err := NewToneGenerator(rate, 0.35)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, segment := range []struct{ hz, ms float64 }{{1900, 300}, {1200, 10}, {1900, 300}, {1200, 30}} {
+		if err := header.ToneMS(segment.hz, segment.ms); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ones := 0
+	for bit := 0; bit < 7; bit++ {
+		tone := 1_300.0
+		if (spec.VIS>>bit)&1 != 0 {
+			tone = 1_100
+			ones++
+		}
+		if err := header.ToneMS(tone, 30); err != nil {
+			t.Fatal(err)
+		}
+	}
+	parityTone := 1_300.0
+	if ones%2 == 0 { // Deliberately invert the required even-parity bit.
+		parityTone = 1_100
+	}
+	if err := header.ToneMS(parityTone, 30); err != nil {
+		t.Fatal(err)
+	}
+	if err := header.ToneMS(1_200, 30); err != nil {
+		t.Fatal(err)
+	}
+	badHeader := header.Samples()
+	bodyStart := int(math.Round(.910 * rate))
+	combined := append(badHeader, encoded[bodyStart:]...)
+
+	decoder, err := NewStreamDecoder(rate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := decoder.SetMode(modeID); err != nil {
+		t.Fatal(err)
+	}
+	var events []StreamEvent
+	for start := 0; start < len(combined); start += 1024 {
+		end := min(start+1024, len(combined))
+		batch, feedErr := decoder.Feed(context.Background(), combined[start:end])
+		if feedErr != nil {
+			t.Fatalf("feed damaged-VIS frame: %v", feedErr)
+		}
+		events = append(events, batch...)
+	}
+	if len(events) != 1 || events[0].Mode.ID != modeID {
+		t.Fatalf("fixed-mode fallback returned %+v, want one %s frame", events, modeID)
+	}
+}
+
+func TestStreamDecoderAutoAcceptsVISWithDamagedParity(t *testing.T) {
+	const rate = 48_000
+	const modeID = Robot36ID
+	spec, err := LookupMode(modeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := NewEncoder(rate).Encode(context.Background(), makeTestSSTVImage(), modeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := NewToneGenerator(rate, 0.30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, segment := range []struct{ hz, ms float64 }{{1900, 300}, {1200, 10}, {1900, 300}, {1200, 30}} {
+		if err := header.ToneMS(segment.hz, segment.ms); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ones := 0
+	for bit := 0; bit < 7; bit++ {
+		tone := 1_300.0
+		if (spec.VIS>>bit)&1 != 0 {
+			tone = 1_100
+			ones++
+		}
+		if err := header.ToneMS(tone, 30); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Invert only the parity symbol. All mode data bits and sync symbols remain
+	// intact, matching a marginal real-world VIS reception.
+	parityTone := 1_300.0
+	if ones%2 == 0 {
+		parityTone = 1_100
+	}
+	if err := header.ToneMS(parityTone, 30); err != nil {
+		t.Fatal(err)
+	}
+	if err := header.ToneMS(1_200, 30); err != nil {
+		t.Fatal(err)
+	}
+	bodyStart := int(math.Round(.910 * rate))
+	combined := append(make([]int16, rate/5), header.Samples()...)
+	combined = append(combined, encoded[bodyStart:]...)
+
+	decoder, err := NewStreamDecoder(rate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []StreamEvent
+	for start := 0; start < len(combined); start += rate / 100 {
+		end := min(start+rate/100, len(combined))
+		batch, feedErr := decoder.Feed(context.Background(), combined[start:end])
+		if feedErr != nil {
+			t.Fatalf("feed parity-damaged Auto frame: %v", feedErr)
+		}
+		events = append(events, batch...)
+	}
+	if len(events) != 1 || events[0].Mode.ID != modeID {
+		t.Fatalf("Auto decoder returned %+v, want one %s frame despite bad parity", events, modeID)
+	}
+}
+
+func TestStreamDecoderFixedModeFallbackSupportsMMSSTVAndNarrowVIS(t *testing.T) {
+	const rate = 8_000
+	for _, modeID := range []string{"mp73", "mp73_n"} {
+		t.Run(modeID, func(t *testing.T) {
+			spec, err := LookupMode(modeID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := NewEncoder(rate).Encode(context.Background(), makeTestSSTVImage(), modeID)
+			if err != nil {
+				t.Fatalf("encode %s: %v", modeID, err)
+			}
+			header, err := NewToneGenerator(rate, 0.35)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var headerMS float64
+			switch spec.Header {
+			case HeaderMMSSTV:
+				// 0xffff is deliberately not a registered extended VIS code.
+				if err := WriteMMSSTVHeader(header, 0xffff); err != nil {
+					t.Fatal(err)
+				}
+				headerMS = mmsstvExtendedHeaderMS
+			case HeaderNarrowVIS:
+				// 0x3f is deliberately not a registered N-VIS mode code.
+				if err := WriteNarrowVIS(header, 0x3f); err != nil {
+					t.Fatal(err)
+				}
+				headerMS = narrowVISHeaderMS
+			default:
+				t.Fatalf("unexpected header family %q", spec.Header)
+			}
+			headerSamples := int(math.Round(headerMS * float64(rate) / 1000))
+			if len(encoded) <= headerSamples {
+				t.Fatalf("encoded %s frame is shorter than its header", modeID)
+			}
+			combined := append(header.Samples(), encoded[headerSamples:]...)
+
+			decoder, err := NewStreamDecoder(rate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := decoder.SetMode(modeID); err != nil {
+				t.Fatal(err)
+			}
+			var events []StreamEvent
+			for start := 0; start < len(combined); start += 2048 {
+				end := min(start+2048, len(combined))
+				batch, feedErr := decoder.Feed(context.Background(), combined[start:end])
+				decoder.DrainUpdates()
+				if feedErr != nil {
+					t.Fatalf("feed damaged %s header: %v", modeID, feedErr)
+				}
+				events = append(events, batch...)
+			}
+			if len(events) != 1 || events[0].Mode.ID != modeID {
+				t.Fatalf("fixed-mode fallback returned %+v, want one %s frame", events, modeID)
+			}
+		})
+	}
+}
+
 func TestStreamDecoderCanReturnToAutoAfterFixedMode(t *testing.T) {
 	decoder, err := NewStreamDecoder(8_000)
 	if err != nil {
@@ -308,6 +679,28 @@ func TestStreamDecoderCanReturnToAutoAfterFixedMode(t *testing.T) {
 	}
 	if decoder.fixedMode != "" || decoder.skipUntil != 0 {
 		t.Fatalf("Auto mode did not clear fixed-frame filtering: fixed=%q skipUntil=%d", decoder.fixedMode, decoder.skipUntil)
+	}
+}
+
+func TestStreamDecoderModeChangeClearsBufferedAudio(t *testing.T) {
+	decoder, err := NewStreamDecoder(8_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder.pending = make([]int16, 4096)
+	decoder.idleFreq = make([]float64, 4096)
+	if err := decoder.SetMode("pd120"); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoder.pending) != 0 || len(decoder.idleFreq) != 0 {
+		t.Fatalf("mode change retained old audio: pending=%d idleFreq=%d", len(decoder.pending), len(decoder.idleFreq))
+	}
+	decoder.pending = make([]int16, 1024)
+	if err := decoder.SetMode(""); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoder.pending) != 0 {
+		t.Fatalf("returning to Auto retained old PCM: %d samples", len(decoder.pending))
 	}
 }
 
@@ -375,6 +768,7 @@ func TestStreamDecoderReceivesShortFrameAfterLongIdle(t *testing.T) {
 	for start := 0; start < len(encoded); start += 1024 {
 		end := min(start+1024, len(encoded))
 		batch, feedErr := decoder.Feed(context.Background(), encoded[start:end])
+		decoder.DrainUpdates()
 		if feedErr != nil {
 			t.Fatal(feedErr)
 		}
@@ -427,6 +821,7 @@ func TestStreamDecoderKeepsExtendedAndNarrowVISHeadersAcrossChunks(t *testing.T)
 				if _, err := decoder.Feed(context.Background(), samples[start:end]); err != nil {
 					t.Fatal(err)
 				}
+				decoder.DrainUpdates()
 			}
 			got, active := decoder.ActiveMode()
 			if !active || got.ID != tt.mode {
@@ -521,7 +916,9 @@ func TestStreamDecoderEmitsProgressiveImagesBeforeFrameCompletion(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
-			var updates []StreamUpdate
+			var updateCount int
+			var lastRows int
+			var midpoint *StreamUpdate
 			var final []StreamEvent
 			for start := 0; start < len(encoded); start += 4096 {
 				end := min(start+4096, len(encoded))
@@ -529,35 +926,82 @@ func TestStreamDecoderEmitsProgressiveImagesBeforeFrameCompletion(t *testing.T) 
 				if feedErr != nil {
 					t.Fatal(feedErr)
 				}
-				updates = append(updates, decoder.DrainUpdates()...)
+				for _, update := range decoder.DrainUpdates() {
+					updateCount++
+					if update.Image != nil {
+						t.Fatal("Feed decoded preview pixels synchronously; preview work must stay off the audio path")
+					}
+					if len(update.Frequency) == 0 || update.SampleRate != rate {
+						t.Fatalf("preview request is missing an immutable frequency snapshot: %+v", update)
+					}
+					if update.Rows <= lastRows || update.Rows >= update.TotalRows {
+						t.Fatalf("progressive row count did not advance monotonically: previous=%d update=%d/%d", lastRows, update.Rows, update.TotalRows)
+					}
+					if update.Rows-lastRows > max(8, update.TotalRows/30) {
+						t.Fatalf("progressive update gap too large: previous=%d update=%d/%d", lastRows, update.Rows, update.TotalRows)
+					}
+					lastRows = update.Rows
+					if midpoint == nil && update.Rows >= update.TotalRows/2 {
+						copyOfUpdate := update
+						midpoint = &copyOfUpdate
+					}
+				}
 				final = append(final, events...)
 			}
-			if len(updates) < 2 {
-				t.Fatalf("got %d progressive updates, want multiple updates before frame completion", len(updates))
+			if updateCount < 20 {
+				t.Fatalf("got %d progressive updates, want at least 20 before frame completion", updateCount)
 			}
 			if len(final) != 1 {
 				t.Fatalf("got %d final frames, want one", len(final))
 			}
-			lastRows := 0
-			for _, update := range updates {
-				if update.Rows <= lastRows || update.Rows >= update.TotalRows {
-					t.Fatalf("progressive row count did not advance monotonically: previous=%d update=%d/%d", lastRows, update.Rows, update.TotalRows)
-				}
-				lastRows = update.Rows
+			if midpoint == nil {
+				t.Fatal("no progressive update reached half the image height")
 			}
-			// Rows comfortably above the progress boundary must closely match the
-			// eventual final raster, proving these are decoded pixels. The preview
-			// uses nominal timing (no sync recovery), so a few channels of drift
-			// are acceptable.
-			preview := updates[len(updates)/2]
-			checkRow := max(0, preview.Rows-3)
+			previewImage, decodeErr := midpoint.Decode(context.Background())
+			if decodeErr != nil {
+				t.Fatalf("decode progressive preview: %v", decodeErr)
+			}
+			checkRow := max(0, midpoint.Rows-3)
 			for _, x := range []int{16, 80, 160, 240, 304} {
-				got, want := preview.Image.NRGBAAt(x, checkRow), final[0].Image.NRGBAAt(x, checkRow)
+				got, want := previewImage.NRGBAAt(x, checkRow), final[0].Image.NRGBAAt(x, checkRow)
 				if absCh(got.R, want.R) > 8 || absCh(got.G, want.G) > 8 || absCh(got.B, want.B) > 8 {
 					t.Fatalf("progressive pixel (%d,%d)=%v differs from final %v", x, checkRow, got, want)
 				}
 			}
 		})
+	}
+}
+
+func TestVISDetectionWithLowLevelAndBroadbandNoise(t *testing.T) {
+	const rate = 48_000
+	g, err := NewToneGenerator(rate, 0.18)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteVIS(g, 8); err != nil {
+		t.Fatal(err)
+	}
+	samples := append(make([]int16, 257), g.Samples()...)
+	samples = append(samples, make([]int16, rate)...)
+	state := uint32(0xA5C31E27)
+	for i := range samples {
+		state = state*1664525 + 1013904223
+		noise := int32((state>>16)&0x1fff) - 4096 // about +/- 0.125 full scale
+		value := int32(samples[i]) + noise
+		if value > 32767 {
+			value = 32767
+		}
+		if value < -32768 {
+			value = -32768
+		}
+		samples[i] = int16(value)
+	}
+	spec, vis, _, err := DetectModeHeader(samples, rate)
+	if err != nil {
+		t.Fatalf("noisy VIS detection failed: %v", err)
+	}
+	if spec.ID != Robot36ID || vis != 8 {
+		t.Fatalf("detected %s / VIS %d, want Robot 36 / VIS 8", spec.ID, vis)
 	}
 }
 

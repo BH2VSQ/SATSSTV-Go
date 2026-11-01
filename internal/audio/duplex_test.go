@@ -87,6 +87,77 @@ func (f *fakePTT) States() []bool {
 	return append([]bool(nil), f.states...)
 }
 
+type fakeVOXPTT struct{ fakePTT }
+
+func (*fakeVOXPTT) RequiresPTTLeadTime() bool { return false }
+
+func TestVOXDoesNotWaitForHardwarePTTLead(t *testing.T) {
+	capture := newFakeCapture()
+	playback := newFakePlayback()
+	vox := &fakeVOXPTT{}
+	duplex, err := NewFullDuplex(capture, playback, vox, 48_000, TxTiming{PTTLead: 300 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer duplex.Close()
+	done := make(chan error, 1)
+	started := time.Now()
+	go func() { done <- duplex.Transmit(context.Background(), []float32{0.1}) }()
+	select {
+	case <-playback.started:
+		if elapsed := time.Since(started); elapsed > 120*time.Millisecond {
+			t.Fatalf("VOX playback started after %s; the 300 ms hardware lead should be skipped", elapsed)
+		}
+	case <-time.After(120 * time.Millisecond):
+		t.Fatal("VOX playback did not start promptly")
+	}
+	close(playback.finish)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("VOX transmission did not finish")
+	}
+}
+
+func TestHardwarePTTStillHonorsConfiguredLead(t *testing.T) {
+	capture := newFakeCapture()
+	playback := newFakePlayback()
+	radio := &fakePTT{}
+	duplex, err := NewFullDuplex(capture, playback, radio, 48_000, TxTiming{PTTLead: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer duplex.Close()
+	started := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- duplex.Transmit(context.Background(), []float32{0.1}) }()
+	select {
+	case <-playback.started:
+		t.Fatal("hardware PTT playback began before its configured lead interval")
+	case <-time.After(40 * time.Millisecond):
+	}
+	select {
+	case <-playback.started:
+		if elapsed := time.Since(started); elapsed < 80*time.Millisecond {
+			t.Fatalf("hardware PTT playback began after %s, expected ~100 ms lead", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("hardware PTT playback did not start after lead interval")
+	}
+	close(playback.finish)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("hardware PTT transmission did not finish")
+	}
+}
+
 func TestReceiveContinuesDuringTransmit(t *testing.T) {
 	capture := newFakeCapture()
 	playback := newFakePlayback()
@@ -271,5 +342,38 @@ func TestTransmitWatchdogReleasesPTT(t *testing.T) {
 	states := radio.States()
 	if len(states) != 2 || !states[0] || states[1] {
 		t.Fatalf("PTT states = %v, want [true false]", states)
+	}
+}
+
+func TestEnqueueCaptureBlockReplacesStaleBacklogWithBoundary(t *testing.T) {
+	queue := make(chan []float32, 2)
+	queue <- []float32{1}
+	queue <- []float32{2}
+	if dropped := enqueueCaptureBlock(queue, []float32{3}); dropped != 2 {
+		t.Fatalf("discarded %d blocks, want 2", dropped)
+	}
+	marker := <-queue
+	if marker != nil {
+		t.Fatalf("first queued item = %v, want discontinuity marker", marker)
+	}
+	latest := <-queue
+	if len(latest) != 1 || latest[0] != 3 {
+		t.Fatalf("latest block = %v, want [3]", latest)
+	}
+}
+
+func TestEnqueueCaptureBlockPreservesSamplesWithoutOverflow(t *testing.T) {
+	queue := make(chan []float32, 2)
+	if dropped := enqueueCaptureBlock(queue, []float32{1}); dropped != 0 {
+		t.Fatalf("discarded %d blocks without overflow, want 0", dropped)
+	}
+	if dropped := enqueueCaptureBlock(queue, []float32{2}); dropped != 0 {
+		t.Fatalf("discarded %d blocks below capacity, want 0", dropped)
+	}
+	for want := float32(1); want <= 2; want++ {
+		got := <-queue
+		if len(got) != 1 || got[0] != want {
+			t.Fatalf("queued block = %v, want [%v]", got, want)
+		}
 	}
 }

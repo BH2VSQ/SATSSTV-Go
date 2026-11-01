@@ -35,22 +35,24 @@ let activeSlot = 0;
 let autoSelected = true;
 let rxEnabled = true;
 let toneActive = false;
-let peakSpectrum = [];
 let txSlots = [];
 let activeTXSlot = 0;
-let selectedImagePath = '';
-let sourceImage = null;
+let imageLibraryEntries = [];
 let components = [];
 let selectedComponent = 0;
 let albumEntries = [];
 let pointerDrag = null;
 let templateSlots = defaultTemplateSlots.map(t => ({ ...t, objects: t.objects.map(o => ({ ...o })) }));
 let selectedTemplateSlot = 0;
+let persistentTXBackground = null;
+let txBackgroundSaveTimer = null;
+let txBackgroundPersistChain = Promise.resolve();
+let txBackgroundPersistVersion = 0;
 const templateImageCache = new Map();
 let contextTarget = null;
 let stationSettings = { myCall: '', locator: '' };
 let audioState = { connected: false, rxActive: false, txActive: false, sampleRate: 48000, pttMode: 'vox' };
-let waterfallHistory = [];
+let waterfallHistory = []; // retained for compatibility with older UI state; rendering uses a circular offscreen buffer
 let captureTelemetrySeen = false;
 let latestRXImageData = '';
 const MAX_WATERFALL_ROWS = 64;
@@ -239,6 +241,7 @@ function renderTXModeSlots() {
   });
   $('txModeInfo').textContent = activeTXMode()?.name || niceMode(txSlots[activeTXSlot]);
   $('encode').disabled = !activeTXMode()?.ready;
+  updateFontSizeLimits();
 }
 function openTXModeMenu(x, y, slotIndex) {
   contextTarget = { type: 'txmode', slotIndex };
@@ -275,25 +278,45 @@ function componentOutline(component) {
   const normalized = withOutlineDefaults(component || {});
   return { enabled: normalized.outlineEnabled, width: normalized.outlineWidth, color: normalized.outlineColor };
 }
-function drawCover(ctx, img, width, height) {
-  const scale = Math.max(width / img.width, height / img.height);
-  const sw = width / scale, sh = height / scale;
-  ctx.drawImage(img, (img.width - sw) / 2, (img.height - sh) / 2, sw, sh, 0, 0, width, height);
+function drawBackgroundImage(ctx, img, component, width, height) {
+  const zoom = Math.max(100, Math.min(400, Number(component.width) || 100)) / 100;
+  const scale = Math.max(width / img.naturalWidth, height / img.naturalHeight) * zoom;
+  const drawWidth = img.naturalWidth * scale;
+  const drawHeight = img.naturalHeight * scale;
+  const x = (width - drawWidth) / 2 + (Number(component.x) || 0) / 100 * width;
+  const y = (height - drawHeight) / 2 + (Number(component.y) || 0) / 100 * height;
+  ctx.drawImage(img, x, y, drawWidth, drawHeight);
+}
+function imageAspectRatio(c) {
+  if (c?.type === 'last_rx' && latestRXImageData) {
+    const img = getTemplateImage(c);
+    if (img?.complete && img.naturalWidth && img.naturalHeight) return img.naturalWidth / img.naturalHeight;
+  } else if (c?.imageData) {
+    const img = getTemplateImage(c);
+    if (img?.complete && img.naturalWidth && img.naturalHeight) return img.naturalWidth / img.naturalHeight;
+  }
+  return 4 / 3;
 }
 function componentBounds(ctx, c, width, height) {
+  if (isBackgroundComponent(c)) return { x: 0, y: 0, width, height, image: true, background: true };
   const x = (Number(c.x) || 0) / 100 * width;
   const y = (Number(c.y) || 0) / 100 * height;
   if (isImageComponent(c)) {
-    return { x, y, width: (Number(c.width) || 40) / 100 * width, height: (Number(c.height) || 40) / 100 * height, image: true };
+    const imageWidth = Math.max(1, (Number(c.width) || 42) / 100 * width);
+    const aspect = Math.max(0.05, imageAspectRatio(c));
+    return { x, y, width: imageWidth, height: imageWidth / aspect, image: true };
   }
+  const maxFontSize = maxFontSizeForMode();
+  const fontSize = Math.max(6, Math.min(maxFontSize, Number(c.fontSize) || 18));
   const text = resolveTokens(c.text || '');
   const lines = text.split('\n');
-  ctx.font = `${c.bold ? '700' : '400'} ${c.fontSize || 18}px "Segoe UI", "Microsoft YaHei", sans-serif`;
-  const lineHeight = (c.fontSize || 18) * 1.2;
+  ctx.font = `${c.bold ? '700' : '400'} ${fontSize}px "Segoe UI", "Microsoft YaHei", sans-serif`;
+  const lineHeight = fontSize * 1.2;
   const maxWidth = Math.max(1, ...lines.map((line) => ctx.measureText(line).width));
-  return { text, x, y, width: maxWidth, height: lineHeight * lines.length, lines, lineHeight, image: false };
+  return { text, x, y, width: maxWidth, height: lineHeight * lines.length, lines, lineHeight, fontSize, image: false };
 }
-function isImageComponent(c) { return c?.type === 'image' || c?.type === 'last_rx'; }
+function isBackgroundComponent(c) { return c?.type === 'background'; }
+function isImageComponent(c) { return c?.type === 'image' || c?.type === 'last_rx' || isBackgroundComponent(c); }
 function getTemplateImage(c) {
   const dataURL = c?.type === 'last_rx' ? latestRXImageData : c?.imageData;
   if (!dataURL) return null;
@@ -301,9 +324,30 @@ function getTemplateImage(c) {
   if (image) return image;
   image = new Image();
   image.onload = () => renderCanvas();
+  image.onerror = () => {
+    templateImageCache.delete(dataURL);
+    setStatus(`无法载入模板图片：${c?.imageName || '图像'}`, true);
+  };
   image.src = dataURL;
   templateImageCache.set(dataURL, image);
   return image;
+}
+function maxFontSizeForMode(mode = activeTXMode()) {
+  const dimension = Math.max(24, Math.min(Number(mode?.width) || 320, Number(mode?.height) || 240));
+  return Math.max(12, Math.min(160, Math.floor(dimension * 0.32)));
+}
+function updateFontSizeLimits() {
+  const limit = maxFontSizeForMode();
+  $('fontSize').max = String(limit);
+  $('fontSize').title = `当前 TX 模式字号上限：${limit}px`;
+  components.forEach(c => {
+    if (c.type === 'text' && Number(c.fontSize) > limit) c.fontSize = limit;
+  });
+  const selected = components[selectedComponent];
+  if (selected?.type === 'text') {
+    $('fontSize').value = String(Math.min(limit, Math.max(6, Number(selected.fontSize) || 18)));
+    $('fontSizeValue').textContent = `${$('fontSize').value} / ${limit} px`;
+  }
 }
 function drawLastRXPlaceholder(ctx, bounds) {
   ctx.save();
@@ -328,23 +372,30 @@ function renderToCanvas(canvas, selectionOutline = false) {
   const width = Math.max(160, mode?.width || 320), height = Math.max(120, mode?.height || 240);
   canvas.width = width; canvas.height = height;
   const ctx = canvas.getContext('2d');
-  if (sourceImage && sourceImage.complete && sourceImage.naturalWidth) drawCover(ctx, sourceImage, width, height);
-  else {
+  const background = components.find(isBackgroundComponent);
+  const backgroundImage = background ? getTemplateImage(background) : null;
+  if (backgroundImage?.complete && backgroundImage.naturalWidth) {
+    drawBackgroundImage(ctx, backgroundImage, background, width, height);
+  } else {
     const grad = ctx.createLinearGradient(0, 0, width, height);
     grad.addColorStop(0, '#24394d'); grad.addColorStop(1, '#111b29');
     ctx.fillStyle = grad; ctx.fillRect(0, 0, width, height);
     ctx.fillStyle = 'rgba(255,255,255,.07)'; ctx.beginPath(); ctx.arc(width * .8, height * .25, height * .28, 0, Math.PI * 2); ctx.fill();
   }
   components.forEach((c, idx) => {
+    if (isBackgroundComponent(c)) {
+      if (selectionOutline && idx === selectedComponent) {
+        ctx.save(); ctx.strokeStyle = '#5bcefa'; ctx.lineWidth = Math.max(1, width / 320);
+        ctx.setLineDash([4, 3]); ctx.strokeRect(1, 1, width - 2, height - 2); ctx.restore();
+      }
+      return;
+    }
     const b = componentBounds(ctx, c, width, height);
     const outline = componentOutline(c);
     if (isImageComponent(c)) {
       const img = getTemplateImage(c);
       if (img?.complete && img.naturalWidth) {
-        const scale = Math.min(b.width / img.naturalWidth, b.height / img.naturalHeight);
-        const drawWidth = img.naturalWidth * scale;
-        const drawHeight = img.naturalHeight * scale;
-        ctx.drawImage(img, b.x + (b.width - drawWidth) / 2, b.y + (b.height - drawHeight) / 2, drawWidth, drawHeight);
+        ctx.drawImage(img, b.x, b.y, b.width, b.height);
       } else if (c.type === 'last_rx') {
         drawLastRXPlaceholder(ctx, b);
       }
@@ -357,7 +408,7 @@ function renderToCanvas(canvas, selectionOutline = false) {
         ctx.restore();
       }
     } else {
-      ctx.font = `${c.bold ? '700' : '400'} ${c.fontSize || 18}px "Segoe UI", "Microsoft YaHei", sans-serif`;
+      ctx.font = `${c.bold ? '700' : '400'} ${b.fontSize}px "Segoe UI", "Microsoft YaHei", sans-serif`;
       ctx.textBaseline = 'top'; ctx.textAlign = 'left'; ctx.fillStyle = c.color || '#ffffff';
       if (outline.enabled) {
         ctx.save();
@@ -374,11 +425,14 @@ function renderToCanvas(canvas, selectionOutline = false) {
       ctx.setLineDash([4, 3]); ctx.strokeRect(b.x - 2, b.y - 2, b.width + 4, b.height + 4); ctx.restore();
     }
   });
-  if (!sourceImage && components.length === 0) {
+  if (!background && components.length === 0) {
     ctx.save(); ctx.font = `600 ${Math.max(7, width * .025)}px "Segoe UI", sans-serif`;
     ctx.fillStyle = 'rgba(255,255,255,.34)'; ctx.textAlign = 'right'; ctx.fillText('SATSSTV-GO', width * .97, height * .04); ctx.restore();
   }
-  if (canvas === $('txCanvas')) $('canvasDimensions').textContent = `${width} × ${height}`;
+  if (canvas === $('txCanvas')) {
+    $('canvasDimensions').textContent = `${width} × ${height}`;
+    $('imageName').textContent = background ? `底图：${background.imageName || '图库图片'}（可拖动 / 缩放）` : '纯色背景';
+  }
 }
 function renderCanvas() { renderToCanvas($('txCanvas'), true); }
 function exportCanvasDataURL() { const canvas = document.createElement('canvas'); renderToCanvas(canvas, false); return canvas.toDataURL('image/png'); }
@@ -388,11 +442,11 @@ function renderComponentList() {
   components.forEach((c, i) => {
     const row = document.createElement('button'); row.className = `component-item${selectedComponent === i ? ' selected' : ''}`;
     const sample = document.createElement('span'); sample.className = 'component-sample';
-    sample.textContent = isImageComponent(c) ? (c.type === 'last_rx' ? 'RX' : 'IMG') : (c.text || '').replace(/\{[A-Z]+\}/g, '…').slice(0, 1) || 'T';
+    sample.textContent = isBackgroundComponent(c) ? 'BG' : (isImageComponent(c) ? (c.type === 'last_rx' ? 'RX' : 'IMG') : (c.text || '').replace(/\{[A-Z]+\}/g, '…').slice(0, 1) || 'T');
     sample.style.color = c.color || '#5b8ba0';
     const name = document.createElement('span'); name.className = 'component-name';
-    name.textContent = isImageComponent(c) ? (c.type === 'last_rx' ? '上一次 RX 图像' : (c.imageName || '模板图像')) : (c.text || '').replace(/\s+/g, ' ').slice(0, 28) || `文字 ${i + 1}`;
-    const meta = document.createElement('small'); meta.textContent = isImageComponent(c) ? `${Math.round(c.width)}×${Math.round(c.height)}%` : `${c.fontSize}px`;
+    name.textContent = isBackgroundComponent(c) ? `底图 · ${c.imageName || '图库图片'}` : (isImageComponent(c) ? (c.type === 'last_rx' ? '上一次 RX 图像' : (c.imageName || '模板图像')) : (c.text || '').replace(/\s+/g, ' ').slice(0, 28) || `文字 ${i + 1}`);
+    const meta = document.createElement('small'); meta.textContent = isImageComponent(c) ? `${Math.round(c.width || 42)}%` : `${c.fontSize}px`;
     row.append(sample, name, meta); row.addEventListener('click', () => selectComponent(i)); host.appendChild(row);
   });
   $('componentProperties').classList.toggle('disabled-properties', components.length === 0);
@@ -406,27 +460,37 @@ function selectComponent(index) {
 function updateComponentProperties() {
   const c = components[selectedComponent];
   const isImage = isImageComponent(c);
+  const isBackground = isBackgroundComponent(c);
   ['componentText', 'fontSize', 'fontColor', 'fontBold'].forEach(id => { $(id).disabled = !c || isImage; });
   ['posX', 'posY', 'deleteText'].forEach(id => { $(id).disabled = !c; });
-  ['imageWidth', 'imageHeight'].forEach(id => { $(id).disabled = !isImage; });
+  $('imageWidth').disabled = !isImage;
   $('imageProperties').hidden = !isImage;
   $('componentText').parentElement.hidden = !c || isImage;
   $('fontBold').parentElement.hidden = !c || isImage;
-  $('outlineProperties').hidden = !c;
-  ['outlineEnabled', 'outlineWidth', 'outlineColor'].forEach(id => { $(id).disabled = !c; });
+  $('outlineProperties').hidden = !c || isBackground;
+  ['outlineEnabled', 'outlineWidth', 'outlineColor'].forEach(id => { $(id).disabled = !c || isBackground; });
+  $('imageWidth').parentElement.firstChild.textContent = isBackground ? '底图缩放 ' : '图像缩放（保持原比例） ';
+  $('posX').parentElement.firstChild.textContent = isBackground ? '水平偏移 ' : '水平位置 ';
+  $('posY').parentElement.firstChild.textContent = isBackground ? '垂直偏移 ' : '垂直位置 ';
+  $('posX').min = isBackground ? '-150' : '0'; $('posX').max = isBackground ? '150' : '100';
+  $('posY').min = isBackground ? '-150' : '0'; $('posY').max = isBackground ? '150' : '100';
   if (!c) return;
   const outline = componentOutline(c);
   $('outlineEnabled').checked = outline.enabled;
   $('outlineWidth').value = String(outline.width);
   $('outlineWidthValue').textContent = `${outline.width.toFixed(1)} px`;
   $('outlineColor').value = outline.color;
-  $('posX').value = c.x; $('xValue').textContent = `${Math.round(c.x)}%`;
-  $('posY').value = c.y; $('yValue').textContent = `${Math.round(c.y)}%`;
+  $('posX').value = c.x || 0; $('xValue').textContent = `${Math.round(c.x || 0)}%`;
+  $('posY').value = c.y || 0; $('yValue').textContent = `${Math.round(c.y || 0)}%`;
   if (isImage) {
-    $('imageWidth').value = c.width; $('imageWidthValue').textContent = `${Math.round(c.width)}%`;
-    $('imageHeight').value = c.height; $('imageHeightValue').textContent = `${Math.round(c.height)}%`;
+    $('imageWidth').min = isBackground ? '100' : '5';
+    $('imageWidth').max = isBackground ? '400' : '100';
+    $('imageWidth').value = String(Math.max(Number($('imageWidth').min), Math.min(Number($('imageWidth').max), Number(c.width) || (isBackground ? 100 : 42))));
+    $('imageWidthValue').textContent = `${Math.round(Number($('imageWidth').value))}%`;
   } else {
-    $('componentText').value = c.text; $('fontSize').value = c.fontSize; $('fontSizeValue').textContent = `${c.fontSize} px`;
+    $('componentText').value = c.text || '';
+    $('fontSize').value = Math.min(maxFontSizeForMode(), c.fontSize || 18);
+    $('fontSizeValue').textContent = `${$('fontSize').value} / ${maxFontSizeForMode()} px`;
     $('fontColor').value = c.color || '#ffffff'; $('fontBold').checked = !!c.bold;
   }
 }
@@ -434,46 +498,149 @@ function updateSelectedComponent() {
   const c = components[selectedComponent]; if (!c) return;
   c.x = Number($('posX').value); c.y = Number($('posY').value);
   if (isImageComponent(c)) {
-    c.width = Number($('imageWidth').value); c.height = Number($('imageHeight').value);
-    c.x = Math.min(c.x, Math.max(0, 100 - c.width));
-    c.y = Math.min(c.y, Math.max(0, 100 - c.height));
+    c.width = Number($('imageWidth').value);
+    if (isBackgroundComponent(c)) {
+      c.width = Math.max(100, Math.min(400, c.width));
+      c.x = Math.max(-150, Math.min(150, c.x)); c.y = Math.max(-150, Math.min(150, c.y));
+    } else {
+      const b = componentBounds($('txCanvas').getContext('2d'), c, $('txCanvas').width, $('txCanvas').height);
+      c.x = Math.max(0, Math.min(Math.max(0, 100 - b.width / $('txCanvas').width * 100), c.x));
+      c.y = Math.max(0, Math.min(Math.max(0, 100 - b.height / $('txCanvas').height * 100), c.y));
+    }
     $('posX').value = c.x; $('posY').value = c.y;
-    $('imageWidthValue').textContent = `${c.width}%`; $('imageHeightValue').textContent = `${c.height}%`;
+    $('imageWidthValue').textContent = `${Math.round(c.width)}%`;
   } else {
-    c.text = $('componentText').value; c.fontSize = Number($('fontSize').value); c.color = $('fontColor').value; c.bold = $('fontBold').checked;
-    $('fontSizeValue').textContent = `${c.fontSize} px`;
+    c.text = $('componentText').value; c.fontSize = Math.min(maxFontSizeForMode(), Number($('fontSize').value)); c.color = $('fontColor').value; c.bold = $('fontBold').checked;
+    $('fontSizeValue').textContent = `${c.fontSize} / ${maxFontSizeForMode()} px`;
   }
   c.outlineEnabled = $('outlineEnabled').checked;
   c.outlineWidth = Number($('outlineWidth').value);
   c.outlineColor = $('outlineColor').value;
   $('outlineWidthValue').textContent = `${c.outlineWidth.toFixed(1)} px`;
-  $('xValue').textContent = `${c.x}%`; $('yValue').textContent = `${c.y}%`;
+  $('xValue').textContent = `${Math.round(c.x)}%`; $('yValue').textContent = `${Math.round(c.y)}%`;
   renderComponentList(); renderCanvas();
+  if (isBackgroundComponent(c)) scheduleTXBackgroundPersist();
 }
 function addTextComponent() {
-  components.push(withOutlineDefaults({ type: 'text', text: '自定义文字', x: 8, y: 15 + (components.length * 8 % 65), fontSize: 18, color: '#ffffff', bold: true }));
+  components.push(withOutlineDefaults({ type: 'text', text: '自定义文字', x: 8, y: 15 + (components.length * 8 % 65), fontSize: Math.min(18, maxFontSizeForMode()), color: '#ffffff', bold: true }));
   selectComponent(components.length - 1);
 }
 async function addImageComponent(dataURL, imageName = '模板图像') {
   if (!dataURL) return;
   const image = new Image();
   image.onload = () => {
-    components.push(withOutlineDefaults({ type: 'image', imageData: dataURL, imageName, x: 8, y: 18, width: 42, height: 42 }));
+    components.push(withOutlineDefaults({ type: 'image', imageData: dataURL, imageName, x: 8, y: 18, width: 42 }));
     templateImageCache.set(dataURL, image);
     selectComponent(components.length - 1);
   };
   image.onerror = () => setStatus('无法载入模板图像', true);
   image.src = dataURL;
 }
-async function chooseTemplateImage() {
+function setBackgroundImage(dataURL, imageName = '图库图片') {
+  if (!dataURL) return;
+  const image = new Image();
+  image.onload = () => {
+    templateImageCache.set(dataURL, image);
+    const current = components.findIndex(isBackgroundComponent);
+    const background = withOutlineDefaults({ type: 'background', imageData: dataURL, imageName, x: 0, y: 0, width: 100 });
+    if (current >= 0) {
+      const previous = components[current];
+      background.x = previous.x || 0; background.y = previous.y || 0; background.width = previous.width || 100;
+      components[current] = background;
+      selectedComponent = current;
+    } else {
+      components.unshift(background);
+      selectedComponent = 0;
+    }
+    persistentTXBackground = { ...background };
+    renderComponentList(); renderCanvas();
+    void persistTXBackgroundNow();
+    setStatus(`已设置模板底图：${imageName}`);
+  };
+  image.onerror = () => setStatus('无法载入底图', true);
+  image.src = dataURL;
+}
+async function openImageLibrary() {
+  $('imageLibraryDialog').showModal();
+  await refreshImageLibrary();
+}
+async function refreshImageLibrary() {
+  const grid = $('imageLibraryGrid');
+  grid.innerHTML = '<div class="image-library-empty">正在读取图库…</div>';
   try {
-    const path = await app().SelectImage(); if (!path) return;
-    const url = await app().LoadImagePreview(path);
-    await addImageComponent(url, path.split(/[\\/]/).pop());
-  } catch (e) { setStatus(`添加模板图像失败：${String(e)}`, true); }
+    imageLibraryEntries = await app().ListImageLibrary();
+    grid.innerHTML = '';
+    if (!imageLibraryEntries.length) {
+      grid.innerHTML = '<div class="image-library-empty">图库为空。点击右上角“导入图片”添加本机图片。</div>';
+      return;
+    }
+    imageLibraryEntries.forEach(entry => {
+      const card = document.createElement('article'); card.className = 'image-library-card';
+      const preview = document.createElement('img'); preview.src = entry.thumbnail; preview.alt = entry.name;
+      const details = document.createElement('div'); details.className = 'image-library-details';
+      const title = document.createElement('b'); title.textContent = entry.name;
+      const meta = document.createElement('small'); meta.textContent = `${entry.width} × ${entry.height} · ${(entry.size / 1024).toFixed(1)} KB`;
+      details.append(title, meta);
+      const actions = document.createElement('div'); actions.className = 'image-library-actions';
+      const backgroundButton = document.createElement('button'); backgroundButton.className = 'small-btn'; backgroundButton.textContent = '设为底图';
+      backgroundButton.addEventListener('click', async () => {
+        try { const dataURL = await app().LoadImageLibraryImage(entry.id); setBackgroundImage(dataURL, entry.name); $('imageLibraryDialog').close(); }
+        catch (e) { setStatus(`载入底图失败：${String(e)}`, true); }
+      });
+      const componentButton = document.createElement('button'); componentButton.className = 'small-btn'; componentButton.textContent = '添加图层';
+      componentButton.addEventListener('click', async () => {
+        try { const dataURL = await app().LoadImageLibraryImage(entry.id); await addImageComponent(dataURL, entry.name); $('imageLibraryDialog').close(); }
+        catch (e) { setStatus(`添加图像失败：${String(e)}`, true); }
+      });
+      actions.append(backgroundButton, componentButton);
+      card.append(preview, details, actions); grid.appendChild(card);
+    });
+  } catch (e) {
+    grid.innerHTML = `<div class="image-library-empty">图库读取失败：${String(e)}</div>`;
+  }
+}
+async function importImageToLibrary() {
+  const button = $('importLibraryImage'); button.disabled = true;
+  try {
+    const entry = await app().ImportImageToLibrary();
+    setStatus(`已导入图库：${entry.name}`);
+    await refreshImageLibrary();
+  } catch (e) {
+    if (!String(e).includes('取消') && !String(e).includes('cancel')) setStatus(`导入图库失败：${String(e)}`, true);
+  } finally { button.disabled = false; }
+}
+async function clearBackground() {
+  if (txBackgroundSaveTimer !== null) {
+    clearTimeout(txBackgroundSaveTimer);
+    txBackgroundSaveTimer = null;
+  }
+  const index = components.findIndex(isBackgroundComponent);
+  if (index >= 0) {
+    components.splice(index, 1);
+    selectedComponent = Math.max(0, Math.min(selectedComponent > index ? selectedComponent - 1 : selectedComponent, components.length - 1));
+  }
+  persistentTXBackground = null;
+  txBackgroundPersistVersion++;
+  // A deliberate clear must also remove legacy per-slot copies; otherwise
+  // startup migration would restore an old template background next launch.
+  const withoutBackgrounds = templateSlots.map((slot) => ({
+    ...slot,
+    objects: (slot.objects || []).filter((object) => !isBackgroundComponent(object)),
+  }));
+  renderComponentList(); renderCanvas();
+  try {
+    // Remove per-slot copies first; only then clear the global setting. If the
+    // slot write fails, the previous persistent background remains recoverable.
+    templateSlots = await app().SaveTemplateSlots(withoutBackgrounds);
+    await queueTXBackgroundPersist(null);
+    renderTemplates();
+    setStatus('已清除共享底图');
+  } catch (e) {
+    setStatus(`清除共享底图失败：${String(e)}`, true);
+  }
 }
 function addLatestRXImage() {
-  components.push(withOutlineDefaults({ type: 'last_rx', imageName: '上一次 RX 图像', x: 8, y: 18, width: 42, height: 42 }));
+  components.push(withOutlineDefaults({ type: 'last_rx', imageName: '上一次 RX 图像', x: 8, y: 18, width: 42 }));
   selectComponent(components.length - 1);
   setStatus(latestRXImageData ? '已添加上一次 RX 图像组件' : '已添加上一次 RX 图像占位组件，收到首张图像后会自动填入');
 }
@@ -494,13 +661,53 @@ function deleteSelectedComponent() {
 }
 
 function templateData(template) { return (template.objects || []).map((o) => withOutlineDefaults(o)); }
+function copyBackground(background) { return background ? withOutlineDefaults({ ...background }) : null; }
+function queueTXBackgroundPersist(background) {
+  const snapshot = copyBackground(background);
+  txBackgroundPersistChain = txBackgroundPersistChain.catch(() => {}).then(() =>
+    snapshot ? app().SaveTXBackground(snapshot) : app().ClearTXBackground()
+  );
+  return txBackgroundPersistChain;
+}
+async function persistTXBackgroundNow() {
+  if (txBackgroundSaveTimer !== null) {
+    clearTimeout(txBackgroundSaveTimer);
+    txBackgroundSaveTimer = null;
+  }
+  const background = components.find(isBackgroundComponent) || persistentTXBackground;
+  persistentTXBackground = copyBackground(background);
+  const version = ++txBackgroundPersistVersion;
+  try {
+    await queueTXBackgroundPersist(persistentTXBackground);
+    if (version === txBackgroundPersistVersion) setStatus('共享底图已保存');
+  } catch (e) {
+    if (version === txBackgroundPersistVersion) setStatus(`保存共享底图失败：${String(e)}`, true);
+  }
+}
+function scheduleTXBackgroundPersist() {
+  if (txBackgroundSaveTimer !== null) clearTimeout(txBackgroundSaveTimer);
+  txBackgroundSaveTimer = setTimeout(() => { void persistTXBackgroundNow(); }, 250);
+}
 function loadTemplateAt(index) {
   selectedTemplateSlot = Math.max(0, Math.min(3, index));
   const template = templateSlots[selectedTemplateSlot];
-  components = templateData(template); selectedComponent = 0;
+  const slotObjects = templateData(template);
+  const slotBackground = slotObjects.find(isBackgroundComponent) || null;
+  const currentBackground = components.find(isBackgroundComponent) || null;
+  const sharedBackground = copyBackground(persistentTXBackground || currentBackground || slotBackground);
+  components = slotObjects.filter((object) => !isBackgroundComponent(object));
+  if (sharedBackground) {
+    components.unshift(sharedBackground);
+    if (!persistentTXBackground) {
+      persistentTXBackground = copyBackground(sharedBackground);
+      void persistTXBackgroundNow();
+    }
+  }
+  selectedComponent = 0;
+  updateFontSizeLimits();
   $('templateName').value = template.name || '';
   renderTemplates(); renderComponentList(); renderCanvas();
-  setStatus(`已载入模板槽位 ${selectedTemplateSlot + 1}：${template.name || '空白模板'}`);
+  setStatus(`已载入模板槽位 ${selectedTemplateSlot + 1}：${template.name || '空白模板'}${sharedBackground ? '（保留共享底图）' : ''}`);
 }
 function renderTemplates() {
   const host = $('templatePresets'); host.innerHTML = '';
@@ -532,17 +739,39 @@ async function loadTemplateSlots() {
   try { templateSlots = await app().GetTemplateSlots(); }
   catch (e) { templateSlots = defaultTemplateSlots.map(t => ({ ...t, objects: t.objects.map(o => ({ ...o })) })); setStatus(`读取模板失败，使用内置模板：${String(e)}`, true); }
   if (!Array.isArray(templateSlots) || templateSlots.length !== 4) templateSlots = defaultTemplateSlots.map(t => ({ ...t, objects: t.objects.map(o => ({ ...o })) }));
+  try {
+    persistentTXBackground = copyBackground(await app().GetTXBackground());
+  } catch (e) {
+    persistentTXBackground = null;
+    setStatus(`读取共享底图失败：${String(e)}`, true);
+  }
+  // Migrate backgrounds saved inside legacy template slots to the new global
+  // setting. Pick the first saved one so old projects keep their last artwork.
+  if (!persistentTXBackground) {
+    for (const slot of templateSlots) {
+      const legacy = (slot.objects || []).find(isBackgroundComponent);
+      if (legacy) {
+        persistentTXBackground = copyBackground(legacy);
+        try { await queueTXBackgroundPersist(persistentTXBackground); }
+        catch (e) { setStatus(`迁移旧模板底图失败：${String(e)}`, true); }
+        break;
+      }
+    }
+  }
   loadTemplateAt(0);
   await refreshLatestRXImage();
 }
 
 function findComponentAt(x, y) {
-  const c = $('txCanvas'), ctx = c.getContext('2d');
+  const canvas = $('txCanvas'), ctx = canvas.getContext('2d');
+  // Foreground layers always take hit priority over the full-canvas background.
   for (let i = components.length - 1; i >= 0; i--) {
-    const b = componentBounds(ctx, components[i], c.width, c.height);
+    if (isBackgroundComponent(components[i])) continue;
+    const b = componentBounds(ctx, components[i], canvas.width, canvas.height);
     if (x >= b.x - 10 && x <= b.x + b.width + 10 && y >= b.y - 10 && y <= b.y + b.height + 10) return i;
   }
-  return -1;
+  const backgroundIndex = components.findIndex(isBackgroundComponent);
+  return backgroundIndex;
 }
 function canvasPoint(event) {
   const canvas = $('txCanvas'), rect = canvas.getBoundingClientRect();
@@ -552,88 +781,102 @@ function setupCanvasDrag() {
   const canvas = $('txCanvas');
   canvas.addEventListener('pointerdown', (e) => {
     const p = canvasPoint(e), index = findComponentAt(p.x, p.y); if (index < 0) return;
-    selectComponent(index); pointerDrag = { index, offsetX: p.x - components[index].x / 100 * canvas.width, offsetY: p.y - components[index].y / 100 * canvas.height };
+    selectComponent(index);
+    const c = components[index];
+    pointerDrag = isBackgroundComponent(c)
+      ? { index, startX: p.x, startY: p.y, originX: Number(c.x) || 0, originY: Number(c.y) || 0, background: true }
+      : { index, offsetX: p.x - c.x / 100 * canvas.width, offsetY: p.y - c.y / 100 * canvas.height, background: false };
     canvas.setPointerCapture(e.pointerId); e.preventDefault();
   });
   canvas.addEventListener('pointermove', (e) => {
-    if (!pointerDrag) return; const p = canvasPoint(e), c = components[pointerDrag.index];
-    const maxX = isImageComponent(c) ? Math.max(0, 100 - Number(c.width || 40)) : 100;
-    const maxY = isImageComponent(c) ? Math.max(0, 100 - Number(c.height || 40)) : 100;
-    c.x = Math.max(0, Math.min(maxX, (p.x - pointerDrag.offsetX) / canvas.width * 100));
-    c.y = Math.max(0, Math.min(maxY, (p.y - pointerDrag.offsetY) / canvas.height * 100));
+    if (!pointerDrag) return;
+    const p = canvasPoint(e), c = components[pointerDrag.index];
+    if (pointerDrag.background) {
+      c.x = Math.max(-150, Math.min(150, pointerDrag.originX + (p.x - pointerDrag.startX) / canvas.width * 100));
+      c.y = Math.max(-150, Math.min(150, pointerDrag.originY + (p.y - pointerDrag.startY) / canvas.height * 100));
+    } else {
+      const b = componentBounds(canvas.getContext('2d'), c, canvas.width, canvas.height);
+      const maxX = Math.max(0, 100 - b.width / canvas.width * 100);
+      const maxY = Math.max(0, 100 - b.height / canvas.height * 100);
+      c.x = Math.max(0, Math.min(maxX, (p.x - pointerDrag.offsetX) / canvas.width * 100));
+      c.y = Math.max(0, Math.min(maxY, (p.y - pointerDrag.offsetY) / canvas.height * 100));
+    }
     updateComponentProperties(); renderComponentList(); renderCanvas();
+    if (pointerDrag.background) scheduleTXBackgroundPersist();
   });
-  const end = () => { pointerDrag = null; };
+  const end = () => {
+    const wasBackground = pointerDrag?.background;
+    pointerDrag = null;
+    if (wasBackground) void persistTXBackgroundNow();
+  };
   canvas.addEventListener('pointerup', end); canvas.addEventListener('pointercancel', end);
 }
 
-let waterfallImageData = null;
 let waterfallOff = null;
+let waterfallNextRow = 0;
+let waterfallRowImage = null;
 let currentInputDBFS = -120;
-
-function spectrumColorRGB(value) {
-  const level = Math.max(0, Math.min(1, (Number(value) - 0.10) / 0.72));
-  const stops = [
-    [0.00, [5, 10, 22]],
-    [0.28, [12, 43, 78]],
-    [0.52, [0, 132, 160]],
-    [0.76, [238, 181, 48]],
-    [1.00, [255, 255, 238]],
-  ];
-
-  const position = Math.pow(level, 0.78);
-  let upper = 1;
-  while (upper < stops.length - 1 && position > stops[upper][0]) upper++;
-
-  const [lowAt, low] = stops[upper - 1];
-  const [highAt, high] = stops[upper];
-  const t = Math.max(0, Math.min(1, (position - lowAt) / (highAt - lowAt)));
-
-  return low.map((channel, index) =>
-    Math.round(channel + (high[index] - channel) * t)
-  );
+function resetWaterfall() {
+  waterfallOff = null;
+  waterfallRowImage = null;
+  waterfallNextRow = 0;
+  waterfallHistory = [];
 }
-
-function spectrumColor(value) {
-  const [red, green, blue] = spectrumColorRGB(value);
-  return `rgb(${red},${green},${blue})`;
+function appendWaterfallRow(values) {
+  if (!Array.isArray(values) || !values.length) return;
+  const bins = values.length;
+  if (!waterfallOff || waterfallOff.width !== bins) {
+    waterfallOff = document.createElement('canvas');
+    waterfallOff.width = bins; waterfallOff.height = MAX_WATERFALL_ROWS;
+    const offCtx = waterfallOff.getContext('2d');
+    offCtx.fillStyle = 'rgb(5,10,22)'; offCtx.fillRect(0, 0, bins, MAX_WATERFALL_ROWS);
+    waterfallRowImage = offCtx.createImageData(bins, 1);
+    waterfallNextRow = 0;
+  }
+  const data = waterfallRowImage.data;
+  for (let i = 0; i < bins; i++) {
+    const value = Math.max(0, Math.min(1, (Number(values[i]) - 0.08) / 0.76));
+    const position = Math.pow(value, 0.78);
+    let gray;
+    if (position <= 0.28) gray = 5 + (12 - 5) * (position / 0.28);
+    else if (position <= 0.52) gray = 12 + (0 - 12) * ((position - 0.28) / 0.24);
+    else if (position <= 0.76) gray = 0 + (238 - 0) * ((position - 0.52) / 0.24);
+    else gray = 238 + (255 - 238) * ((position - 0.76) / 0.24);
+    const p = i * 4; data[p] = gray; data[p + 1] = gray; data[p + 2] = gray; data[p + 3] = 255;
+  }
+  waterfallOff.getContext('2d').putImageData(waterfallRowImage, 0, waterfallNextRow);
+  waterfallNextRow = (waterfallNextRow + 1) % MAX_WATERFALL_ROWS;
 }
 function drawWaterfall(ctx, w, waterfallY, waterfallH, xOffset = 0) {
-  const rows = waterfallHistory.slice(-MAX_WATERFALL_ROWS);
-  if (!rows.length) return;
-  const bins = rows[0].length;
-  const rowCount = MAX_WATERFALL_ROWS;
-  if (!waterfallOff || waterfallOff.width !== bins || waterfallOff.height !== rowCount) {
-    waterfallOff = document.createElement('canvas');
-    waterfallOff.width = bins;
-    waterfallOff.height = rowCount;
-    waterfallImageData = waterfallOff.getContext('2d').createImageData(bins, rowCount);
-  }
-  const data = waterfallImageData.data;
-  const emptyRows = rowCount - rows.length;
-  // Clear the (still empty) leading rows so a partial waterfall never leaves
-  // stale pixels after an RX restart.
-  for (let r = 0; r < emptyRows; r++) {
-    const base = r * bins * 4;
-    for (let b = 0; b < bins; b++) {
-      const p = base + b * 4;
-      data[p] = 5; data[p + 1] = 10; data[p + 2] = 22; data[p + 3] = 255;
-    }
-  }
-  for (let r = 0; r < rows.length; r++) {
-    const row = rows[r];
-    const base = (emptyRows + r) * bins * 4;
-    for (let b = 0; b < bins; b++) {
-      const [gray] = spectrumColorRGB(row[b]);
-      const p = base + b * 4;
-      data[p] = gray; data[p + 1] = gray; data[p + 2] = gray; data[p + 3] = 255;
-    }
-  }
-  waterfallOff.getContext('2d').putImageData(waterfallImageData, 0, 0);
-  const prevSmoothing = ctx.imageSmoothingEnabled;
+  if (!waterfallOff || w <= 0 || waterfallH <= 0) return;
+
+  // The circular buffer is stored as rows. Once it wraps, the oldest row is
+  // waterfallNextRow, so stitch [nextRow..end] followed by [0..nextRow].
+  // IMPORTANT: drawImage source coordinates are (sx, sy, sw, sh). The row
+  // pointer belongs in sy, never sx; using it as sx made the image drift left
+  // as the ring advanced and exposed duplicated/cropped-looking bands.
+  const splitRow = Math.max(0, Math.min(MAX_WATERFALL_ROWS,
+    Math.trunc(waterfallNextRow)));
+  const olderRows = MAX_WATERFALL_ROWS - splitRow;
+  const splitHeight = waterfallH * olderRows / MAX_WATERFALL_ROWS;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(xOffset, waterfallY, w, waterfallH);
+  ctx.clip();
   ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(waterfallOff, 0, 0, bins, rowCount, xOffset, waterfallY, w, waterfallH);
-  ctx.imageSmoothingEnabled = prevSmoothing;
+
+  if (olderRows > 0) {
+    ctx.drawImage(waterfallOff,
+      0, splitRow, waterfallOff.width, olderRows,
+      xOffset, waterfallY, w, splitHeight);
+  }
+  if (splitRow > 0) {
+    ctx.drawImage(waterfallOff,
+      0, 0, waterfallOff.width, splitRow,
+      xOffset, waterfallY + splitHeight, w, waterfallH - splitHeight);
+  }
+  ctx.restore();
 }
 function drawIdleSpectrum() {
   const canvas = $('spectrum'), ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
@@ -689,7 +932,7 @@ function drawIdleSpectrum() {
   ctx.textBaseline = 'top';
   ctx.textAlign = 'center';
   markers.forEach(marker => {
-    const x = plotX + (marker.frequency - 900) / 1900 * plotW;
+    const x = plotX + (marker.frequency - 700) / 2000 * plotW;
     ctx.strokeStyle = 'rgba(255,238,65,.9)';
     ctx.lineWidth = 1.2;
     ctx.beginPath(); ctx.moveTo(x, 18); ctx.lineTo(x, plotH); ctx.stroke();
@@ -709,10 +952,7 @@ function renderLiveSpectrum(values) {
   const canvas = $('spectrum'), ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
   if (!Array.isArray(values) || !values.length) { drawIdleSpectrum(); return; }
   const normalized = values.map(v => Math.max(0, Math.min(1, Number(v) || 0)));
-  waterfallHistory.push(normalized);
-  if (waterfallHistory.length > MAX_WATERFALL_ROWS) waterfallHistory.shift();
-  if (peakSpectrum.length !== normalized.length) peakSpectrum = normalized.slice();
-  else peakSpectrum = normalized.map((value, index) => Math.max(value, peakSpectrum[index] * 0.965));
+  appendWaterfallRow(normalized);
 
   drawIdleSpectrum();
   const plotX = 44;
@@ -722,16 +962,13 @@ function renderLiveSpectrum(values) {
     plotX + index * plotW / Math.max(1, spectrum.length - 1),
     plotH - 9 - value * (plotH - 34),
   ]);
-  const peaks = pointsFor(peakSpectrum);
-  ctx.beginPath(); ctx.moveTo(peaks[0][0], peaks[0][1]);
-  for (let i = 1; i < peaks.length; i++) ctx.lineTo(peaks[i][0], peaks[i][1]);
-  ctx.lineWidth = 1.3; ctx.strokeStyle = '#ffe64a'; ctx.stroke();
-
   const points = pointsFor(normalized);
   ctx.beginPath(); ctx.moveTo(points[0][0], points[0][1]);
   for (let i = 1; i < points.length; i++) ctx.lineTo(points[i][0], points[i][1]);
-  ctx.lineWidth = 2.2; ctx.strokeStyle = '#063cff';
-  ctx.shadowColor = '#063cff'; ctx.shadowBlur = 1.5; ctx.stroke(); ctx.shadowBlur = 0;
+  // MMSSTV's default FQC graph is a single live trace. A second peak-hold
+  // envelope made this view look like two superimposed spectrum layers.
+  ctx.lineWidth = 1.8; ctx.strokeStyle = '#063cff';
+  ctx.shadowColor = '#063cff'; ctx.shadowBlur = 0.8; ctx.stroke(); ctx.shadowBlur = 0;
 }
 
 function updateAudioState(state) {
@@ -739,8 +976,7 @@ function updateAudioState(state) {
   audioState = { ...audioState, ...(state || {}) };
   if (audioState.rxActive && !wasRXActive) {
     captureTelemetrySeen = false;
-    waterfallHistory = [];
-    peakSpectrum = [];
+    resetWaterfall();
     drawIdleSpectrum();
   }
   if (!audioState.rxActive) captureTelemetrySeen = false;
@@ -768,6 +1004,11 @@ function updateAudioState(state) {
 function bindRuntimeEvents() {
   if (!window.runtime?.EventsOn) return;
   window.runtime.EventsOn('audio:state', updateAudioState);
+  window.runtime.EventsOn('audio:warning', (message) => {
+    const warning = String(message || '音频设备提示');
+    $('rxHint').textContent = warning;
+    setStatus(warning);
+  });
   window.runtime.EventsOn('audio:telemetry', (data) => {
     captureTelemetrySeen = true;
     const peakHz = Number(data?.peakHz || 0);
@@ -995,22 +1236,13 @@ async function saveAllSettings() {
   } finally { button.disabled = false; }
 }
 
-async function chooseImage() {
-  try {
-    const path = await app().SelectImage(); if (!path) return;
-    const url = await app().LoadImagePreview(path);
-    const img = new Image();
-    img.onload = () => { sourceImage = img; selectedImagePath = path; $('imageName').textContent = path.split(/[\\/]/).pop(); renderCanvas(); setStatus('背景图片已载入'); };
-    img.onerror = () => setStatus('无法载入所选图片', true); img.src = url;
-  } catch (e) { setStatus(`载入图片失败：${String(e)}`, true); }
-}
-function clearBackground() { sourceImage = null; selectedImagePath = ''; $('imageName').textContent = '纯色背景，尚未载入图片'; renderCanvas(); }
+
 async function encodeWAV() {
   const mode = activeTXMode(); if (!mode || !mode.ready) return setStatus('当前 TX 模式尚无可用编码器', true);
   const button = $('encode'); button.disabled = true; setStatus('正在合成画面并编码 WAV…');
   try {
     const dataURL = exportCanvasDataURL();
-    const name = selectedImagePath ? selectedImagePath.split(/[\\/]/).pop() : 'SATSSTV-Go';
+    const background = components.find(isBackgroundComponent); const name = background?.imageName || 'SATSSTV-Go';
     const path = await app().EncodeImageData(dataURL, name, mode.id, Number($('rate').value));
     $('txStatus').textContent = 'WAV 已生成';
     let albumNote = '';
@@ -1129,18 +1361,19 @@ async function initializeAudioRX() {
 
 
 // UI events. RX starts automatically on application launch and remains active.
-$('chooseImage').addEventListener('click', chooseImage);
 $('clearBackground').addEventListener('click', clearBackground);
+$('addImage').addEventListener('click', openImageLibrary);
+$('closeImageLibrary').addEventListener('click', () => $('imageLibraryDialog').close());
+$('importLibraryImage').addEventListener('click', importImageToLibrary);
 $('encode').addEventListener('click', encodeWAV);
 $('txToggle').addEventListener('click', toggleTX);
 $('toneToggle').addEventListener('click', toggleTone);
 $('addText').addEventListener('click', addTextComponent);
-$('addImage').addEventListener('click', chooseTemplateImage);
 $('addLastRX').addEventListener('click', addLatestRXImage);
 $('deleteText').addEventListener('click', deleteSelectedComponent);
 $('saveTemplate').addEventListener('click', saveCurrentTemplate);
 $('componentText').addEventListener('input', updateSelectedComponent);
-['fontSize', 'fontColor', 'posX', 'posY', 'fontBold', 'imageWidth', 'imageHeight', 'outlineEnabled', 'outlineWidth', 'outlineColor'].forEach(id => $(id).addEventListener('input', updateSelectedComponent));
+['fontSize', 'fontColor', 'posX', 'posY', 'fontBold', 'imageWidth', 'outlineEnabled', 'outlineWidth', 'outlineColor'].forEach(id => $(id).addEventListener('input', updateSelectedComponent));
 VALUE_IDS.forEach(id => $(id).addEventListener('input', () => {
   if (id === 'myCall' || id === 'locator') syncStationSettingsForm();
   renderCanvas();

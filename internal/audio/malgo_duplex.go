@@ -169,7 +169,10 @@ func (m *MalgoDuplex) StartCapture(ctx context.Context, onSamples func([]float32
 		defer freeMalgoDeviceID(deviceID)
 	}
 
-	queue := make(chan []float32, 256)
+	// Keep native-side latency bounded. The application worker has a separate
+	// short queue and explicit discontinuity handling; a 64-block native queue
+	// could hide seconds of backlog before the receiver noticed an overrun.
+	queue := make(chan []float32, 8)
 	workerCtx, cancel := context.WithCancel(context.Background())
 	dev, err := malgo.InitDevice(m.ctx.Context, cfg, malgo.DeviceCallbacks{Data: func(_, input []byte, _ uint32) {
 		defer func() {
@@ -184,13 +187,13 @@ func (m *MalgoDuplex) StartCapture(ctx context.Context, onSamples func([]float32
 		for i := range block {
 			block[i] = math.Float32frombits(binary.LittleEndian.Uint32(input[i*4 : i*4+4]))
 		}
-		select {
-		case queue <- block:
-		case <-workerCtx.Done():
-		default:
-			// Never replace old samples with new ones: that would corrupt the
-			// SSTV timing. Count the exceptional overflow for visible diagnostics.
-			m.droppedBlocks.Add(1)
+		if workerCtx.Err() != nil {
+			return
+		}
+		if discarded := enqueueCaptureBlock(queue, block); discarded > 0 {
+			// An ordered nil marker tells the downstream worker to reset its
+			// decoder state before consuming fresh audio.
+			m.droppedBlocks.Add(discarded)
 		}
 	}})
 	if err != nil {
@@ -222,9 +225,8 @@ func (m *MalgoDuplex) StartCapture(ctx context.Context, onSamples func([]float32
 			case <-workerCtx.Done():
 				return
 			case block := <-queue:
-				if len(block) != 0 {
-					onSamples(block)
-				}
+				// Nil marks a discontinuity and must reach the application layer.
+				onSamples(block)
 			}
 		}
 	}()
@@ -272,6 +274,50 @@ func (m *MalgoDuplex) StopCapture() error {
 // Playback is independent of the capture device, enabling software full-duplex.
 func (m *MalgoDuplex) Play(ctx context.Context, samples []float32, sampleRate int) error {
 	return m.PlayWithProgress(ctx, samples, sampleRate, nil)
+}
+
+// PreparePlayback initializes and starts the shared output endpoint ahead of
+// TX. Between transmissions the native callback emits silence, so the first
+// waveform does not pay device-open/start latency after PTT has been asserted.
+func (m *MalgoDuplex) PreparePlayback() error {
+	if m == nil {
+		return errors.New("audio engine is closed")
+	}
+	m.ctxMu.RLock()
+	defer m.ctxMu.RUnlock()
+	if m.ctx == nil || m.closed.Load() {
+		return errors.New("audio engine is closed")
+	}
+	m.playbackLifeMu.Lock()
+	defer m.playbackLifeMu.Unlock()
+	m.playbackMu.Lock()
+	if m.playbackJob != nil {
+		m.playbackMu.Unlock()
+		return ErrTransmitBusy
+	}
+	if m.playback == nil {
+		dev, err := m.newPlaybackDeviceLocked()
+		if err != nil {
+			m.playbackMu.Unlock()
+			return err
+		}
+		m.playback = dev
+	}
+	dev := m.playback
+	m.playbackMu.Unlock()
+	if dev.IsStarted() {
+		return nil
+	}
+	if err := dev.Start(); err != nil {
+		m.playbackMu.Lock()
+		if m.playback == dev && m.playbackJob == nil {
+			m.playback = nil
+		}
+		m.playbackMu.Unlock()
+		dev.Uninit()
+		return fmt.Errorf("start prepared playback device: %w", err)
+	}
+	return nil
 }
 
 // PlayWithProgress plays an SSTV waveform and polls the native callback's
@@ -471,8 +517,8 @@ func (m *MalgoDuplex) StopPlayback() error {
 	return stopErr
 }
 
-// DroppedCaptureBlocks reports exceptional input blocks that could not be
-// queued. The receiver never discards older queued samples to make room.
+// DroppedCaptureBlocks reports input blocks discarded when the bounded native
+// capture queue overflowed. A discontinuity marker is forwarded to RX.
 func (m *MalgoDuplex) DroppedCaptureBlocks() uint64 {
 	if m == nil {
 		return 0

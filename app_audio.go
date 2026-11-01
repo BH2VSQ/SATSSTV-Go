@@ -266,6 +266,15 @@ func (a *App) connectAudio() error {
 	if err != nil {
 		return fmt.Errorf("连接音频设备失败：%w", err)
 	}
+	// Prepare the shared output endpoint while the user is connecting audio,
+	// not after they press TX. The device emits silence while idle, avoiding the
+	// first-transmission initialization delay. RX remains usable if the output
+	// device cannot be prepared; TX will report the concrete error on demand.
+	if playbackPrimer, ok := session.(interface{ PreparePlayback() error }); ok {
+		if primeErr := playbackPrimer.PreparePlayback(); primeErr != nil && a.ctx != nil {
+			runtime.EventsEmit(a.ctx, "audio:warning", "TX 输出设备预热失败，首次发射时将重新初始化："+primeErr.Error())
+		}
+	}
 	a.audioMu.Lock()
 	if a.audioSession != nil {
 		a.audioMu.Unlock()
@@ -319,12 +328,23 @@ func (a *App) emitAudioState() {
 }
 
 func (a *App) setRXMode(modeID string) error {
-	a.rxDecoderMu.Lock()
-	defer a.rxDecoderMu.Unlock()
-	if a.rxDecoder == nil {
-		return nil
+	modeID = strings.TrimSpace(modeID)
+	if modeID != "" {
+		spec, err := sstv.LookupMode(modeID)
+		if err != nil {
+			return err
+		}
+		if !spec.CodecReady {
+			return fmt.Errorf("%s 解码器尚未实现", spec.Name)
+		}
+		modeID = spec.ID
 	}
-	return a.rxDecoder.SetMode(modeID)
+	// Applying a mode while Feed is decoding a long frame used to block the
+	// Wails call until the full DSP pass ended. Publish the request atomically;
+	// the RX worker applies it at the next block boundary under rxDecoderMu.
+	requested := modeID
+	a.rxModeRequest.Store(&requested)
+	return nil
 }
 
 func (a *App) startRX(modeID string) error {
@@ -354,12 +374,12 @@ func (a *App) startRX(modeID string) error {
 		baseCtx = context.Background()
 	}
 	rxCtx, cancel := context.WithCancel(baseCtx)
-	// Keep several seconds of ordered audio queued. SSTV decoding is timing
-	// sensitive: dropping an old block creates a discontinuity in the VIS,
-	// line-sync and pixel clocks. The display may lag briefly, but audio must
-	// never be silently replaced by newer samples.
-	queue := make(chan []float32, 256)
-	var dropped atomic.Uint64
+	// Keep the end-to-end backlog below a few capture periods. SSTV timing is
+	// sensitive, but multi-second buffering is worse: it makes RX appear frozen
+	// and eventually overflows the native queue. If this short queue fills, the
+	// sender inserts an explicit discontinuity marker and keeps the newest data.
+	queue := make(chan []float32, 8)
+	a.rxQueueDrops.Store(0)
 
 	a.rxDecoderMu.Lock()
 	a.rxDecoder = decoder
@@ -377,14 +397,12 @@ func (a *App) startRX(modeID string) error {
 	a.audioMu.Unlock()
 
 	if err := session.StartReceive(rxCtx, func(block []float32) {
-		// The runtime callback is already off the native device callback thread.
-		// Preserve order; if the oversized safety queue ever fills, report the
-		// loss rather than silently pretending this is a valid SSTV stream.
-		select {
-		case queue <- block:
-		case <-rxCtx.Done():
-		default:
-			dropped.Add(1)
+		// Do not block the capture worker behind DSP/UI work. Bound latency and
+		// explicitly reset the decoder if an exceptional overload loses samples.
+		if rxCtx.Err() == nil {
+			if dropped := enqueueRXBlock(queue, block); dropped > 0 {
+				a.rxQueueDrops.Add(dropped)
+			}
 		}
 	}); err != nil {
 		cancel()
@@ -401,9 +419,40 @@ func (a *App) startRX(modeID string) error {
 		_ = a.stopRX()
 		return err
 	}
-	go a.runRXWorker(rxCtx, queue, decoder, fskidDecoder, cfg.SampleRate, &dropped, session)
+	a.rxModeRequest.Store(&modeID)
+	go a.runRXWorker(rxCtx, queue, decoder, fskidDecoder, cfg.SampleRate, session, modeID)
 	a.emitAudioState()
 	return nil
+}
+
+// enqueueRXBlock is the application-side low-latency queue policy. When full,
+// all stale blocks are discarded, then a nil discontinuity marker and the
+// newest block are queued in order. This prevents back-pressure from filling
+// the native miniaudio queue while making any sample loss visible to RX.
+func enqueueRXBlock(queue chan []float32, block []float32) uint64 {
+	select {
+	case queue <- block:
+		return 0
+	default:
+	}
+	var discarded uint64
+	for {
+		select {
+		case stale := <-queue:
+			if stale != nil {
+				discarded++
+			}
+		default:
+			if discarded == 0 {
+				discarded = 1
+			}
+			queue <- nil
+			if block != nil {
+				queue <- block
+			}
+			return discarded
+		}
+	}
 }
 
 func (a *App) stopRX() error {
@@ -432,77 +481,119 @@ type captureDiagnostics interface {
 	CaptureError() string
 }
 
-func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *sstv.StreamDecoder, fskidDecoder *sstv.FSKIDDecoder, sampleRate int, dropped *atomic.Uint64, session appAudioRuntime) {
-	lastTelemetry := time.Time{}
+type rxTelemetryBlock struct {
+	Samples         []float32
+	ReceivedSamples uint64
+	DroppedBlocks   uint64
+	Discontinuity   bool
+}
+
+func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *sstv.StreamDecoder, fskidDecoder *sstv.FSKIDDecoder, sampleRate int, session appAudioRuntime, initialMode string) {
 	var receivedSamples uint64
 	lastProgress := time.Time{}
-	lastCaptureError := ""
-	spectrumWindow := make([]float32, 0, spectrumFFTSize)
+	telemetryQueue := make(chan rxTelemetryBlock, 8)
+	previewQueue := make(chan sstv.StreamUpdate, 1) // latest preview wins; never back-pressure DSP
+	frameQueue := make(chan sstv.StreamEvent, 2)
+	var latestPreviewSequence atomic.Uint64
+	var completedPreviewFrame atomic.Uint64
+	go a.runRXTelemetryWorker(ctx, telemetryQueue, sampleRate, session)
+	go a.runRXPreviewWorker(ctx, previewQueue, &latestPreviewSequence, &completedPreviewFrame)
+	go a.runRXFrameWorker(ctx, frameQueue)
+	activeMode := initialMode
+	var recentPCM []int16
+	recentLimit := max(sampleRate/2, 1) // retain 500 ms so an FSKID preamble at frame end is not clipped
+	fskidArmed := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case block := <-queue:
+			if block == nil {
+				// The capture backend discarded a stale queue backlog. Treat this
+				// as a hard stream boundary: do not decode a raster or FSKID symbol
+				// sequence across missing samples.
+				decoder.Reset()
+				latestPreviewSequence.Add(1) // invalidate any preview already decoding
+				fskidDecoder.Reset()
+				recentPCM = nil
+				fskidArmed = false
+				enqueueRXTelemetry(telemetryQueue, rxTelemetryBlock{Discontinuity: true})
+				lastProgress = time.Time{}
+				if a.ctx != nil {
+					runtime.EventsEmit(a.ctx, "rx:progress", map[string]any{"active": false, "percent": 0})
+					runtime.EventsEmit(a.ctx, "rx:error", "音频处理发生积压，已丢弃过期音频并重置解码器，正在等待下一次 SSTV 信号")
+				}
+				continue
+			}
 			if len(block) == 0 {
 				continue
 			}
 			receivedSamples += uint64(len(block))
 			pcm := audio.Float32ToPCM16(block)
-			spectrumWindow = append(spectrumWindow, block...)
-			if len(spectrumWindow) > spectrumFFTSize {
-				spectrumWindow = append(spectrumWindow[:0], spectrumWindow[len(spectrumWindow)-spectrumFFTSize:]...)
+			recentPCM = append(recentPCM, pcm...)
+			if len(recentPCM) > recentLimit {
+				trim := len(recentPCM) - recentLimit
+				copy(recentPCM, recentPCM[trim:])
+				recentPCM = recentPCM[:recentLimit]
 			}
-			// Keep a rolling window of raw captured samples for diagnostics.
-			a.dumpMu.Lock()
-			a.dumpBuf = append(a.dumpBuf, block...)
-			if len(a.dumpBuf) > sampleRate*10 {
-				a.dumpBuf = append([]float32(nil), a.dumpBuf[len(a.dumpBuf)-sampleRate*10:]...)
+			var droppedBlocks uint64
+			if diagnostics, ok := session.(captureDiagnostics); ok {
+				droppedBlocks = diagnostics.DroppedCaptureBlocks()
 			}
-			a.dumpMu.Unlock()
-			if time.Since(lastTelemetry) >= 80*time.Millisecond {
-				level := rmsDBFS(block)
-				spectrum := makeSpectrum(spectrumWindow, sampleRate)
-				peakHz, crest := spectrumPeak(spectrum)
-				droppedBlocks := dropped.Load()
-				if diagnostics, ok := session.(captureDiagnostics); ok {
-					droppedBlocks += diagnostics.DroppedCaptureBlocks()
-					if captureErr := diagnostics.CaptureError(); captureErr != "" && captureErr != lastCaptureError {
-						lastCaptureError = captureErr
-						if a.ctx != nil {
-							runtime.EventsEmit(a.ctx, "rx:error", "音频采集回调异常："+captureErr)
-						}
-					}
-				}
-				if a.ctx != nil {
-					runtime.EventsEmit(a.ctx, "audio:telemetry", map[string]any{"dbfs": level, "spectrum": spectrum, "peakHz": peakHz, "crest": crest, "droppedBlocks": droppedBlocks, "samplesReceived": receivedSamples, "blockSamples": len(block)})
-				}
-				lastTelemetry = time.Now()
-			}
-			// setRXMode and stopRX may update or clear the stream decoder while
-			// capture is active. Keep the decoder state serialized with those
-			// control operations; capture callbacks themselves never take this lock.
-			// FSKID is a separate station-identification stream appended after the
-			// analog picture. Decode it in parallel with the raster receiver.
-			for _, identity := range fskidDecoder.Feed(pcm) {
-				if a.ctx != nil {
-					runtime.EventsEmit(a.ctx, "rx:callsign", map[string]any{"callsign": identity.Callsign, "source": "MMSSTV FSKID"})
-				}
-			}
+			telemetry := rxTelemetryBlock{Samples: block, ReceivedSamples: receivedSamples, DroppedBlocks: droppedBlocks}
+			// Spectrum is visualization-only and must never hold SSTV decoding.
+			enqueueRXTelemetry(telemetryQueue, telemetry)
+			a.appendCaptureDump(block, sampleRate*10)
+
+			// FSKID is transmitted after the analog picture. Scanning every live
+			// SSTV pixel as a possible FSKID preamble used to run two 300 ms
+			// Goertzel windows at 1 ms offsets, creating large CPU spikes on long
+			// 1500/1900 Hz image tones. Arm it only after a complete picture and
+			// seed it with the retained tail so the first 300 ms preamble is intact.
 			a.rxDecoderMu.Lock()
+			if requested := a.rxModeRequest.Load(); requested != nil && *requested != activeMode {
+				if modeErr := decoder.SetMode(*requested); modeErr != nil {
+					a.rxDecoderMu.Unlock()
+					if a.ctx != nil {
+						runtime.EventsEmit(a.ctx, "rx:error", "切换 RX 模式失败："+modeErr.Error())
+					}
+					continue
+				}
+				activeMode = *requested
+				latestPreviewSequence.Add(1) // do not paint a stale image after mode changes
+			}
 			events, err := decoder.Feed(ctx, pcm)
 			progress, progressActive := decoder.Progress()
 			progressiveUpdates := decoder.DrainUpdates()
+			_, decoderActive := decoder.ActiveMode()
 			a.rxDecoderMu.Unlock()
+
+			if decoderActive {
+				fskidDecoder.Reset()
+				fskidArmed = false
+			} else if len(events) > 0 {
+				fskidDecoder.Reset()
+				for _, identity := range fskidDecoder.Feed(recentPCM) {
+					if a.ctx != nil {
+						runtime.EventsEmit(a.ctx, "rx:callsign", map[string]any{"callsign": identity.Callsign, "source": "MMSSTV FSKID"})
+					}
+				}
+				fskidArmed = true
+			} else if fskidArmed {
+				for _, identity := range fskidDecoder.Feed(pcm) {
+					if a.ctx != nil {
+						runtime.EventsEmit(a.ctx, "rx:callsign", map[string]any{"callsign": identity.Callsign, "source": "MMSSTV FSKID"})
+					}
+					fskidArmed = false
+				}
+			}
+
+			// JPEG/base64 conversion and Wails event delivery run on a separate
+			// latest-wins worker. A slow webview can skip an obsolete preview, but
+			// it can never stall the ordered PCM decoder and overflow audio queues.
 			for _, update := range progressiveUpdates {
-				if a.ctx == nil || update.Image == nil {
-					continue
-				}
-				var preview bytes.Buffer
-				if jpeg.Encode(&preview, update.Image, &jpeg.Options{Quality: 76}) != nil {
-					continue
-				}
-				dataURL := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(preview.Bytes())
-				runtime.EventsEmit(a.ctx, "rx:preview", map[string]any{"image": dataURL, "mode": update.Mode.Name, "modeId": update.Mode.ID, "width": update.Mode.Width, "height": update.Mode.Height, "rows": update.Rows, "totalRows": update.TotalRows})
+				latestPreviewSequence.Store(update.Sequence)
+				enqueueLatestRXPreview(previewQueue, update)
 			}
 			if progressActive && a.ctx != nil && time.Since(lastProgress) >= 100*time.Millisecond {
 				runtime.EventsEmit(a.ctx, "rx:progress", map[string]any{"active": true, "mode": progress.Mode.Name, "modeId": progress.Mode.ID, "percent": progress.Percent, "rows": progress.Rows, "totalRows": progress.TotalRows, "receivedSamples": progress.Received, "totalSamples": progress.Total})
@@ -515,24 +606,161 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 				continue
 			}
 			for _, event := range events {
+				completedPreviewFrame.Store(event.FrameID)
 				if a.ctx != nil {
 					runtime.EventsEmit(a.ctx, "rx:progress", map[string]any{"active": false, "percent": 100, "mode": event.Mode.Name, "modeId": event.Mode.ID, "rows": event.Mode.Height, "totalRows": event.Mode.Height, "complete": true})
 				}
-				var buf bytes.Buffer
-				if err := png.Encode(&buf, event.Image); err != nil {
-					continue
-				}
-				dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes())
-				now := time.Now()
-				_, saveErr := a.saveAlbumImage(event.Image, "rx", event.Mode.ID, "实时接收完成")
-				payload := map[string]any{"image": dataURL, "mode": event.Mode.Name, "modeId": event.Mode.ID, "width": event.Mode.Width, "height": event.Mode.Height, "timestamp": now.Format("2006-01-02 15:04:05"), "albumSaved": saveErr == nil}
-				if saveErr != nil {
-					payload["albumError"] = saveErr.Error()
-				}
-				if a.ctx != nil {
-					runtime.EventsEmit(a.ctx, "rx:frame", payload)
+				select {
+				case frameQueue <- event:
+				case <-ctx.Done():
+					return
 				}
 			}
+		}
+	}
+}
+
+func enqueueLatestRXPreview(queue chan sstv.StreamUpdate, update sstv.StreamUpdate) {
+	select {
+	case queue <- update:
+		return
+	default:
+	}
+	select {
+	case <-queue:
+	default:
+	}
+	select {
+	case queue <- update:
+	default:
+	}
+}
+
+func (a *App) runRXPreviewWorker(ctx context.Context, queue <-chan sstv.StreamUpdate, latestSequence, completedFrame *atomic.Uint64) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case update := <-queue:
+			if a.ctx == nil || update.FrameID <= completedFrame.Load() || update.Sequence != latestSequence.Load() {
+				continue
+			}
+			img, err := update.Decode(ctx)
+			if err != nil || img == nil {
+				continue
+			}
+			var preview bytes.Buffer
+			if err := jpeg.Encode(&preview, img, &jpeg.Options{Quality: 78}); err != nil {
+				continue
+			}
+			// Do not deliver a preview that became stale while it was being
+			// reconstructed/encoded or after the complete frame arrived.
+			if update.FrameID <= completedFrame.Load() || update.Sequence != latestSequence.Load() || ctx.Err() != nil {
+				continue
+			}
+			dataURL := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(preview.Bytes())
+			runtime.EventsEmit(a.ctx, "rx:preview", map[string]any{"image": dataURL, "mode": update.Mode.Name, "modeId": update.Mode.ID, "width": update.Mode.Width, "height": update.Mode.Height, "rows": update.Rows, "totalRows": update.TotalRows})
+		}
+	}
+}
+
+func (a *App) runRXFrameWorker(ctx context.Context, queue <-chan sstv.StreamEvent) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event := <-queue:
+			if event.Image == nil {
+				continue
+			}
+			var buf bytes.Buffer
+			if err := png.Encode(&buf, event.Image); err != nil {
+				if a.ctx != nil {
+					runtime.EventsEmit(a.ctx, "rx:error", "PNG 图像编码失败："+err.Error())
+				}
+				continue
+			}
+			dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes())
+			now := time.Now()
+			_, saveErr := a.saveAlbumImage(event.Image, "rx", event.Mode.ID, "实时接收完成")
+			payload := map[string]any{"image": dataURL, "mode": event.Mode.Name, "modeId": event.Mode.ID, "width": event.Mode.Width, "height": event.Mode.Height, "timestamp": now.Format("2006-01-02 15:04:05"), "albumSaved": saveErr == nil}
+			if saveErr != nil {
+				payload["albumError"] = saveErr.Error()
+			}
+			if a.ctx != nil {
+				runtime.EventsEmit(a.ctx, "rx:frame", payload)
+			}
+		}
+	}
+}
+
+func enqueueRXTelemetry(queue chan rxTelemetryBlock, item rxTelemetryBlock) {
+	select {
+	case queue <- item:
+		return
+	default:
+	}
+	for {
+		select {
+		case <-queue:
+		default:
+			queue <- rxTelemetryBlock{Discontinuity: true}
+			if !item.Discontinuity {
+				queue <- item
+			}
+			return
+		}
+	}
+}
+
+// runRXTelemetryWorker computes UI-only spectrum data away from the ordered
+// decoder path. Intermediate telemetry blocks may be coalesced; the SSTV PCM
+// stream itself is never coalesced here.
+func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetryBlock, sampleRate int, session appAudioRuntime) {
+	lastTelemetry := time.Time{}
+	lastCaptureError := ""
+	receivedSamples := uint64(0)
+	spectrumWindow := make([]float32, 0, spectrumFFTSize)
+	windowSamples := sstv.MMSSTVSpectrumWindowSamples(sampleRate)
+	cadence := time.Duration(float64(windowSamples) / float64(max(1, sampleRate)) * float64(time.Second))
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case item := <-queue:
+			if item.Discontinuity {
+				spectrumWindow = spectrumWindow[:0]
+				lastTelemetry = time.Time{}
+				continue
+			}
+			if len(item.Samples) == 0 {
+				continue
+			}
+			receivedSamples = item.ReceivedSamples
+			spectrumWindow = append(spectrumWindow, item.Samples...)
+			if len(spectrumWindow) > windowSamples {
+				spectrumWindow = append(spectrumWindow[:0], spectrumWindow[len(spectrumWindow)-windowSamples:]...)
+			}
+			if len(spectrumWindow) < windowSamples || time.Since(lastTelemetry) < cadence {
+				continue
+			}
+			level := rmsDBFS(item.Samples)
+			spectrum := makeSpectrum(spectrumWindow, sampleRate)
+			peakHz, crest := spectrumPeak(spectrum)
+			droppedBlocks := item.DroppedBlocks + a.rxQueueDrops.Swap(0)
+			if diagnostics, ok := session.(captureDiagnostics); ok {
+				droppedBlocks = diagnostics.DroppedCaptureBlocks()
+				if captureErr := diagnostics.CaptureError(); captureErr != "" && captureErr != lastCaptureError {
+					lastCaptureError = captureErr
+					if a.ctx != nil {
+						runtime.EventsEmit(a.ctx, "rx:error", "音频采集回调异常："+captureErr)
+					}
+				}
+			}
+			if a.ctx != nil {
+				runtime.EventsEmit(a.ctx, "audio:telemetry", map[string]any{"dbfs": level, "spectrum": spectrum, "peakHz": peakHz, "crest": crest, "droppedBlocks": droppedBlocks, "samplesReceived": receivedSamples, "blockSamples": len(item.Samples)})
+			}
+			lastTelemetry = time.Now()
 		}
 	}
 }
@@ -552,66 +780,27 @@ func rmsDBFS(samples []float32) float64 {
 	return 20 * math.Log10(rms)
 }
 
-// makeSpectrum computes a Hann-windowed FFT trace over 900..2800 Hz.
-// An 8192-sample window gives 5.86 Hz raw-bin spacing at 48 kHz. 1024 display
-// bins retain the narrow tone peaks without the old 512-bin output bottleneck.
-// Magnitudes remain calibrated to the actual PCM amplitude; no display AGC.
-// spectrumScratch is a reusable FFT workspace. makeSpectrum is only ever
-// called from the single RX worker goroutine, so it is safe to share the
-// buffer across calls instead of allocating a fresh 128 KiB every telemetry
-// tick.
+// makeSpectrum uses MMSSTV's default FQC frequency-occupancy algorithm rather
+// than a magnitude FFT. At 48 kHz this uses 8192 raw samples (2048 after /4
+// decimation), a 400 Hz discriminator LPF and a 700..2700 Hz display range.
 const (
-	spectrumFFTSize = 8192
-	spectrumBins    = 1024
+	spectrumFFTSize = 8192 // maximum raw window at 48 kHz
+	spectrumBins    = 2048
+	spectrumMinHz   = 700.0
+	spectrumMaxHz   = 2700.0
 )
 
-var spectrumScratch = make([]complex128, spectrumFFTSize)
-
 func makeSpectrum(samples []float32, sampleRate int) []float64 {
-	const floorDBFS = -60.0
-	const ceilingDBFS = 0.0
 	out := make([]float64, spectrumBins)
 	if len(samples) < 16 || sampleRate <= 0 {
 		return out
 	}
-	count := min(len(samples), spectrumFFTSize)
-	start := len(samples) - count
-	window := spectrumScratch[:spectrumFFTSize]
-	var windowSum float64
-	for i := 0; i < count; i++ {
-		// Hann window: a narrow main lobe, so a clean tone shows a tall, sharp
-		// peak rather than a broad hump.
-		weight := 0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(max(1, count-1)))
-		windowSum += weight
-		window[i] = complex(float64(samples[start+i])*weight, 0)
-	}
-	clear(window[count:])
-	if windowSum <= 0 {
-		return out
-	}
-	fftInPlace(window)
-	for bin := 0; bin < spectrumBins; bin++ {
-		frequency := 900.0 + float64(bin)*(1900.0/float64(spectrumBins-1))
-		fftPosition := frequency * float64(spectrumFFTSize) / float64(sampleRate)
-		lower := int(math.Floor(fftPosition))
-		if lower < 1 || lower+1 >= spectrumFFTSize/2 {
-			continue
-		}
-		fraction := fftPosition - float64(lower)
-		lowerMagnitude := math.Hypot(real(window[lower]), imag(window[lower]))
-		upperMagnitude := math.Hypot(real(window[lower+1]), imag(window[lower+1]))
-		magnitude := lowerMagnitude + (upperMagnitude-lowerMagnitude)*fraction
-		amplitude := 2 * magnitude / windowSum
-		dbfs := 20 * math.Log10(math.Max(1e-8, amplitude))
-		out[bin] = math.Max(0, math.Min(1, (dbfs-floorDBFS)/(ceilingDBFS-floorDBFS)))
-	}
-	return out
+	return sstv.MMSSTVFrequencyHistogram(audio.Float32ToPCM16(samples), sampleRate, spectrumBins, spectrumMinHz, spectrumMaxHz)
 }
 
 // spectrumPeak reports the dominant frequency and a "peakiness" crest factor
-// (peak bin divided by the mean bin). A clean narrow-band tone has a crest well
-// above 5, while broadband noise sits near 1; this distinguishes a genuine SSTV
-// tone from a flat noise floor for diagnostics.
+// (peak frequency-occupancy bin divided by the mean bin). A clean narrow-band
+// signal has a high crest; broad/noisy audio has a lower crest.
 func spectrumPeak(spectrum []float64) (peakHz, crest float64) {
 	if len(spectrum) == 0 {
 		return 0, 0
@@ -624,56 +813,12 @@ func spectrumPeak(spectrum []float64) (peakHz, crest float64) {
 			peakIdx = i
 		}
 	}
-	// Spectrum values are a display mapping of -60..0 dBFS, not linear
-	// magnitudes. Convert them back to linear amplitude before calculating
-	// peak-to-mean crest; averaging the display values made this metric wrong.
-	linear := make([]float64, len(spectrum))
-	var linearSum float64
-	for i, value := range spectrum {
-		dbfs := -60 + math.Max(0, math.Min(1, value))*60
-		linear[i] = math.Pow(10, dbfs/20)
-		linearSum += linear[i]
-	}
-	mean := linearSum / float64(len(linear))
-	peakHz = 900.0 + float64(peakIdx)*(1900.0/float64(len(spectrum)-1))
+	mean := sum / float64(len(spectrum))
+	peakHz = spectrumMinHz + float64(peakIdx)*(spectrumMaxHz-spectrumMinHz)/float64(len(spectrum)-1)
 	if mean > 0 {
-		crest = linear[peakIdx] / mean
+		crest = spectrum[peakIdx] / mean
 	}
 	return peakHz, crest
-}
-
-func fftInPlace(values []complex128) {
-	n := len(values)
-	if n < 2 || n&(n-1) != 0 {
-		return
-	}
-	j := 0
-	for i := 1; i < n; i++ {
-		bit := n >> 1
-		for j&bit != 0 {
-			j ^= bit
-			bit >>= 1
-		}
-		j ^= bit
-		if i < j {
-			values[i], values[j] = values[j], values[i]
-		}
-	}
-	for size := 2; size <= n; size <<= 1 {
-		angle := -2 * math.Pi / float64(size)
-		step := complex(math.Cos(angle), math.Sin(angle))
-		half := size >> 1
-		for offset := 0; offset < n; offset += size {
-			factor := complex(1.0, 0.0)
-			for i := 0; i < half; i++ {
-				even := values[offset+i]
-				odd := values[offset+i+half] * factor
-				values[offset+i] = even + odd
-				values[offset+i+half] = even - odd
-				factor *= step
-			}
-		}
-	}
 }
 func (a *App) StartTX(dataURL, modeID string, sampleRate int) error {
 	img, err := decodeDataURL(dataURL)
@@ -903,6 +1048,52 @@ func (a *App) shutdown(context.Context) {
 	a.rxDecoderMu.Unlock()
 }
 
+// appendCaptureDump maintains an ordered rolling window without moving the
+// entire buffer for every new block. It is called only from the RX worker.
+func (a *App) appendCaptureDump(samples []float32, capacity int) {
+	if a == nil || len(samples) == 0 || capacity <= 0 {
+		return
+	}
+	a.dumpMu.Lock()
+	defer a.dumpMu.Unlock()
+	if len(a.dumpBuf) != capacity {
+		a.dumpBuf = make([]float32, capacity)
+		a.dumpWrite = 0
+		a.dumpCount = 0
+	}
+	if len(samples) >= capacity {
+		copy(a.dumpBuf, samples[len(samples)-capacity:])
+		a.dumpWrite = 0
+		a.dumpCount = capacity
+		return
+	}
+	first := copy(a.dumpBuf[a.dumpWrite:], samples)
+	if first < len(samples) {
+		copy(a.dumpBuf, samples[first:])
+	}
+	a.dumpWrite = (a.dumpWrite + len(samples)) % capacity
+	a.dumpCount = min(capacity, a.dumpCount+len(samples))
+}
+
+// captureDumpSnapshot returns the retained audio in chronological order.
+func (a *App) captureDumpSnapshot() []float32 {
+	if a == nil {
+		return nil
+	}
+	a.dumpMu.Lock()
+	defer a.dumpMu.Unlock()
+	if a.dumpCount == 0 || len(a.dumpBuf) == 0 {
+		return nil
+	}
+	out := make([]float32, a.dumpCount)
+	start := (a.dumpWrite - a.dumpCount + len(a.dumpBuf)) % len(a.dumpBuf)
+	first := copy(out, a.dumpBuf[start:])
+	if first < len(out) {
+		copy(out[first:], a.dumpBuf[:len(out)-first])
+	}
+	return out
+}
+
 // SaveCapturedAudio writes the last few seconds of raw captured audio to a WAV
 // file in the settings directory. It is a diagnostic helper: the exported file
 // shows exactly what the capture device produced, so capture/level/sample-rate
@@ -914,9 +1105,7 @@ func (a *App) SaveCapturedAudio() (string, error) {
 	if rate <= 0 {
 		rate = 48_000
 	}
-	a.dumpMu.Lock()
-	buf := append([]float32(nil), a.dumpBuf...)
-	a.dumpMu.Unlock()
+	buf := a.captureDumpSnapshot()
 	if len(buf) < rate/10 {
 		return "", fmt.Errorf("采集缓冲不足（仅 %d 采样）", len(buf))
 	}

@@ -104,6 +104,15 @@ func NewFSKIDDecoder(sampleRate int) (*FSKIDDecoder, error) {
 	return &FSKIDDecoder{rate: sampleRate}, nil
 }
 
+// Reset discards an incomplete station-ID candidate after an input stream gap.
+func (d *FSKIDDecoder) Reset() {
+	if d == nil {
+		return
+	}
+	d.pending = nil
+	d.scanFrom = 0
+}
+
 // Feed returns newly validated identities. The one-millisecond search step is
 // important: FSKID may begin at any sample offset, and a coarse ten-millisecond
 // search can misalign the single start bit and every following data symbol.

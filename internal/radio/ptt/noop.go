@@ -19,4 +19,8 @@ func NewNoopController(mode Mode) (*NoopController, error) {
 }
 
 func (c *NoopController) SetPTT(_ context.Context, _ bool) error { return nil }
-func (c *NoopController) Close() error                           { return nil }
+
+// RequiresPTTLeadTime reports that VOX has no software-controlled keying line.
+// Audio should therefore begin immediately rather than waiting for PTT lead.
+func (c *NoopController) RequiresPTTLeadTime() bool { return false }
+func (c *NoopController) Close() error              { return nil }

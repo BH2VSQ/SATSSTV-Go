@@ -21,12 +21,12 @@ func TestMakeSpectrumDetects1500HzTone(t *testing.T) {
 			peakIndex = i
 		}
 	}
-	peakFrequency := 900.0 + float64(peakIndex)*(1900.0/float64(len(spectrum)-1))
-	if math.Abs(peakFrequency-1500) > 5 {
+	peakFrequency := spectrumMinHz + float64(peakIndex)*(spectrumMaxHz-spectrumMinHz)/float64(len(spectrum)-1)
+	if math.Abs(peakFrequency-1500) > 8 {
 		t.Fatalf("detected peak at %.1f Hz, want approximately 1500 Hz", peakFrequency)
 	}
 	if spectrum[peakIndex] < 0.8 {
-		t.Fatalf("1500 Hz peak is too weak after normalization: %.3f", spectrum[peakIndex])
+		t.Fatalf("1500 Hz frequency-occupancy peak is too weak: %.3f", spectrum[peakIndex])
 	}
 }
 
@@ -42,7 +42,7 @@ func TestMakeSpectrumHandlesEmptyInput(t *testing.T) {
 	}
 }
 
-func TestMakeSpectrumPreservesInputLevel(t *testing.T) {
+func TestMakeSpectrumUsesMMSSTVStyleAGC(t *testing.T) {
 	const sampleRate = 48_000
 	makeTone := func(amplitude float64) []float32 {
 		samples := make([]float32, spectrumFFTSize)
@@ -52,7 +52,7 @@ func TestMakeSpectrumPreservesInputLevel(t *testing.T) {
 		return samples
 	}
 	loud := makeSpectrum(makeTone(0.5), sampleRate)
-	quiet := makeSpectrum(makeTone(0.05), sampleRate)
+	quiet := makeSpectrum(makeTone(0.025), sampleRate)
 	peak := func(values []float64) float64 {
 		maximum := 0.0
 		for _, value := range values {
@@ -62,7 +62,94 @@ func TestMakeSpectrumPreservesInputLevel(t *testing.T) {
 		}
 		return maximum
 	}
-	if peak(loud)-peak(quiet) < 0.12 {
-		t.Fatalf("spectrum appears to normalize away input level: loud %.3f, quiet %.3f", peak(loud), peak(quiet))
+	if peak(loud) < 0.8 || peak(quiet) < 0.8 {
+		t.Fatalf("MMSSTV-style AGC failed to reveal weak or strong tone: loud %.3f, quiet %.3f", peak(loud), peak(quiet))
+	}
+	if math.Abs(peak(loud)-peak(quiet)) > 0.15 {
+		t.Fatalf("AGC should produce similar frequency occupancy for both levels: loud %.3f, quiet %.3f", peak(loud), peak(quiet))
+	}
+}
+
+func TestEnqueueRXBlockDropsStaleAudioWithDiscontinuity(t *testing.T) {
+	queue := make(chan []float32, 2)
+	queue <- []float32{1}
+	queue <- []float32{2}
+	if dropped := enqueueRXBlock(queue, []float32{3}); dropped != 2 {
+		t.Fatalf("discarded %d stale blocks, want 2", dropped)
+	}
+	if marker := <-queue; marker != nil {
+		t.Fatalf("first queued item = %v, want discontinuity marker", marker)
+	}
+	if latest := <-queue; len(latest) != 1 || latest[0] != 3 {
+		t.Fatalf("latest queued block = %v, want [3]", latest)
+	}
+}
+
+func TestEnqueueRXTelemetryPreservesStreamBoundary(t *testing.T) {
+	queue := make(chan rxTelemetryBlock, 2)
+	queue <- rxTelemetryBlock{Samples: []float32{1}}
+	queue <- rxTelemetryBlock{Samples: []float32{2}}
+	enqueueRXTelemetry(queue, rxTelemetryBlock{Samples: []float32{3}})
+	first := <-queue
+	if !first.Discontinuity {
+		t.Fatalf("first telemetry item = %+v, want stream boundary", first)
+	}
+	latest := <-queue
+	if latest.Discontinuity || len(latest.Samples) != 1 || latest.Samples[0] != 3 {
+		t.Fatalf("latest telemetry item = %+v, want latest sample block [3]", latest)
+	}
+}
+
+func TestCaptureDumpCircularBufferKeepsNewestSamplesInOrder(t *testing.T) {
+	app := &App{}
+	app.appendCaptureDump([]float32{0, 1, 2}, 5)
+	app.appendCaptureDump([]float32{3, 4, 5}, 5)
+	got := app.captureDumpSnapshot()
+	want := []float32{1, 2, 3, 4, 5}
+	if len(got) != len(want) {
+		t.Fatalf("snapshot has %d samples, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("snapshot[%d] = %v, want %v (whole: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestCaptureDumpCircularBufferHandlesOversizedBlock(t *testing.T) {
+	app := &App{}
+	app.appendCaptureDump([]float32{0, 1, 2, 3, 4, 5, 6}, 4)
+	got := app.captureDumpSnapshot()
+	want := []float32{3, 4, 5, 6}
+	if len(got) != len(want) {
+		t.Fatalf("snapshot has %d samples, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("snapshot[%d] = %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestSetRXModePublishesCanonicalRequestWithoutDecoderLock(t *testing.T) {
+	app := &App{}
+	if err := app.setRXMode(" ROBOT36 "); err != nil {
+		t.Fatalf("set RX mode: %v", err)
+	}
+	requested := app.rxModeRequest.Load()
+	if requested == nil || *requested != "robot36" {
+		t.Fatalf("published mode = %v, want robot36", requested)
+	}
+	if err := app.setRXMode("not-a-real-mode"); err == nil {
+		t.Fatal("invalid RX mode should be rejected")
+	}
+	if got := app.rxModeRequest.Load(); got == nil || *got != "robot36" {
+		t.Fatalf("invalid request changed active request: %v", got)
+	}
+	if err := app.setRXMode(""); err != nil {
+		t.Fatalf("restore auto RX mode: %v", err)
+	}
+	if got := app.rxModeRequest.Load(); got == nil || *got != "" {
+		t.Fatalf("auto mode request = %v, want empty ID", got)
 	}
 }

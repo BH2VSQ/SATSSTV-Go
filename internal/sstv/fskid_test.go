@@ -133,3 +133,28 @@ func TestFSKIDMalformedCandidateDoesNotBlockLaterValidCallsign(t *testing.T) {
 		t.Fatalf("valid FSKID after malformed candidate was not recovered: %v", got)
 	}
 }
+
+func TestFSKIDDecoderResetClearsPartialCandidate(t *testing.T) {
+	const rate = 8_000
+	wave, err := AppendMMSSTVFSKID(nil, rate, "BH2VSQ", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder, err := NewFSKIDDecoder(rate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if events := decoder.Feed(wave[:rate/2]); len(events) != 0 {
+		t.Fatalf("partial FSKID unexpectedly produced events: %+v", events)
+	}
+	if len(decoder.pending) == 0 {
+		t.Fatal("partial FSKID candidate was not buffered")
+	}
+	decoder.Reset()
+	if len(decoder.pending) != 0 || decoder.scanFrom != 0 {
+		t.Fatalf("reset left stale FSKID state: pending=%d scanFrom=%d", len(decoder.pending), decoder.scanFrom)
+	}
+	if events := decoder.Feed(wave); len(events) != 1 || events[0].Callsign != "BH2VSQ" {
+		t.Fatalf("FSKID after reset = %+v, want BH2VSQ", events)
+	}
+}

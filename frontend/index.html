@@ -38,7 +38,7 @@
         </section>
 
         <section class="pane tx-pane">
-          <div class="pane-heading"><div class="pane-title"><span class="tx-tag">TX</span><strong>发送编辑器</strong><small id="txStatus">草稿</small></div><div class="pane-tools"><button class="small-btn" id="chooseImage">载入图片</button><button class="small-btn" id="encode">生成 WAV</button><button class="small-btn tone-toggle-button" id="toneToggle" disabled>1500 Hz 单音</button><button class="small-btn tx-toggle-button" id="txToggle" disabled>开始发射</button></div></div>
+          <div class="pane-heading"><div class="pane-title"><span class="tx-tag">TX</span><strong>发送编辑器</strong><small id="txStatus">草稿</small></div><div class="pane-tools"><button class="small-btn" id="encode">生成 WAV</button><button class="small-btn tone-toggle-button" id="toneToggle" disabled>1500 Hz 单音</button><button class="small-btn tx-toggle-button" id="txToggle" disabled>开始发射</button></div></div>
           <div class="modebar tx-modebar">
             <div class="modebar-label"><b>TX MODE</b><small>右键更换槽位</small></div>
             <div id="txModeSlots" class="mode-slots"></div>
@@ -49,7 +49,7 @@
             <div class="tx-preview-column">
               <div class="tx-canvas-frame"><canvas id="txCanvas" width="320" height="240"></canvas></div>
               <div class="canvas-meta"><span id="canvasDimensions">320 × 240</span><span>拖动文字或图像可调整位置</span></div>
-              <div class="source-line"><span id="imageName">纯色背景，尚未载入图片</span><button id="clearBackground" class="link-btn">清除</button></div>
+              <div class="source-line"><span id="imageName">默认背景，尚未载入图片</span><button id="clearBackground" class="link-btn">清除</button></div>
               <div class="tx-action-row"><span id="txResult">编辑画面就绪</span></div>
             </div>
             <div class="component-editor">
@@ -73,11 +73,10 @@
                   </div>
                 </div>
                 <div id="imageProperties" class="property-grid image-properties" hidden>
-                  <label class="property-field">图像宽度 <output id="imageWidthValue">40%</output><input id="imageWidth" type="range" min="5" max="100" value="40"></label>
-                  <label class="property-field">图像高度 <output id="imageHeightValue">40%</output><input id="imageHeight" type="range" min="5" max="100" value="40"></label>
+                  <label class="property-field">图像缩放（保持原比例） <output id="imageWidthValue">42%</output><input id="imageWidth" type="range" min="5" max="100" value="42"></label>
                 </div>
               </div>
-              <div class="editor-help">支持多个文字和图像组件。选中后可拖动画布对象，或调整坐标、字号及图像宽高。</div>
+              <div class="editor-help">支持文字、图像图层和可拖动缩放的持久底图。图像按原图比例缩放；字号上限随 TX 模式分辨率变化。</div>
             </div>
           </div>
           <div class="template-library">
@@ -143,6 +142,10 @@
     </div>
   </dialog>
 
+  <dialog id="imageLibraryDialog" class="image-library-dialog">
+    <div class="dialog-title"><div><strong>模板图片图库</strong><small>图片保存在本机用户配置目录，模板会嵌入自己的副本</small></div><div class="image-library-toolbar"><button id="importLibraryImage" class="small-btn primary-small">导入图片</button><button id="closeImageLibrary" class="icon-action">×</button></div></div>
+    <div id="imageLibraryGrid" class="image-library-grid"><div class="image-library-empty">正在读取图库…</div></div>
+  </dialog>
   <dialog id="albumPreviewDialog" class="preview-dialog"><button id="closePreview" class="preview-close">×</button><img id="albumPreviewImage" alt="相册图像预览"><div id="albumPreviewCaption"></div></dialog>
   <script src="app.js"></script>
 </body>

@@ -19,8 +19,12 @@ func TestDecodeRobustToNoise(t *testing.T) {
 			state = state*1664525 + 1013904223
 			n := int32((state>>16)&0x1ff) - 256
 			v := float64(encoded[i])*scale + float64(n)*noiseAmp/256.0*32768
-			if v > 32767 { v = 32767 }
-			if v < -32768 { v = -32768 }
+			if v > 32767 {
+				v = 32767
+			}
+			if v < -32768 {
+				v = -32768
+			}
 			samples[i] = int16(v)
 		}
 		_, _, _, err := DetectModeHeader(samples, rate)

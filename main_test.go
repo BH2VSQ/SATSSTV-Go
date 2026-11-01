@@ -189,8 +189,8 @@ func TestAudioTelemetryHelpersReturnFiniteValues(t *testing.T) {
 		t.Fatalf("unexpected dBFS value: %f", level)
 	}
 	bins := makeSpectrum(quiet, 48_000)
-	if len(bins) != 72 {
-		t.Fatalf("spectrum bin count = %d, want 72", len(bins))
+	if len(bins) != spectrumBins {
+		t.Fatalf("spectrum bin count = %d, want %d", len(bins), spectrumBins)
 	}
 	for i, value := range bins {
 		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > 1 {

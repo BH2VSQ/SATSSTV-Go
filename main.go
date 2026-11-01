@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/BH2VSQ/SATSSTV-Go/internal/sstv"
@@ -31,20 +32,25 @@ var assets embed.FS
 type App struct {
 	ctx context.Context
 
-	audioMu      sync.Mutex
-	rxOpMu       sync.Mutex
-	txOpMu       sync.Mutex // serializes TX start and audio-session replacement/close
-	audioSession appAudioRuntime
-	audioConfig  AudioSettings
-	rxCancel     context.CancelFunc
-	txCancel     context.CancelFunc
-	txGeneration uint64 // prevents an older TX worker from clearing a newer TX state
-	rxDecoderMu  sync.Mutex
-	rxDecoder    *sstv.StreamDecoder
-	albumMu      sync.Mutex
+	audioMu        sync.Mutex
+	rxOpMu         sync.Mutex
+	txOpMu         sync.Mutex // serializes TX start and audio-session replacement/close
+	audioSession   appAudioRuntime
+	audioConfig    AudioSettings
+	rxCancel       context.CancelFunc
+	txCancel       context.CancelFunc
+	txGeneration   uint64 // prevents an older TX worker from clearing a newer TX state
+	rxDecoderMu    sync.Mutex
+	rxDecoder      *sstv.StreamDecoder
+	rxModeRequest  atomic.Pointer[string]
+	rxQueueDrops   atomic.Uint64
+	albumMu        sync.Mutex
+	imageLibraryMu sync.Mutex
 
-	dumpMu  sync.Mutex
-	dumpBuf []float32 // rolling window of raw captured float samples
+	dumpMu    sync.Mutex
+	dumpBuf   []float32 // fixed-size circular buffer of recent raw captured float samples
+	dumpWrite int
+	dumpCount int
 }
 
 func (a *App) startup(ctx context.Context) {
