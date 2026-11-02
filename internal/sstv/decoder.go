@@ -1525,8 +1525,9 @@ type StreamEvent struct {
 	FrameID uint64
 	// AFCOffsets is the exact sample-indexed correction history used by the
 	// completed image. WaterfallPNG comes from the same corrected frequency track.
-	AFCOffsets   []AFCOffsetPoint
-	WaterfallPNG []byte
+	AFCOffsets        []AFCOffsetPoint
+	WaterfallPNG      []byte
+	FrequencySpectrum []float64
 	// DecodeRequest is populated when deferred final-frame decoding is enabled.
 	// It owns immutable frequency chunk headers and can be decoded by a worker
 	// after Feed has returned, keeping the real-time PCM path short.
