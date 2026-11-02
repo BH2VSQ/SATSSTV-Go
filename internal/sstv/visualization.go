@@ -322,3 +322,29 @@ func BuildAFCFrameWaterfall(frequency []float64, sampleRate int, spec ModeSpec, 
 	}
 	return img
 }
+
+
+// BuildAFCFrameSpectrum creates a frame-wide spectrum using the same per-sample
+// AFC correction points that were used to reconstruct the completed image.
+func BuildAFCFrameSpectrum(frequency []float64, sampleRate int, spec ModeSpec, bodyStart int, offsets []AFCOffsetPoint, bins int, minHz, maxHz float64) []float64 {
+	if sampleRate < 8_000 || spec.Height <= 0 || bodyStart < 0 || bodyStart >= len(frequency) || bins < 2 || maxHz <= minHz {
+		return make([]float64, max(0, bins))
+	}
+	bodyEnd := min(len(frequency), bodyStart+int(math.Round(BodyDurationMS(spec)*float64(sampleRate)/1000)))
+	if bodyEnd <= bodyStart {
+		return make([]float64, bins)
+	}
+	corrected := make([]float64, bodyEnd-bodyStart)
+	offsetIndex := 0
+	currentOffset := 0.0
+	for sample := bodyStart; sample < bodyEnd; sample++ {
+		for offsetIndex < len(offsets) && offsets[offsetIndex].SampleIndex <= sample {
+			currentOffset = offsets[offsetIndex].OffsetHz
+			offsetIndex++
+		}
+		if f := frequency[sample]; f > 80 && f < 3_900 && !math.IsNaN(f) && !math.IsInf(f, 0) {
+			corrected[sample-bodyStart] = f - currentOffset
+		}
+	}
+	return FrequencyHistogramFromTrack(corrected, sampleRate, bins, minHz, maxHz)
+}
