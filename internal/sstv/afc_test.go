@@ -256,7 +256,7 @@ func TestLiveHeaderSearchHonorsConfiguredWideAFCWindow(t *testing.T) {
 			}
 			samples := append(generator.Samples(), make([]int16, rate)...)
 			shifted := shiftFrequency(samples, rate, offset)
-			freq := newFrequencyTracker(rate).Process(shifted)
+			freq := newStreamFrequencyTracker(rate, true).Process(shifted)
 			leaderSamples := int(math.Round(0.300 * rate))
 			breakSamples := int(math.Round(0.010 * rate))
 			leader := meanFreqQuick(freq, 0, leaderSamples, 6)
