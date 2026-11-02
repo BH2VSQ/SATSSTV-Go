@@ -336,14 +336,22 @@ func TestRobot72CatalogAndTiming(t *testing.T) {
 }
 
 func TestImplementedModesDecodeTheirOwnWaveforms(t *testing.T) {
-	const rate = 8_000
+	const standardRate = 8_000
 	source := makeTestSSTVImage()
-	encoder := NewEncoder(rate)
 	for _, spec := range Modes() {
 		if !spec.CodecReady {
 			continue
 		}
 		t.Run(spec.ID, func(t *testing.T) {
+			// N-VIS narrow-band MP carries the full 0..255 component range in
+			// only 256 Hz. At 8 kHz, the short MP73 pixel dwell provides too few
+			// samples for a meaningful zero-crossing frequency estimate. Exercise
+			// these modes at the application's normal 48 kHz audio rate instead.
+			rate := standardRate
+			if spec.NarrowBand {
+				rate = DefaultRate
+			}
+			encoder := NewEncoder(rate)
 			samples, err := encoder.Encode(context.Background(), source, spec.ID)
 			if err != nil {
 				t.Fatalf("encode: %v", err)

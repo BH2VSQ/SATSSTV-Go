@@ -85,8 +85,8 @@ func TestStationSettingsPersistAndNormalize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetStationSettings() on first run: %v", err)
 	}
-	if initial.MyCall != "" || initial.Locator != "" {
-		t.Fatalf("expected empty first-run settings, got %+v", initial)
+	if initial.MyCall != defaultStationCallsign || initial.Locator != defaultStationLocator {
+		t.Fatalf("unexpected first-run station defaults: got %+v, want %s / %s", initial, defaultStationCallsign, defaultStationLocator)
 	}
 
 	saved, err := app.SaveStationSettings(StationSettings{MyCall: " n0call ", Locator: "aa00aa "})
