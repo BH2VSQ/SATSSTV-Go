@@ -406,7 +406,7 @@ func streamLeaderOffset(freq []float64, sampleRate int, maxOffsetHz float64) flo
 		return 0
 	}
 	if maxOffsetHz < 20 || maxOffsetHz > 1_000 {
-		maxOffsetHz = 200
+		maxOffsetHz = 500
 	}
 	leaderSamples := int(math.Round(0.300 * float64(sampleRate)))
 	if leaderSamples <= 0 || leaderSamples > len(freq) {
@@ -818,7 +818,7 @@ func (c *sampleClock) syncFromFrequency(durationMS, searchMS float64) bool {
 	if c.afcEnabled {
 		maxOffset = c.afcMaxOffsetHz
 		if maxOffset < 20 || maxOffset > 1_000 {
-			maxOffset = 300
+			maxOffset = 500
 		}
 	}
 	target := HorizontalSync + c.offset
@@ -908,14 +908,16 @@ func medianFloat64(values []float64) float64 {
 
 // updateAFC estimates frequency offset only from the stable centre of a
 // detected horizontal-sync pulse. Median/MAD reject edge transitions, noise,
-// and picture pixels; bounded steps prevent one bad row from moving the tune.
+// and picture pixels. Small Doppler drift is smoothed; a clean large step is
+// treated as a receiver retune and reacquired immediately instead of making
+// the decoder spend many raster lines chasing the operator's tuning change.
 func (c *sampleClock) updateAFC(start, pulseSamples int) {
 	if c == nil || !c.afcEnabled || len(c.frequency) == 0 || pulseSamples <= 0 {
 		return
 	}
 	maxOffset := c.afcMaxOffsetHz
 	if maxOffset < 20 || maxOffset > 1_000 {
-		maxOffset = 300
+		maxOffset = 500
 	}
 	lo := max(0, start+pulseSamples/5)
 	hi := min(len(c.frequency), start+pulseSamples*4/5)
@@ -934,15 +936,38 @@ func (c *sampleClock) updateAFC(start, pulseSamples int) {
 	for i, value := range values {
 		deviations[i] = math.Abs(value - centre)
 	}
-	if medianFloat64(deviations) > 65 {
+	mad := medianFloat64(deviations)
+	// The zero-crossing discriminator has several-hertz-to-tens-of-hertz
+	// quantization on short 9 ms sync pulses. Allow modest real-world jitter,
+	// while still rejecting a pulse contaminated by image pixels or noise.
+	if mad > 90 {
 		return
 	}
 	targetOffset := centre - HorizontalSync
 	if math.Abs(targetOffset) > maxOffset {
 		return
 	}
-	delta := math.Max(-45, math.Min(45, targetOffset-c.offset))
-	c.offset += delta * 0.60
+	delta := targetOffset - c.offset
+	absDelta := math.Abs(delta)
+
+	// A stable sync pulse that disagrees by 75 Hz or more is much more likely
+	// to represent a manual receiver retune than natural satellite Doppler.
+	// Snap only when the median absolute deviation confirms a clean tone.
+	if absDelta >= 75 && mad <= 65 {
+		c.offset = targetOffset
+		return
+	}
+	if absDelta >= 75 {
+		// Lower-confidence but still valid sync: reacquire much faster than the
+		// normal Doppler loop, with a bounded correction to resist a bad line.
+		step := math.Max(-180, math.Min(180, delta))
+		c.offset += step * 0.90
+		return
+	}
+
+	// For ordinary slow drift, retain the existing bounded low-pass behavior.
+	step := math.Max(-45, math.Min(45, delta))
+	c.offset += step * 0.60
 }
 
 func (c *sampleClock) scan(freq []float64, width int, totalMS float64) ([]uint8, error) {
@@ -1610,17 +1635,17 @@ func NewStreamDecoder(sampleRate int) (*StreamDecoder, error) {
 	if sampleRate < 8_000 || sampleRate > 192_000 {
 		return nil, fmt.Errorf("invalid sample rate %d", sampleRate)
 	}
-	return &StreamDecoder{rate: sampleRate, maxIdle: sampleRate * 12, afcMaxOffsetHz: 300}, nil
+	return &StreamDecoder{rate: sampleRate, maxIdle: sampleRate * 12, afcMaxOffsetHz: 500}, nil
 }
 
-// SetAFC configures line-sync frequency-offset tracking. A maximum of 300 Hz
+// SetAFC configures line-sync frequency-offset tracking. A maximum of 500 Hz
 // is used for legacy/out-of-range values; supported UI values are 100..1000 Hz.
 func (d *StreamDecoder) SetAFC(enabled bool, maxOffsetHz float64) {
 	if d == nil {
 		return
 	}
 	if maxOffsetHz < 20 || maxOffsetHz > 1_000 {
-		maxOffsetHz = 300
+		maxOffsetHz = 500
 	}
 	d.afcEnabled = enabled
 	d.afcMaxOffsetHz = maxOffsetHz
