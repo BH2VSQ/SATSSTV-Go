@@ -1061,7 +1061,7 @@ function bindRuntimeEvents() {
     const signalPresent = data?.signalPresent !== false;
     $('spectrumState').textContent = signalPresent
       ? t('spectrumPeak', { peak: peakHz.toFixed(0), crest: crest.toFixed(1) })
-      : 'NO STABLE TONE';
+      : t('noStableTone');
     const dbfs = Number(data?.inputDbfs ?? data?.dbfs ?? -120);
     currentInputDBFS = dbfs;
     currentAttenuationDB = Math.max(0, Number(data?.attenuationDB || 0));
