@@ -303,3 +303,51 @@ func TestSampleClockAFCLocksSyncBeyondOldNinetyHertzWindow(t *testing.T) {
 		t.Fatalf("AFC offset after 14 sync lines = %.1f Hz, want approximately 260 Hz", clock.offset)
 	}
 }
+
+
+func TestSampleClockAFCImmediatelyReacquiresCleanRetuneStep(t *testing.T) {
+	const rate = 12_000
+	const lineSamples = rate * 150 / 1_000
+	const pulseSamples = rate * 9 / 1_000
+	const start = 200
+	frequency := make([]float64, lineSamples*3)
+	for i := range frequency {
+		frequency[i] = 1_900
+	}
+	// First line is tuned normally; the second line simulates a 350 Hz
+	// receiver-frequency change made by the operator between SSTV lines.
+	for i := start; i < start+pulseSamples; i++ {
+		frequency[i] = HorizontalSync
+	}
+	second := start + lineSamples
+	for i := second; i < second+pulseSamples; i++ {
+		frequency[i] = HorizontalSync + 350
+	}
+
+	clock := sampleClock{
+		rate: rate, frequency: frequency, offset: 0,
+		afcEnabled: true, afcMaxOffsetHz: 500,
+	}
+	clock.pos = start
+	if !clock.syncFirst(9, 2) {
+		t.Fatal("failed to acquire initial 1200 Hz sync")
+	}
+	clock.pos = second
+	if !clock.syncFirst(9, 2) {
+		t.Fatal("failed to acquire retuned 1550 Hz sync")
+	}
+	if math.Abs(clock.offset-350) > 1 {
+		t.Fatalf("AFC offset after clean retune = %.1f Hz, want 350 Hz", clock.offset)
+	}
+}
+
+func TestStreamDecoderDefaultAFCWindowCoversModerateManualRetune(t *testing.T) {
+	const rate = 48_000
+	decoder, err := NewStreamDecoder(rate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoder.afcMaxOffsetHz != 500 {
+		t.Fatalf("default AFC window = ±%.0f Hz, want ±500 Hz", decoder.afcMaxOffsetHz)
+	}
+}
