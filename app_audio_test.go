@@ -534,3 +534,60 @@ func TestTelemetryWindowDoesNotRequireFullRateAudioBuffer(t *testing.T) {
 		t.Fatalf("display frequency track has %d samples from %d input samples; expected approximately one quarter", len(track), len(input))
 	}
 }
+
+func TestAggregateRXAudioCoalescesBlocksWithoutChangingSamples(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	input := make(chan []float32, 4)
+	output := make(chan []float32, 4)
+	input <- []float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	input <- []float32{11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+	close(input)
+	aggregateRXAudio(ctx, input, output, 1_000) // 20 samples = 20 ms
+	var got []float32
+	for block := range output {
+		if block == nil {
+			t.Fatal("unexpected discontinuity marker")
+		}
+		if len(block) != 20 {
+			t.Fatalf("aggregated block length = %d, want 20", len(block))
+		}
+		got = append(got, block...)
+	}
+	if len(got) != 20 {
+		t.Fatalf("received %d samples after aggregation, want 20", len(got))
+	}
+	for i := range got {
+		if got[i] != float32(i+1) {
+			t.Fatalf("aggregated sample %d = %.0f, want %d", i, got[i], i+1)
+		}
+	}
+}
+
+func TestAggregateRXAudioPreservesDiscontinuityBoundary(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	input := make(chan []float32, 8)
+	output := make(chan []float32, 8)
+	input <- []float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	input <- []float32{11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+	input <- nil
+	input <- []float32{21, 22, 23, 24, 25, 26, 27, 28, 29, 30}
+	input <- []float32{31, 32, 33, 34, 35, 36, 37, 38, 39, 40}
+	close(input)
+	aggregateRXAudio(ctx, input, output, 1_000)
+	var blocks [][]float32
+	for block := range output {
+		blocks = append(blocks, block)
+	}
+	if len(blocks) != 3 {
+		t.Fatalf("output contained %d items, want data + gap + data", len(blocks))
+	}
+	if len(blocks[0]) != 20 || blocks[1] != nil || len(blocks[2]) != 20 {
+		t.Fatalf("unexpected aggregate boundaries: lengths %d, gap=%v, %d",
+			len(blocks[0]), blocks[1] == nil, len(blocks[2]))
+	}
+	if blocks[0][0] != 1 || blocks[0][19] != 20 || blocks[2][0] != 21 || blocks[2][19] != 40 {
+		t.Fatalf("aggregator changed sample order across discontinuity: %+v", blocks)
+	}
+}
