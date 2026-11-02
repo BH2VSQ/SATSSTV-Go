@@ -106,3 +106,31 @@ func TestAutoAttenuatorResetRestoresUnity(t *testing.T) {
 	}
 	_ = time.Second // keep this test file's import stable if release timing changes.
 }
+
+
+func TestAutoAttenuatorFollowsChangingInputLevel(t *testing.T) {
+	const rate = 48_000
+	a := NewAutoAttenuator(rate, DefaultAutoAttenuatorConfig())
+	makeTone := func(amplitude float64) []float32 {
+		out := make([]float32, 480)
+		for i := range out {
+			out[i] = float32(amplitude * math.Sin(2*math.Pi*1_500*float64(i)/rate))
+		}
+		return out
+	}
+	_, loud := a.Process(makeTone(0.95))
+	if loud.AttenuationDB < 1 {
+		t.Fatalf("loud input attenuation = %.2f dB, expected dynamic reduction", loud.AttenuationDB)
+	}
+	quiet := AutoAttenuatorStats{}
+	for i := 0; i < 60; i++ {
+		_, quiet = a.Process(makeTone(0.20))
+	}
+	if quiet.AttenuationDB >= loud.AttenuationDB {
+		t.Fatalf("attenuation did not recover as input level fell: loud %.2f dB, quiet %.2f dB", loud.AttenuationDB, quiet.AttenuationDB)
+	}
+	_, loudAgain := a.Process(makeTone(0.95))
+	if loudAgain.AttenuationDB <= quiet.AttenuationDB {
+		t.Fatalf("attenuation did not increase when input level rose again: quiet %.2f dB, loud %.2f dB", quiet.AttenuationDB, loudAgain.AttenuationDB)
+	}
+}
