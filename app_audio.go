@@ -416,10 +416,11 @@ func (a *App) startRX(modeID string) error {
 		baseCtx = context.Background()
 	}
 	rxCtx, cancel := context.WithCancel(baseCtx)
-	// Keep one bounded 64-block jitter queue. It absorbs brief scheduler hiccups
-	// without allowing multi-second stale audio to accumulate. Sustained DSP
-	// overload still emits an explicit discontinuity marker.
-	queue := make(chan []float32, 64)
+	// Keep a bounded native-callback queue, then coalesce tiny callback blocks
+	// into 20 ms PCM batches before the ordered decoder worker. This preserves
+	// every sample while reducing per-block DSP/filter/allocator overhead.
+	captureQueue := make(chan []float32, 32)
+	decodeQueue := make(chan []float32, 8)
 	a.rxQueueDrops.Store(0)
 
 	a.rxDecoderMu.Lock()
@@ -441,7 +442,7 @@ func (a *App) startRX(modeID string) error {
 		// Do not block the capture worker behind DSP/UI work. Bound latency and
 		// explicitly reset the decoder if an exceptional overload loses samples.
 		if rxCtx.Err() == nil {
-			if dropped := enqueueRXBlock(queue, block); dropped > 0 {
+			if dropped := enqueueRXBlock(captureQueue, block); dropped > 0 {
 				a.rxQueueDrops.Add(dropped)
 			}
 		}
@@ -461,9 +462,82 @@ func (a *App) startRX(modeID string) error {
 		return err
 	}
 	a.rxModeRequest.Store(&modeID)
-	go a.runRXWorker(rxCtx, queue, decoder, fskidDecoder, cfg.SampleRate, session, modeID, cfg)
+	go aggregateRXAudio(rxCtx, captureQueue, decodeQueue, cfg.SampleRate)
+	go a.runRXWorker(rxCtx, decodeQueue, decoder, fskidDecoder, cfg.SampleRate, session, modeID, cfg)
 	a.emitAudioState()
 	return nil
+}
+
+// aggregateRXAudio joins small native callback blocks into roughly 20 ms
+// batches. It preserves exact sample order and forwards discontinuity markers
+// only after flushing the pre-gap tail. Both queues remain bounded and use the
+// same stale-audio policy, so capture callbacks never wait for DSP.
+func aggregateRXAudio(ctx context.Context, input <-chan []float32, output chan []float32, sampleRate int) {
+	defer close(output)
+	targetSamples := max(1, sampleRate/50)
+	flushAfter := 20 * time.Millisecond
+	pending := make([]float32, 0, targetSamples*2)
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	timerActive := false
+	stopTimer := func() {
+		if !timerActive {
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timerActive = false
+	}
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		block := append([]float32(nil), pending...)
+		pending = pending[:0]
+		stopTimer()
+		enqueueRXBlock(output, block)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return
+		case <-timer.C:
+			timerActive = false
+			flush()
+		case block, ok := <-input:
+			if !ok {
+				flush()
+				return
+			}
+			if block == nil {
+				// Samples before a known capture gap must reach the decoder before
+				// the reset marker; never merge samples across a missing interval.
+				flush()
+				enqueueRXBlock(output, nil)
+				continue
+			}
+			if len(block) == 0 {
+				continue
+			}
+			if len(pending) == 0 {
+				if !timerActive {
+					timer.Reset(flushAfter)
+					timerActive = true
+				}
+			}
+			pending = append(pending, block...)
+			if len(pending) >= targetSamples {
+				flush()
+			}
+		}
+	}
 }
 
 // enqueueRXBlock is the application-side low-latency queue policy. When full,
