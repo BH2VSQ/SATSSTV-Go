@@ -82,7 +82,10 @@ func detectVISFromRange(samples []int16, freq []float64, sampleRate, startAt int
 				continue
 			}
 			breakMean := meanFreqQuick(freq, breakStart, breakN, max(1, sampleRate/8_000))
-			if breakMean < 1_100+offset || breakMean > 1_300+offset {
+			// A 10 ms break is shorter than the discriminator/filter transient.
+			// Keep a wider coarse gate here and let the raw-PCM narrowband
+			// detector below make the final 1200 Hz symbol decision.
+			if breakMean < 1_200+offset-220 || breakMean > 1_200+offset+220 {
 				continue
 			}
 			if bestTone(samples[breakStart:breakEnd], sampleRate, 1_200+offset, 1_900+offset) != 1_200+offset {

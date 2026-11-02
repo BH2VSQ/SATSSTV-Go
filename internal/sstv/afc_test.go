@@ -279,7 +279,7 @@ func TestLiveHeaderSearchHonorsConfiguredWideAFCWindow(t *testing.T) {
 
 func TestSampleClockAFCLocksSyncBeyondOldNinetyHertzWindow(t *testing.T) {
 	const rate = 12_000
-	frequency := make([]float64, rate/2)
+	frequency := make([]float64, rate)
 	for i := range frequency {
 		frequency[i] = 1_900
 	}
