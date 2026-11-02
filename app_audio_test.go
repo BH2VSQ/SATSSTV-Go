@@ -92,18 +92,17 @@ func TestEnqueueRXBlockDropsStaleAudioWithDiscontinuity(t *testing.T) {
 	}
 }
 
-func TestEnqueueRXTelemetryPreservesStreamBoundary(t *testing.T) {
+func TestEnqueueRXTelemetryKeepsOnlyLatestDisplayBlock(t *testing.T) {
 	queue := make(chan rxTelemetryBlock, 2)
 	queue <- rxTelemetryBlock{Samples: []float32{1}}
 	queue <- rxTelemetryBlock{Samples: []float32{2}}
 	enqueueRXTelemetry(queue, rxTelemetryBlock{Samples: []float32{3}})
-	first := <-queue
-	if !first.Discontinuity {
-		t.Fatalf("first telemetry item = %+v, want stream boundary", first)
+	if len(queue) != 1 {
+		t.Fatalf("telemetry queue has %d blocks, want only latest block", len(queue))
 	}
 	latest := <-queue
-	if latest.Discontinuity || len(latest.Samples) != 1 || latest.Samples[0] != 3 {
-		t.Fatalf("latest telemetry item = %+v, want latest sample block [3]", latest)
+	if !latest.Discontinuity || len(latest.Samples) != 1 || latest.Samples[0] != 3 {
+		t.Fatalf("latest telemetry item = %+v, want discontinuity + newest sample block [3]", latest)
 	}
 }
 
@@ -505,5 +504,33 @@ func TestRXAudioQueueHasSingleJitterBufferBudget(t *testing.T) {
 	}
 	if got := <-queue; len(got) != 1 || got[0] != 99 {
 		t.Fatalf("newest item after overflow = %v, want [99]", got)
+	}
+}
+
+
+func TestValidDisplayFrequencyRatioIgnoresMissingAndOutOfBandSamples(t *testing.T) {
+	track := []float64{0, 0, 1_200, 1_500, 1_900, 2_300, 3_200, math.NaN()}
+	got := validDisplayFrequencyRatio(track, 700, 2700)
+	if math.Abs(got-0.5) > 1e-9 {
+		t.Fatalf("display tone coverage = %.3f, want 0.500", got)
+	}
+	if validDisplayFrequencyRatio(nil, 700, 2700) != 0 {
+		t.Fatal("empty track should have zero tone coverage")
+	}
+}
+
+func TestTelemetryWindowDoesNotRequireFullRateAudioBuffer(t *testing.T) {
+	const rate = 48_000
+	tracker := sstv.NewCorrectedDisplayFrequencyTracker(rate)
+	if got := tracker.SampleRate(); got < 10_000 || got > 16_000 {
+		t.Fatalf("display discriminator rate = %d Hz, want approximately 12 kHz", got)
+	}
+	input := make([]int16, rate/8)
+	for i := range input {
+		input[i] = int16(0.3 * math.Sin(2*math.Pi*1_900*float64(i)/rate) * 32767)
+	}
+	track := tracker.Process(input, 0)
+	if len(track) < len(input)/5 || len(track) > len(input)/3 {
+		t.Fatalf("display frequency track has %d samples from %d input samples; expected approximately one quarter", len(track), len(input))
 	}
 }
