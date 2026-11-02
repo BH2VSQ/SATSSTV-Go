@@ -1069,7 +1069,6 @@ func (c *sampleClock) scanRange(freq []float64, width int, totalMS, minHz, maxHz
 			sum += freq[i] * weight
 			weightSum += weight
 		}
-		count := int(weightSum)
 		if weightSum <= 0 {
 			return nil, fmt.Errorf("unable to estimate SSTV pixel frequency at pixel %d (samples %d..%d)", x, start, end)
 		}
