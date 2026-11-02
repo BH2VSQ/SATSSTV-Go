@@ -1687,6 +1687,8 @@ func (d *StreamDecoder) prepareProgressiveUpdate(ctx context.Context, frameEnd i
 		SampleRate:      d.rate,
 		BodyStart:       d.bodyStart,
 		Offset:          d.offset,
+		AFCEnabled:      d.afcEnabled,
+		AFCMaxOffsetHz:  d.afcMaxOffsetHz,
 		FrameID:         d.frameID,
 		Sequence:        d.previewSequence,
 		FrequencyChunks: chunkSnapshot,
