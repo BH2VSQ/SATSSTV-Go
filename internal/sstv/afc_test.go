@@ -257,7 +257,7 @@ func TestLiveHeaderSearchHonorsConfiguredWideAFCWindow(t *testing.T) {
 			samples := append(generator.Samples(), make([]int16, rate)...)
 			shifted := shiftFrequency(samples, rate, offset)
 			freq := newFrequencyTracker(rate).Process(shifted)
-			detected, vis, _, err := detectModeHeaderFromRange(shifted, freq, rate, 0, 700)
+			detected, vis, _, _, _, err := detectModeHeaderFromRange(shifted, freq, rate, 0, 700)
 			if err != nil {
 				t.Fatalf("live header search failed at %+.0f Hz: %v", offset, err)
 			}
