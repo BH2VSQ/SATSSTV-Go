@@ -24,6 +24,54 @@ func detectModeHeaderFrom(samples []int16, freq []float64, sampleRate, startAt i
 	return detectModeHeaderFromRange(samples, freq, sampleRate, startAt, 350)
 }
 
+// stableMeanFreqQuick estimates the leader frequency and its spread using
+// sparse samples of the already-demodulated track. Broadband noise can have a
+// plausible average near 1900 Hz but a broad instantaneous-frequency spread;
+// reject it before invoking raw-PCM Goertzel symbol classifiers.
+func stableMeanFreqQuick(freq []float64, start, n, stride int) (mean, spread, coverage float64) {
+	if stride < 1 {
+		stride = 1
+	}
+	if start < 0 {
+		start = 0
+	}
+	end := min(start+n, len(freq))
+	if end <= start {
+		return 0, 0, 0
+	}
+	var sum, sumSquares float64
+	valid, total := 0, 0
+	for i := start; i < end; i += stride {
+		total++
+		f := freq[i]
+		if f <= 80 || f >= 3_900 || math.IsNaN(f) || math.IsInf(f, 0) {
+			continue
+		}
+		sum += f
+		sumSquares += f * f
+		valid++
+	}
+	if total == 0 || valid == 0 {
+		return 0, 0, 0
+	}
+	mean = sum / float64(valid)
+	variance := sumSquares/float64(valid) - mean*mean
+	if variance < 0 {
+		variance = 0
+	}
+	return mean, math.Sqrt(variance), float64(valid) / float64(total)
+}
+
+// maxLeaderSpread allows extra discriminator jitter on lower sample-rate
+// devices while rejecting the broad instantaneous-frequency spread typical
+// of broadband receiver noise.
+func maxLeaderSpread(sampleRate int) float64 {
+	if sampleRate < 12_000 {
+		return 260
+	}
+	return 190
+}
+
 func detectModeHeaderFromRange(samples []int16, freq []float64, sampleRate, startAt int, maxOffsetHz float64) (spec ModeSpec, vis uint8, bodyStart, headerStart, nextStart int, retErr error) {
 	if maxOffsetHz < 20 || maxOffsetHz > 1_000 {
 		maxOffsetHz = 350
@@ -162,8 +210,13 @@ func detectFixedModePrefixRange(samples []int16, freq []float64, rate, startAt i
 	step := max(1, rate/500)
 	start, step := alignedStart(startAt, step)
 	maxStart := min(len(samples)-headerN, rate*3)
+	quickStride := max(1, rate/1_000)
 	for coarse := start; coarse <= maxStart; coarse += step {
-		offset := meanFreqQuick(freq, coarse, leaderN, max(1, rate/8_000)) - 1_900
+		leaderMean, leaderSpread, leaderCoverage := stableMeanFreqQuick(freq, coarse, leaderN, quickStride)
+		if leaderCoverage < 0.65 || leaderSpread > maxLeaderSpread(rate) {
+			continue
+		}
+		offset := leaderMean - 1_900
 		if offset < -maxOffsetHz || offset > maxOffsetHz {
 			continue
 		}
@@ -212,13 +265,15 @@ func detectExtendedVISFromRange(samples []int16, freq []float64, rate, startAt i
 	leaderN := int(math.Round(.300 * float64(rate)))
 	breakN := int(math.Round(.010 * float64(rate)))
 	bitN := int(math.Round(.030 * float64(rate)))
-	quickStride := max(1, rate/8_000)
+	quickStride := max(1, rate/1_000)
 	for ; start <= maxStart; start += step {
 		p := start
-		// Reject candidates unless both the leader and its short break have the
-		// expected frequency. A continuous 1900 Hz idle tone must not trigger a
-		// 300 ms Goertzel scan at every 2 ms search position.
-		leader := meanFreqQuick(freq, p, leaderN, quickStride)
+		// Broadband noise can have a plausible average zero-crossing frequency
+		// near 1900 Hz. Reject an unstable leader before expensive symbol tests.
+		leader, spread, coverage := stableMeanFreqQuick(freq, p, leaderN, quickStride)
+		if coverage < 0.65 || spread > maxLeaderSpread(rate) {
+			continue
+		}
 		if leader < 1_900-maxOffsetHz || leader > 1_900+maxOffsetHz {
 			continue
 		}
@@ -283,10 +338,13 @@ func detectNarrowVISFromRange(samples []int16, freq []float64, rate, startAt int
 	leaderN := int(math.Round(.300 * float64(rate)))
 	breakN := int(math.Round(.100 * float64(rate)))
 	bitN := int(math.Round(.022 * float64(rate)))
-	quickStride := max(1, rate/8_000)
+	quickStride := max(1, rate/1_000)
 	for ; start <= maxStart; start += step {
 		p := start
-		leader := meanFreqQuick(freq, p, leaderN, quickStride)
+		leader, spread, coverage := stableMeanFreqQuick(freq, p, leaderN, quickStride)
+		if coverage < 0.65 || spread > maxLeaderSpread(rate) {
+			continue
+		}
 		if leader < 1_900-maxOffsetHz || leader > 1_900+maxOffsetHz {
 			continue
 		}
