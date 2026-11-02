@@ -169,35 +169,84 @@ func (f *mmsstvFQC) Do(sample float64) float64 {
 // RX spectrum and waterfall. It consumes the same attenuated PCM as the image
 // decoder and subtracts the current AFC offset before frequency histogramming.
 type CorrectedDisplayFrequencyTracker struct {
-	tracker *frequencyTracker
-	filter  biquad
+	tracker          *frequencyTracker
+	filter           biquad
+	prefilter        biquad
+	inputSampleRate  int
+	outputSampleRate int
+	decimation       int
+	decimationPhase  int
 }
 
-// NewCorrectedDisplayFrequencyTracker creates a wide-offset display tracker.
-// The wide passband is required because the radio may be retuned several
-// hundred hertz away from nominal SSTV tones before AFC reacquires the signal.
+// NewCorrectedDisplayFrequencyTracker creates a low-cost wide-offset display
+// tracker. Display work is intentionally performed near 12 kHz: this retains
+// the complete 700..2700 Hz SSTV audio band while avoiding a second full-rate
+// discriminator competing with the ordered image decoder.
 func NewCorrectedDisplayFrequencyTracker(sampleRate int) *CorrectedDisplayFrequencyTracker {
 	if sampleRate < 8_000 || sampleRate > 192_000 {
 		return nil
 	}
-	filter := mmsstvFQCLowPass(400, float64(sampleRate))
-	const zeroFrequency = -1900.0 / 400.0
-	filter.x1, filter.x2 = zeroFrequency, zeroFrequency
-	filter.y1, filter.y2 = zeroFrequency, zeroFrequency
-	return &CorrectedDisplayFrequencyTracker{
-		tracker: newStreamFrequencyTracker(sampleRate, true),
-		filter:  filter,
+	decimation := max(1, int(math.Round(float64(sampleRate)/12_000)))
+	outputRate := sampleRate / decimation
+	t := &CorrectedDisplayFrequencyTracker{
+		inputSampleRate: sampleRate, outputSampleRate: outputRate,
+		decimation: decimation,
 	}
+	t.Reset()
+	return t
 }
 
-// Process returns sample-aligned frequency values after applying the supplied
-// AFC offset. A positive measured receiver offset is subtracted from the input
-// frequencies so standard SSTV tones return to their nominal coordinates.
+// SampleRate reports the discriminator rate after display-only decimation.
+func (t *CorrectedDisplayFrequencyTracker) SampleRate() int {
+	if t == nil {
+		return 0
+	}
+	return t.outputSampleRate
+}
+
+// Reset discards filter history. It is used after a visualization discontinuity
+// or a noise-gate interval; it never touches the SSTV decoder's AFC state.
+func (t *CorrectedDisplayFrequencyTracker) Reset() {
+	if t == nil || t.outputSampleRate <= 0 {
+		return
+	}
+	t.tracker = newStreamFrequencyTracker(t.outputSampleRate, true)
+	t.filter = mmsstvFQCLowPass(400, float64(t.outputSampleRate))
+	const zeroFrequency = -1900.0 / 400.0
+	t.filter.x1, t.filter.x2, t.filter.y1, t.filter.y2 = zeroFrequency, zeroFrequency, zeroFrequency, zeroFrequency
+	t.prefilter = biquad{}
+	if t.decimation > 1 {
+		// Pre-filter before decimation so energy above the reduced Nyquist
+		// frequency cannot fold back into the SSTV video band.
+		t.prefilter = biquadLowPass(float64(t.outputSampleRate)*0.34, float64(t.inputSampleRate))
+	}
+	t.decimationPhase = 0
+}
+
+// Process returns a decimated, sample-aligned frequency track after applying
+// the supplied AFC offset. A positive measured receiver offset is subtracted
+// so standard SSTV tones return to their nominal coordinates.
 func (t *CorrectedDisplayFrequencyTracker) Process(samples []int16, afcOffsetHz float64) []float64 {
 	if t == nil || t.tracker == nil || len(samples) == 0 {
 		return nil
 	}
-	raw := t.tracker.Process(samples)
+	var decimated []int16
+	if t.decimation == 1 {
+		decimated = samples
+	} else {
+		decimated = make([]int16, 0, (len(samples)+t.decimation-1)/t.decimation)
+		for _, sample := range samples {
+			value := t.prefilter.Do(float64(sample))
+			t.decimationPhase++
+			if t.decimationPhase < t.decimation {
+				continue
+			}
+			t.decimationPhase = 0
+			value = math.Max(-32768, math.Min(32767, math.Round(value)))
+			decimated = append(decimated, int16(value))
+		}
+	}
+	raw := t.tracker.Process(decimated)
 	out := make([]float64, len(raw))
 	for i, frequency := range raw {
 		if frequency < 80 || frequency > 3_900 || math.IsNaN(frequency) || math.IsInf(frequency, 0) {
