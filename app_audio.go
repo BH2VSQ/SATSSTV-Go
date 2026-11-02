@@ -808,7 +808,7 @@ func (a *App) runRXWorker(
 	var completedPreviewFrame atomic.Uint64
 	var fskidDecodedCycle atomic.Uint64
 	var fskidFinishedCycle atomic.Uint64
-	go a.runRXPreviewWorker(ctx, previewQueue, &latestPreviewSequence, &completedPreviewFrame, &latestAFCOffset)
+	go a.runRXPreviewWorker(ctx, previewQueue, &latestPreviewSequence, &completedPreviewFrame, latestAFCOffset)
 	go a.runRXFrameWorker(ctx, frameQueue)
 	go a.runRXFSKIDWorker(ctx, fskidQueue, fskidDecoder, &fskidDecodedCycle, &fskidFinishedCycle)
 	activeMode := initialMode
