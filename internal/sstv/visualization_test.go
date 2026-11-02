@@ -81,7 +81,13 @@ func TestCorrectedDisplayTrackerMovesRetunedToneBackToNominalFrequency(t *testin
 		samples[i] = int16(0.4 * math.Sin(2*math.Pi*2_200*float64(i)/rate) * 32767)
 	}
 	tracker := NewCorrectedDisplayFrequencyTracker(rate)
+	if got := tracker.SampleRate(); got < 10_000 || got > 16_000 {
+		t.Fatalf("display discriminator rate = %d Hz, want approximately 12 kHz", got)
+	}
 	track := tracker.Process(samples, offset)
+	if len(track) < len(samples)/5 || len(track) > len(samples)/3 {
+		t.Fatalf("decimated frequency track has %d points from %d input samples; want approximately one quarter", len(track), len(samples))
+	}
 	var sum float64
 	count := 0
 	for _, f := range track[1_000:] {
