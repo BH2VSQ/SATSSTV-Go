@@ -616,6 +616,7 @@ type sampleClock struct {
 	afcEnabled     bool
 	afcMaxOffsetHz float64
 	offsetTrace    []AFCOffsetPoint
+	afcSyncStart   int
 }
 
 func (c *sampleClock) skip(ms float64) {
@@ -906,6 +907,7 @@ func (c *sampleClock) syncFromFrequency(durationMS, searchMS float64) bool {
 	}
 	c.pos = bestStart + pulseSamples
 	c.fractional = 0
+	c.afcSyncStart = bestStart
 	c.updateAFC(bestStart, pulseSamples)
 	return true
 }
@@ -1000,7 +1002,7 @@ func (c *sampleClock) recordAFCOffset(previous float64) {
 	if c == nil || math.Abs(c.offset-previous) < 0.25 {
 		return
 	}
-	point := AFCOffsetPoint{SampleIndex: max(0, min(len(c.frequency), c.pos)), OffsetHz: c.offset}
+	point := AFCOffsetPoint{SampleIndex: max(0, min(len(c.frequency), c.afcSyncStart)), OffsetHz: c.offset}
 	if n := len(c.offsetTrace); n > 0 && c.offsetTrace[n-1].SampleIndex == point.SampleIndex {
 		c.offsetTrace[n-1] = point
 		return
