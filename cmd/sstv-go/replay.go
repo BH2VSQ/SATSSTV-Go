@@ -25,6 +25,8 @@ type streamReplayFrame struct {
 	Width                 int     `json:"width"`
 	Height                int     `json:"height"`
 	VIS                   uint8   `json:"vis"`
+	EndSample             int     `json:"end_sample"`
+	EndSeconds            float64 `json:"end_seconds"`
 	AFCInitialHz          float64 `json:"afc_initial_hz"`
 	AFCFinalOffsetHz      float64 `json:"afc_final_offset_hz"`
 	AFCFinalCorrectionHz  float64 `json:"afc_final_correction_hz"`
@@ -37,6 +39,7 @@ type streamReplayFrame struct {
 
 type streamReplayReport struct {
 	InputPath           string              `json:"input_path"`
+	Mode                string              `json:"mode"`
 	SampleRate          int                 `json:"sample_rate"`
 	Samples             int                 `json:"samples"`
 	DurationSeconds     float64             `json:"duration_seconds"`
@@ -59,6 +62,7 @@ func decodeStream(args []string) error {
 	flags := flag.NewFlagSet("decode-stream", flag.ContinueOnError)
 	input := flags.String("in", "", "input mono/stereo 16-bit PCM WAV file")
 	outputDir := flags.String("out-dir", "stream-replay", "output directory for decoded PNG frames and report")
+	mode := flags.String("mode", "auto", "SSTV mode, or auto for VIS detection")
 	afcMax := flags.Float64("afc-max", 1_000, "AFC capture range in Hz (20..1000)")
 	chunkMS := flags.Float64("chunk-ms", 20, "ordered decoder input block duration in milliseconds")
 	if err := flags.Parse(args); err != nil {
@@ -93,12 +97,18 @@ func decodeStream(args []string) error {
 	if err != nil {
 		return err
 	}
+	if !strings.EqualFold(strings.TrimSpace(*mode), "auto") {
+		if err := decoder.SetMode(*mode); err != nil {
+			return fmt.Errorf("select stream mode %q: %w", *mode, err)
+		}
+	}
 	decoder.SetAFC(true, *afcMax)
 	decoder.SetDeferredFrameDecode(true)
 	attenuator := audio.NewAutoAttenuator(sampleRate, audio.DefaultAutoAttenuatorConfig())
 	chunkSamples := max(1, int(math.Round(float64(sampleRate)*(*chunkMS)/1000)))
 	report := streamReplayReport{
 		InputPath: *input,
+		Mode: *mode,
 		SampleRate: sampleRate,
 		Samples: len(samples),
 		DurationSeconds: float64(len(samples)) / float64(sampleRate),
@@ -161,6 +171,8 @@ func decodeStream(args []string) error {
 				Width: event.Mode.Width,
 				Height: event.Mode.Height,
 				VIS: event.VIS,
+				EndSample: end,
+				EndSeconds: float64(end) / float64(sampleRate),
 				AFCInitialHz: event.DecodeRequest.Offset,
 				AFCCorrectionCount: len(offsets),
 			}
@@ -211,8 +223,8 @@ func decodeStream(args []string) error {
 				frame.WaterfallPath = waterfallPath
 			}
 			report.Frames = append(report.Frames, frame)
-			fmt.Printf("Decoded frame %d: %s (%dx%d), AFC correction %+0.1f Hz, %d correction points, raster decode %.1f ms\n",
-				frame.Index, frame.Mode, frame.Width, frame.Height,
+			fmt.Printf("Decoded frame %d at %.3f s: %s (%dx%d), AFC correction %+0.1f Hz, %d correction points, raster decode %.1f ms\n",
+				frame.Index, frame.EndSeconds, frame.Mode, frame.Width, frame.Height,
 				frame.AFCFinalCorrectionHz, frame.AFCCorrectionCount, frame.DecodeMS)
 		}
 	}
