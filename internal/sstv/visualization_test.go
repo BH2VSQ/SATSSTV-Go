@@ -71,3 +71,84 @@ func TestMMSSTVFrequencyHistogramSilenceIsBlack(t *testing.T) {
 func fmtToneCase(rate int, tone float64) string {
 	return fmt.Sprintf("%dHz_%d", int(tone), rate)
 }
+
+
+func TestCorrectedDisplayTrackerMovesRetunedToneBackToNominalFrequency(t *testing.T) {
+	const rate = 48_000
+	const offset = 300.0
+	samples := make([]int16, 8_192)
+	for i := range samples {
+		samples[i] = int16(0.4 * math.Sin(2*math.Pi*2_200*float64(i)/rate) * 32767)
+	}
+	tracker := NewCorrectedDisplayFrequencyTracker(rate)
+	track := tracker.Process(samples, offset)
+	var sum float64
+	count := 0
+	for _, f := range track[1_000:] {
+		if f > 1_700 && f < 2_100 {
+			sum += f
+			count++
+		}
+	}
+	if count == 0 {
+		t.Fatal("no corrected frequency samples were produced")
+	}
+	mean := sum / float64(count)
+	if math.Abs(mean-1_900) > 25 {
+		t.Fatalf("corrected frequency mean = %.1f Hz, want 1900 ±25 Hz", mean)
+	}
+}
+
+func TestFrequencyHistogramFromCorrectedTrackAlignsNominalTones(t *testing.T) {
+	const rate = 48_000
+	track := make([]float64, 8_192)
+	for i := range track {
+		track[i] = 1_900
+	}
+	histogram := FrequencyHistogramFromTrack(track, rate, 2_048, 700, 2_700)
+	peakIndex := 0
+	for i := 1; i < len(histogram); i++ {
+		if histogram[i] > histogram[peakIndex] {
+			peakIndex = i
+		}
+	}
+	peakHz := 700 + float64(peakIndex)*2_000/float64(len(histogram)-1)
+	if math.Abs(peakHz-1_900) > 10 {
+		t.Fatalf("corrected histogram peak = %.1f Hz, want 1900 ±10 Hz", peakHz)
+	}
+}
+
+func TestBuildAFCFrameWaterfallUsesPerLineOffsetHistory(t *testing.T) {
+	const rate = 10_000
+	spec := ModeSpec{
+		Family: FamilyRobot, Width: 320, Height: 4,
+		SyncMS: 1, SyncPorchMS: 1, LumaMS: 4,
+		SeparatorMS: 1, ColorPorchMS: 1, ChromaMS: 2,
+	}
+	const bodyStart = 100
+	frequency := make([]float64, bodyStart+rate)
+	for i := bodyStart; i < bodyStart+100; i++ {
+		frequency[i] = 2_200 // Receiver is 300 Hz high on the first raster line.
+	}
+	for i := bodyStart + 100; i < bodyStart+400; i++ {
+		frequency[i] = 1_500
+	}
+	offsets := []AFCOffsetPoint{
+		{SampleIndex: 0, OffsetHz: 300},
+		{SampleIndex: bodyStart + 100, OffsetHz: 0},
+	}
+	waterfall := BuildAFCFrameWaterfall(frequency, rate, spec, bodyStart, offsets, 201, 700, 2_700)
+	if waterfall == nil || waterfall.Bounds().Dx() != 201 || waterfall.Bounds().Dy() != 4 {
+		t.Fatalf("unexpected waterfall dimensions: %v", waterfall)
+	}
+	// 1900 Hz maps to x=120; 1500 Hz maps to x=80 in a 201-bin 700..2700 plot.
+	if got := waterfall.GrayAt(120, 0).Y; got < 200 {
+		t.Fatalf("first line was not shifted from 2200 to 1900 Hz (pixel intensity %d)", got)
+	}
+	if got := waterfall.GrayAt(80, 1).Y; got < 200 {
+		t.Fatalf("second line did not retain its 1500 Hz frequency (pixel intensity %d)", got)
+	}
+	if got := waterfall.GrayAt(150, 0).Y; got > 10 {
+		t.Fatalf("uncorrected 2200 Hz bin remains bright on first line (intensity %d)", got)
+	}
+}
