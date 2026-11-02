@@ -1030,6 +1030,10 @@ func materializeRXFrameEvent(ctx context.Context, event sstv.StreamEvent) (sstv.
 		event.Image = img
 		event.AFCOffsets = offsets
 		track := event.DecodeRequest.FrequencyTrack()
+		event.FrequencySpectrum = sstv.BuildAFCFrameSpectrum(
+			track, event.DecodeRequest.SampleRate, event.DecodeRequest.Mode,
+			event.DecodeRequest.BodyStart, offsets, 900, 700, 2700,
+		)
 		waterfall := sstv.BuildAFCFrameWaterfall(
 			track, event.DecodeRequest.SampleRate, event.DecodeRequest.Mode,
 			event.DecodeRequest.BodyStart, offsets, 512, 700, 2700,
@@ -1085,6 +1089,7 @@ func (a *App) runRXFrameWorker(ctx context.Context, queue <-chan sstv.StreamEven
 			_, saveErr := a.saveAlbumImage(event.Image, "rx", event.Mode.ID, "实时接收完成")
 			payload := map[string]any{
 				"image": dataURL, "waterfallImage": waterfallURL,
+				"frameSpectrum": event.FrequencySpectrum,
 				"mode": event.Mode.Name, "modeId": event.Mode.ID,
 				"width": event.Mode.Width, "height": event.Mode.Height,
 				"timestamp": now.Format("2006-01-02 15:04:05"),
