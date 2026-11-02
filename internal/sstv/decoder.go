@@ -95,7 +95,11 @@ func detectVISFromRange(samples []int16, freq []float64, sampleRate, startAt int
 			if breakMean < 1_200+offset-220 || breakMean > 1_200+offset+220 {
 				continue
 			}
-			if bestTone(samples[breakStart:breakEnd], sampleRate, 1_200+offset, 1_900+offset) != 1_200+offset {
+			// The short break contains only 10 ms of audio, so a single exact
+			// Goertzel frequency is overly sensitive to small leader-offset error.
+			// headerTone searches a narrow tolerance around both candidates and
+			// returns the expected 1200 Hz symbol when it is the stronger tone.
+			if headerTone(samples[breakStart:breakEnd], sampleRate, 1_200+offset, 1_900+offset) != 1_200+offset {
 				continue
 			}
 			if decoded, after, ok := decodeVISHeaderAtPCM(samples, sampleRate, candidate, offset); ok {
