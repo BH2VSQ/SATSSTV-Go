@@ -421,6 +421,13 @@ func (a *App) startRX(modeID string) error {
 	// every sample while reducing per-block DSP/filter/allocator overhead.
 	captureQueue := make(chan []float32, 32)
 	decodeQueue := make(chan []float32, 8)
+	// Spectrum telemetry is forked before the ordered decoder. A slow Feed()
+	// must never starve the independent spectrum/waterfall view.
+	telemetryQueue := make(chan rxTelemetryBlock, 8)
+	var latestAFCOffset atomic.Uint64
+	var latestDecodeMS atomic.Uint64
+	var decodeQueueDepth atomic.Int64
+	latestAFCOffset.Store(math.Float64bits(0))
 	a.rxQueueDrops.Store(0)
 
 	a.rxDecoderMu.Lock()
@@ -439,10 +446,11 @@ func (a *App) startRX(modeID string) error {
 	a.audioMu.Unlock()
 
 	if err := session.StartReceive(rxCtx, func(block []float32) {
-		// Do not block the capture worker behind DSP/UI work. Bound latency and
-		// explicitly reset the decoder if an exceptional overload loses samples.
+		// Native backends may reuse their callback buffer after returning. Take
+		// one owned copy, then fan it into the capture/aggregation path.
 		if rxCtx.Err() == nil {
-			if dropped := enqueueRXBlock(captureQueue, block); dropped > 0 {
+			owned := append([]float32(nil), block...)
+			if dropped := enqueueRXBlock(captureQueue, owned); dropped > 0 {
 				a.rxQueueDrops.Add(dropped)
 			}
 		}
@@ -462,8 +470,9 @@ func (a *App) startRX(modeID string) error {
 		return err
 	}
 	a.rxModeRequest.Store(&modeID)
-	go aggregateRXAudio(rxCtx, captureQueue, decodeQueue, cfg.SampleRate, &a.rxQueueDrops)
-	go a.runRXWorker(rxCtx, decodeQueue, decoder, fskidDecoder, cfg.SampleRate, session, modeID, cfg)
+	go a.runRXTelemetryWorker(rxCtx, telemetryQueue, cfg.SampleRate, session, &latestAFCOffset, &latestDecodeMS, &decodeQueueDepth, cap(decodeQueue))
+	go aggregateRXAudio(rxCtx, captureQueue, decodeQueue, telemetryQueue, cfg.SampleRate, cfg, session, a, &a.rxQueueDrops)
+	go a.runRXWorker(rxCtx, decodeQueue, decoder, fskidDecoder, cfg.SampleRate, session, modeID, cfg, &latestAFCOffset, &latestDecodeMS, &decodeQueueDepth)
 	a.emitAudioState()
 	return nil
 }
@@ -472,11 +481,36 @@ func (a *App) startRX(modeID string) error {
 // batches. It preserves exact sample order and forwards discontinuity markers
 // only after flushing the pre-gap tail. Both queues remain bounded and use the
 // same stale-audio policy, so capture callbacks never wait for DSP.
-func aggregateRXAudio(ctx context.Context, input <-chan []float32, output chan []float32, sampleRate int, droppedCounter *atomic.Uint64) {
+// aggregateRXAudio coalesces native callback blocks into roughly 20 ms batches,
+// applies the automatic attenuator once, and fans the exact same processed PCM
+// to the ordered decoder and the independent spectrum/waterfall worker. The
+// display queue is lossy/latest-wins; the decoder queue remains ordered and
+// reports discontinuities if its bounded capacity is exceeded.
+func aggregateRXAudio(
+	ctx context.Context,
+	input <-chan []float32,
+	output chan []float32,
+	telemetryOutput chan rxTelemetryBlock,
+	sampleRate int,
+	settings AudioSettings,
+	session appAudioRuntime,
+	capture *App,
+	droppedCounter *atomic.Uint64,
+) {
 	defer close(output)
+	if telemetryOutput != nil {
+		defer close(telemetryOutput)
+	}
 	targetSamples := max(1, sampleRate/50)
 	flushAfter := 20 * time.Millisecond
 	pending := make([]float32, 0, targetSamples*2)
+	attenuator := audio.NewAutoAttenuator(sampleRate, audio.AutoAttenuatorConfig{
+		Enabled: settings.AutoAttenuatorEnabled,
+		TargetDBFS: settings.AttenuatorTargetDBFS,
+		MaxAttenuationDB: settings.AttenuatorMaxReductionDB,
+		Release: 500 * time.Millisecond,
+	})
+	var receivedSamples uint64
 	timer := time.NewTimer(time.Hour)
 	if !timer.Stop() {
 		<-timer.C
@@ -494,20 +528,48 @@ func aggregateRXAudio(ctx context.Context, input <-chan []float32, output chan [
 		}
 		timerActive = false
 	}
+	enqueueDiscontinuity := func() {
+		if dropped := enqueueRXBlock(output, nil); dropped > 0 && droppedCounter != nil {
+			droppedCounter.Add(dropped)
+		}
+		enqueueRXTelemetry(telemetryOutput, rxTelemetryBlock{Discontinuity: true})
+	}
 	flush := func() {
 		if len(pending) == 0 {
 			return
 		}
-		block := append([]float32(nil), pending...)
+		rawBlock := append([]float32(nil), pending...)
 		pending = pending[:0]
 		stopTimer()
-		if dropped := enqueueRXBlock(output, block); dropped > 0 && droppedCounter != nil {
+		receivedSamples += uint64(len(rawBlock))
+		if capture != nil {
+			capture.appendCaptureDump(rawBlock, sampleRate*10)
+		}
+		processedBlock, attenuation := attenuator.Process(rawBlock)
+		if dropped := enqueueRXBlock(output, processedBlock); dropped > 0 && droppedCounter != nil {
 			droppedCounter.Add(dropped)
 		}
-	}
-	enqueue := func(block []float32) {
-		if dropped := enqueueRXBlock(output, block); dropped > 0 && droppedCounter != nil {
-			droppedCounter.Add(dropped)
+		if telemetryOutput != nil {
+			var captureDropped uint64
+			if diagnostics, ok := session.(captureDiagnostics); ok {
+				captureDropped = diagnostics.DroppedCaptureBlocks()
+			}
+			enqueueRXTelemetry(telemetryOutput, rxTelemetryBlock{
+				Samples: processedBlock,
+				InputDBFS: rmsDBFS(rawBlock),
+				InputPeak: attenuation.InputPeak,
+				OutputPeak: attenuation.OutputPeak,
+				AttenuationDB: attenuation.AttenuationDB,
+				InputClippedSamples: attenuation.InputClippedSamples,
+				AutoAttenuator: settings.AutoAttenuatorEnabled,
+				AFCEnabled: settings.AFCEnabled,
+				AFCMaxOffsetHz: settings.AFCMaxOffsetHz,
+				QueueDepth: len(output),
+				QueueCapacity: cap(output),
+				BlockMS: float64(len(processedBlock)) * 1000 / float64(max(1, sampleRate)),
+				ReceivedSamples: receivedSamples,
+				DroppedBlocks: captureDropped,
+			})
 		}
 	}
 	for {
@@ -524,20 +586,19 @@ func aggregateRXAudio(ctx context.Context, input <-chan []float32, output chan [
 				return
 			}
 			if block == nil {
-				// Samples before a known capture gap must reach the decoder before
-				// the reset marker; never merge samples across a missing interval.
+				// Never combine samples across a known gap. Deliver the pre-gap
+				// samples first, then reset both independent consumers.
 				flush()
-				enqueue(nil)
+				attenuator.Reset()
+				enqueueDiscontinuity()
 				continue
 			}
 			if len(block) == 0 {
 				continue
 			}
-			if len(pending) == 0 {
-				if !timerActive {
-					timer.Reset(flushAfter)
-					timerActive = true
-				}
+			if len(pending) == 0 && !timerActive {
+				timer.Reset(flushAfter)
+				timerActive = true
 			}
 			pending = append(pending, block...)
 			if len(pending) >= targetSamples {
