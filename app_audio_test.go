@@ -543,7 +543,7 @@ func TestAggregateRXAudioCoalescesBlocksWithoutChangingSamples(t *testing.T) {
 	input <- []float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
 	input <- []float32{11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
 	close(input)
-	aggregateRXAudio(ctx, input, output, 1_000) // 20 samples = 20 ms
+	aggregateRXAudio(ctx, input, output, 1_000, nil) // 20 samples = 20 ms
 	var got []float32
 	for block := range output {
 		if block == nil {
@@ -575,7 +575,7 @@ func TestAggregateRXAudioPreservesDiscontinuityBoundary(t *testing.T) {
 	input <- []float32{21, 22, 23, 24, 25, 26, 27, 28, 29, 30}
 	input <- []float32{31, 32, 33, 34, 35, 36, 37, 38, 39, 40}
 	close(input)
-	aggregateRXAudio(ctx, input, output, 1_000)
+	aggregateRXAudio(ctx, input, output, 1_000, nil)
 	var blocks [][]float32
 	for block := range output {
 		blocks = append(blocks, block)
