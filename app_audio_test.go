@@ -535,59 +535,80 @@ func TestTelemetryWindowDoesNotRequireFullRateAudioBuffer(t *testing.T) {
 	}
 }
 
-func TestAggregateRXAudioCoalescesBlocksWithoutChangingSamples(t *testing.T) {
+func TestAggregateRXAudioCoalescesBlocksAndFansOutSameProcessedSamples(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	input := make(chan []float32, 4)
 	output := make(chan []float32, 4)
-	input <- []float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-	input <- []float32{11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+	telemetry := make(chan rxTelemetryBlock, 4)
+	input <- []float32{0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10}
+	input <- []float32{0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20}
 	close(input)
-	aggregateRXAudio(ctx, input, output, 1_000, nil) // 20 samples = 20 ms
-	var got []float32
+	aggregateRXAudio(ctx, input, output, telemetry, 1_000, AudioSettings{}, nil, nil, nil) // 20 samples = 20 ms
+	var decoded []float32
 	for block := range output {
 		if block == nil {
 			t.Fatal("unexpected discontinuity marker")
 		}
 		if len(block) != 20 {
-			t.Fatalf("aggregated block length = %d, want 20", len(block))
+			t.Fatalf("aggregated decoder block length = %d, want 20", len(block))
 		}
-		got = append(got, block...)
+		decoded = append(decoded, block...)
 	}
-	if len(got) != 20 {
-		t.Fatalf("received %d samples after aggregation, want 20", len(got))
+	var displayed []float32
+	for item := range telemetry {
+		if item.Discontinuity {
+			t.Fatal("unexpected display discontinuity")
+		}
+		displayed = append(displayed, item.Samples...)
 	}
-	for i := range got {
-		if got[i] != float32(i+1) {
-			t.Fatalf("aggregated sample %d = %.0f, want %d", i, got[i], i+1)
+	if len(decoded) != 20 || len(displayed) != 20 {
+		t.Fatalf("decoder received %d samples and telemetry received %d; want 20 each", len(decoded), len(displayed))
+	}
+	for i := range decoded {
+		if decoded[i] != float32(i+1)/100 {
+			t.Fatalf("decoder sample %d = %.3f, want %.3f", i, decoded[i], float32(i+1)/100)
+		}
+		if displayed[i] != decoded[i] {
+			t.Fatalf("display sample %d = %.3f differs from decoder sample %.3f", i, displayed[i], decoded[i])
 		}
 	}
 }
 
-func TestAggregateRXAudioPreservesDiscontinuityBoundary(t *testing.T) {
+func TestAggregateRXAudioPreservesDiscontinuityBoundaryForBothConsumers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	input := make(chan []float32, 8)
 	output := make(chan []float32, 8)
-	input <- []float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-	input <- []float32{11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+	telemetry := make(chan rxTelemetryBlock, 8)
+	input <- []float32{0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10}
+	input <- []float32{0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20}
 	input <- nil
-	input <- []float32{21, 22, 23, 24, 25, 26, 27, 28, 29, 30}
-	input <- []float32{31, 32, 33, 34, 35, 36, 37, 38, 39, 40}
+	input <- []float32{0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, 0.28, 0.29, 0.30}
+	input <- []float32{0.31, 0.32, 0.33, 0.34, 0.35, 0.36, 0.37, 0.38, 0.39, 0.40}
 	close(input)
-	aggregateRXAudio(ctx, input, output, 1_000, nil)
-	var blocks [][]float32
+	aggregateRXAudio(ctx, input, output, telemetry, 1_000, AudioSettings{}, nil, nil, nil)
+	var decoderBlocks [][]float32
 	for block := range output {
-		blocks = append(blocks, block)
+		decoderBlocks = append(decoderBlocks, block)
 	}
-	if len(blocks) != 3 {
-		t.Fatalf("output contained %d items, want data + gap + data", len(blocks))
+	var displayItems []rxTelemetryBlock
+	for item := range telemetry {
+		displayItems = append(displayItems, item)
 	}
-	if len(blocks[0]) != 20 || blocks[1] != nil || len(blocks[2]) != 20 {
-		t.Fatalf("unexpected aggregate boundaries: lengths %d, gap=%v, %d",
-			len(blocks[0]), blocks[1] == nil, len(blocks[2]))
+	if len(decoderBlocks) != 3 || len(displayItems) != 3 {
+		t.Fatalf("decoder items=%d, telemetry items=%d; want data + gap + data",
+			len(decoderBlocks), len(displayItems))
 	}
-	if blocks[0][0] != 1 || blocks[0][19] != 20 || blocks[2][0] != 21 || blocks[2][19] != 40 {
-		t.Fatalf("aggregator changed sample order across discontinuity: %+v", blocks)
+	if len(decoderBlocks[0]) != 20 || decoderBlocks[1] != nil || len(decoderBlocks[2]) != 20 {
+		t.Fatalf("unexpected decoder boundaries: lengths %d, gap=%v, %d",
+			len(decoderBlocks[0]), decoderBlocks[1] == nil, len(decoderBlocks[2]))
+	}
+	if !displayItems[1].Discontinuity || len(displayItems[0].Samples) != 20 || len(displayItems[2].Samples) != 20 {
+		t.Fatalf("unexpected display discontinuity markers or sample lengths: %+v", displayItems)
+	}
+	if decoderBlocks[0][0] != 0.01 || decoderBlocks[0][19] != 0.20 ||
+		decoderBlocks[2][0] != 0.21 || decoderBlocks[2][19] != 0.40 {
+		t.Fatalf("aggregator changed sample order across discontinuity: %+v", decoderBlocks)
 	}
 }
