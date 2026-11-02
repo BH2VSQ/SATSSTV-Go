@@ -1300,13 +1300,22 @@ func enqueueRXTelemetry(queue chan rxTelemetryBlock, item rxTelemetryBlock) {
 // runRXTelemetryWorker is a best-effort display task. It keeps a short rolling
 // audio window, runs the discriminator only five times per second, and never
 // feeds work back into the ordered SSTV/FSKID queues.
-func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetryBlock, sampleRate int, session appAudioRuntime) {
+func (a *App) runRXTelemetryWorker(
+	ctx context.Context,
+	queue <-chan rxTelemetryBlock,
+	sampleRate int,
+	session appAudioRuntime,
+	latestAFCOffset, latestDecodeMS *atomic.Uint64,
+	decodeQueueDepth *atomic.Int64,
+	decodeQueueCapacity int,
+	droppedCounter *atomic.Uint64,
+) {
 	const (
 		analysisWindowMS = 200
-		updateInterval   = 200 * time.Millisecond
-		noiseFloorDBFS   = -88.0
-		minToneCoverage  = 0.22
-		minToneCrest     = 1.8
+		updateInterval = 200 * time.Millisecond
+		noiseFloorDBFS = -88.0
+		minToneCoverage = 0.22
+		minToneCrest = 1.8
 	)
 	lastTelemetry := time.Time{}
 	lastCaptureError := ""
@@ -1318,11 +1327,17 @@ func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetry
 		select {
 		case <-ctx.Done():
 			return
-		case item := <-queue:
+		case item, ok := <-queue:
+			if !ok {
+				return
+			}
 			if item.Discontinuity {
 				analysisWindow = analysisWindow[:0]
 				if displayTracker != nil {
 					displayTracker.Reset()
+				}
+				if len(item.Samples) == 0 {
+					continue
 				}
 			}
 			if len(item.Samples) == 0 {
@@ -1343,12 +1358,16 @@ func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetry
 			var spectrum []float64
 			peakHz, crest, toneCoverage := 0.0, 0.0, 0.0
 			signalPresent := false
-			// Silence and very weak broadband noise do not need a discriminator
-			// pass. This gate affects only visualization, never SSTV decoding.
 			if level >= noiseFloorDBFS && displayTracker != nil {
+				// Each analysis window is intentionally independent. A discontinuity
+				// in decoder processing cannot freeze or corrupt this display tracker.
 				displayTracker.Reset()
 				pcm := audio.Float32ToPCM16(analysisWindow)
-				correctedFrequency := displayTracker.Process(pcm, item.AFCOffsetHz)
+				offset := 0.0
+				if latestAFCOffset != nil {
+					offset = math.Float64frombits(latestAFCOffset.Load())
+				}
+				correctedFrequency := displayTracker.Process(pcm, offset)
 				toneCoverage = validDisplayFrequencyRatio(correctedFrequency, spectrumMinHz, spectrumMaxHz)
 				if toneCoverage >= minToneCoverage {
 					spectrum = sstv.FrequencyHistogramFromTrack(
@@ -1360,15 +1379,32 @@ func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetry
 				}
 			}
 
-			droppedBlocks := item.DroppedBlocks + a.rxQueueDrops.Swap(0)
+			droppedBlocks := uint64(0)
+			if droppedCounter != nil {
+				droppedBlocks = droppedCounter.Load()
+			}
 			if diagnostics, ok := session.(captureDiagnostics); ok {
-				droppedBlocks = diagnostics.DroppedCaptureBlocks()
+				if count := diagnostics.DroppedCaptureBlocks(); count > droppedBlocks {
+					droppedBlocks = count
+				}
 				if captureErr := diagnostics.CaptureError(); captureErr != "" && captureErr != lastCaptureError {
 					lastCaptureError = captureErr
 					if a.ctx != nil {
 						runtime.EventsEmit(a.ctx, "rx:error", "音频采集回调异常："+captureErr)
 					}
 				}
+			}
+			afcOffset := 0.0
+			if latestAFCOffset != nil {
+				afcOffset = math.Float64frombits(latestAFCOffset.Load())
+			}
+			decodeMS := 0.0
+			if latestDecodeMS != nil {
+				decodeMS = math.Float64frombits(latestDecodeMS.Load())
+			}
+			queueDepth := 0
+			if decodeQueueDepth != nil {
+				queueDepth = int(decodeQueueDepth.Load())
 			}
 			if a.ctx != nil {
 				runtime.EventsEmit(a.ctx, "audio:telemetry", map[string]any{
@@ -1378,12 +1414,12 @@ func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetry
 					"samplesReceived": receivedSamples, "blockSamples": len(item.Samples),
 					"inputPeak": item.InputPeak, "outputPeak": item.OutputPeak,
 					"attenuationDB": item.AttenuationDB,
-					"afcOffsetHz": item.AFCOffsetHz, "afcCorrectionHz": -item.AFCOffsetHz,
+					"afcOffsetHz": afcOffset, "afcCorrectionHz": -afcOffset,
 					"inputClippedSamples": item.InputClippedSamples,
 					"autoAttenuator": item.AutoAttenuator,
 					"afcEnabled": item.AFCEnabled, "afcMaxOffsetHz": item.AFCMaxOffsetHz,
-					"rxQueueDepth": item.QueueDepth, "rxQueueCapacity": item.QueueCapacity,
-					"decodeMs": item.DecodeMS, "blockMs": item.BlockMS,
+					"rxQueueDepth": queueDepth, "rxQueueCapacity": decodeQueueCapacity,
+					"decodeMs": decodeMS, "blockMs": item.BlockMS,
 				})
 			}
 			lastTelemetry = time.Now()
