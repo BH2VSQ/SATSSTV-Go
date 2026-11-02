@@ -74,7 +74,7 @@ func defaultAudioSettings() AudioSettings {
 		SampleRate: 48_000, PTTMode: string(ptt.ModeVOX), ActiveHigh: true,
 		PTTLeadMS: 300, PTTTailMS: 250,
 		AutoAttenuatorEnabled: true, AttenuatorTargetDBFS: -3,
-		AttenuatorMaxReductionDB: 24, AFCEnabled: true, AFCMaxOffsetHz: 300,
+		AttenuatorMaxReductionDB: 24, AFCEnabled: true, AFCMaxOffsetHz: 500,
 	}
 }
 
@@ -149,7 +149,7 @@ func normalizeAudioSettings(cfg AudioSettings) (AudioSettings, error) {
 		return AudioSettings{}, errors.New("自动衰减最大范围必须在 0 至 48 dB 之间")
 	}
 	if cfg.AFCMaxOffsetHz == 0 {
-		cfg.AFCMaxOffsetHz = 300
+		cfg.AFCMaxOffsetHz = 500
 	}
 	if cfg.AFCMaxOffsetHz < 20 || cfg.AFCMaxOffsetHz > 1000 {
 		return AudioSettings{}, errors.New("AFC 最大频偏范围必须在 20 至 1000 Hz 之间")
