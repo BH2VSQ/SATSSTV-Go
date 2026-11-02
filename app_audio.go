@@ -663,6 +663,7 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 	go a.runRXFSKIDWorker(ctx, fskidQueue, fskidDecoder, &fskidDecodedCycle, &fskidFinishedCycle)
 	activeMode := initialMode
 	var afcFrameID uint64
+	lastPreviewRows := 0
 	var fskidCycle rxFSKIDCycle
 	for {
 		select {
@@ -734,6 +735,7 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 					continue
 				}
 				activeMode = *requested
+				lastPreviewRows = 0
 				latestPreviewSequence.Add(1) // do not paint a stale image after mode changes
 			}
 			decodeStarted := time.Now()
@@ -794,7 +796,19 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 			// JPEG/base64 conversion and Wails event delivery run on a separate
 			// latest-wins worker. A slow webview can skip an obsolete preview, but
 			// it can never stall the ordered PCM decoder and overflow audio queues.
+			// Reconstructing a partial image repeatedly costs more than the
+			// incremental audio path: each preview re-decodes all rows received so
+			// far. Publish only a few checkpoints per frame, and reduce that budget
+			// further whenever the ordered PCM queue or Feed cost indicates load.
 			for _, update := range progressiveUpdates {
+				minRowsDelta := max(1, update.TotalRows/4)
+				if queueDepth >= 2 || (blockMS > 0 && telemetry.DecodeMS >= blockMS*0.50) {
+					minRowsDelta = max(minRowsDelta, update.TotalRows/2)
+				}
+				if update.Rows < update.TotalRows && update.Rows-lastPreviewRows < minRowsDelta {
+					continue
+				}
+				lastPreviewRows = update.Rows
 				latestPreviewSequence.Store(update.Sequence)
 				enqueueLatestRXPreview(previewQueue, update)
 			}
@@ -809,6 +823,7 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 				continue
 			}
 			for _, event := range events {
+				lastPreviewRows = 0
 				completedPreviewFrame.Store(event.FrameID)
 				if a.ctx != nil {
 					runtime.EventsEmit(a.ctx, "rx:progress", map[string]any{"active": false, "percent": 100, "mode": event.Mode.Name, "modeId": event.Mode.ID, "rows": event.Mode.Height, "totalRows": event.Mode.Height, "complete": true})
