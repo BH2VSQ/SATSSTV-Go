@@ -639,7 +639,9 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 	})
 	var receivedSamples uint64
 	lastProgress := time.Time{}
-	telemetryQueue := make(chan rxTelemetryBlock, 8)
+	// Display telemetry is expendable. Two blocks are enough for short
+	// scheduler hiccups; the queue always keeps the newest audio window.
+	telemetryQueue := make(chan rxTelemetryBlock, 2)
 	previewQueue := make(chan sstv.StreamUpdate, 1) // latest preview wins; never back-pressure DSP
 	frameQueue := make(chan sstv.StreamEvent, 2)
 	// Forty-millisecond batches keep channel overhead low. A 512-entry queue
@@ -1110,62 +1112,94 @@ func (a *App) runRXFrameWorker(ctx context.Context, queue <-chan sstv.StreamEven
 }
 
 func enqueueRXTelemetry(queue chan rxTelemetryBlock, item rxTelemetryBlock) {
+	if queue == nil {
+		return
+	}
 	select {
 	case queue <- item:
 		return
 	default:
 	}
+	// Spectrum/waterfall are a latest-state display, not a lossless data path.
+	// Discard stale display blocks and mark the newest block as discontinuous
+	// so only the visualization tracker is reset. SSTV PCM is on another queue.
+	item.Discontinuity = true
 	for {
 		select {
 		case <-queue:
 		default:
-			queue <- rxTelemetryBlock{Discontinuity: true}
-			if !item.Discontinuity {
-				queue <- item
+			select {
+			case queue <- item:
+			default:
 			}
 			return
 		}
 	}
 }
 
-// runRXTelemetryWorker computes UI-only spectrum data away from the ordered
-// decoder path. Intermediate telemetry blocks may be coalesced; the SSTV PCM
-// stream itself is never coalesced here.
+// runRXTelemetryWorker is a best-effort display task. It keeps a short rolling
+// audio window, runs the discriminator only five times per second, and never
+// feeds work back into the ordered SSTV/FSKID queues.
 func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetryBlock, sampleRate int, session appAudioRuntime) {
+	const (
+		analysisWindowMS = 120
+		updateInterval   = 200 * time.Millisecond
+		noiseFloorDBFS   = -88.0
+		minToneCoverage  = 0.22
+		minToneCrest     = 1.8
+	)
 	lastTelemetry := time.Time{}
 	lastCaptureError := ""
 	receivedSamples := uint64(0)
 	displayTracker := sstv.NewCorrectedDisplayFrequencyTracker(sampleRate)
-	frequencyWindow := make([]float64, 0, spectrumFFTSize)
-	windowSamples := sstv.MMSSTVSpectrumWindowSamples(sampleRate)
-	cadence := time.Duration(float64(windowSamples) / float64(max(1, sampleRate)) * float64(time.Second))
+	windowSamples := max(256, sampleRate*analysisWindowMS/1000)
+	analysisWindow := make([]float32, 0, windowSamples)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case item := <-queue:
 			if item.Discontinuity {
-				frequencyWindow = frequencyWindow[:0]
-				displayTracker = sstv.NewCorrectedDisplayFrequencyTracker(sampleRate)
-				lastTelemetry = time.Time{}
-				continue
+				analysisWindow = analysisWindow[:0]
+				if displayTracker != nil {
+					displayTracker.Reset()
+				}
 			}
 			if len(item.Samples) == 0 {
 				continue
 			}
 			receivedSamples = item.ReceivedSamples
-			pcm := audio.Float32ToPCM16(item.Samples)
-			correctedFrequency := displayTracker.Process(pcm, item.AFCOffsetHz)
-			frequencyWindow = append(frequencyWindow, correctedFrequency...)
-			if len(frequencyWindow) > windowSamples {
-				frequencyWindow = append(frequencyWindow[:0], frequencyWindow[len(frequencyWindow)-windowSamples:]...)
+			analysisWindow = append(analysisWindow, item.Samples...)
+			if len(analysisWindow) > windowSamples {
+				excess := len(analysisWindow) - windowSamples
+				copy(analysisWindow, analysisWindow[excess:])
+				analysisWindow = analysisWindow[:windowSamples]
 			}
-			if len(frequencyWindow) < windowSamples || time.Since(lastTelemetry) < cadence {
+			if len(analysisWindow) < windowSamples || time.Since(lastTelemetry) < updateInterval {
 				continue
 			}
-			level := rmsDBFS(item.Samples)
-			spectrum := sstv.FrequencyHistogramFromTrack(frequencyWindow, sampleRate, spectrumBins, spectrumMinHz, spectrumMaxHz)
-			peakHz, crest := spectrumPeak(spectrum)
+
+			level := rmsDBFS(analysisWindow)
+			var spectrum []float64
+			peakHz, crest, toneCoverage := 0.0, 0.0, 0.0
+			signalPresent := false
+			// Silence and very weak broadband noise do not need a discriminator
+			// pass. This gate affects only visualization, never SSTV decoding.
+			if level >= noiseFloorDBFS && displayTracker != nil {
+				displayTracker.Reset()
+				pcm := audio.Float32ToPCM16(analysisWindow)
+				correctedFrequency := displayTracker.Process(pcm, item.AFCOffsetHz)
+				toneCoverage = validDisplayFrequencyRatio(correctedFrequency, spectrumMinHz, spectrumMaxHz)
+				if toneCoverage >= minToneCoverage {
+					spectrum = sstv.FrequencyHistogramFromTrack(
+						correctedFrequency, displayTracker.SampleRate(),
+						spectrumBins, spectrumMinHz, spectrumMaxHz,
+					)
+					peakHz, crest = spectrumPeak(spectrum)
+					signalPresent = crest >= minToneCrest
+				}
+			}
+
 			droppedBlocks := item.DroppedBlocks + a.rxQueueDrops.Swap(0)
 			if diagnostics, ok := session.(captureDiagnostics); ok {
 				droppedBlocks = diagnostics.DroppedCaptureBlocks()
@@ -1179,6 +1213,7 @@ func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetry
 			if a.ctx != nil {
 				runtime.EventsEmit(a.ctx, "audio:telemetry", map[string]any{
 					"dbfs": level, "inputDbfs": item.InputDBFS, "spectrum": spectrum,
+					"signalPresent": signalPresent, "toneCoverage": toneCoverage,
 					"peakHz": peakHz, "crest": crest, "droppedBlocks": droppedBlocks,
 					"samplesReceived": receivedSamples, "blockSamples": len(item.Samples),
 					"inputPeak": item.InputPeak, "outputPeak": item.OutputPeak,
@@ -1194,6 +1229,19 @@ func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetry
 			lastTelemetry = time.Now()
 		}
 	}
+}
+
+func validDisplayFrequencyRatio(track []float64, minHz, maxHz float64) float64 {
+	if len(track) == 0 || maxHz <= minHz {
+		return 0
+	}
+	valid := 0
+	for _, frequency := range track {
+		if frequency >= minHz && frequency <= maxHz && !math.IsNaN(frequency) && !math.IsInf(frequency, 0) {
+			valid++
+		}
+	}
+	return float64(valid) / float64(len(track))
 }
 
 func rmsDBFS(samples []float32) float64 {
