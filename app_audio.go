@@ -462,7 +462,7 @@ func (a *App) startRX(modeID string) error {
 		return err
 	}
 	a.rxModeRequest.Store(&modeID)
-	go aggregateRXAudio(rxCtx, captureQueue, decodeQueue, cfg.SampleRate)
+	go aggregateRXAudio(rxCtx, captureQueue, decodeQueue, cfg.SampleRate, &a.rxQueueDrops)
 	go a.runRXWorker(rxCtx, decodeQueue, decoder, fskidDecoder, cfg.SampleRate, session, modeID, cfg)
 	a.emitAudioState()
 	return nil
@@ -472,7 +472,7 @@ func (a *App) startRX(modeID string) error {
 // batches. It preserves exact sample order and forwards discontinuity markers
 // only after flushing the pre-gap tail. Both queues remain bounded and use the
 // same stale-audio policy, so capture callbacks never wait for DSP.
-func aggregateRXAudio(ctx context.Context, input <-chan []float32, output chan []float32, sampleRate int) {
+func aggregateRXAudio(ctx context.Context, input <-chan []float32, output chan []float32, sampleRate int, droppedCounter *atomic.Uint64) {
 	defer close(output)
 	targetSamples := max(1, sampleRate/50)
 	flushAfter := 20 * time.Millisecond
@@ -501,7 +501,14 @@ func aggregateRXAudio(ctx context.Context, input <-chan []float32, output chan [
 		block := append([]float32(nil), pending...)
 		pending = pending[:0]
 		stopTimer()
-		enqueueRXBlock(output, block)
+		if dropped := enqueueRXBlock(output, block); dropped > 0 && droppedCounter != nil {
+			droppedCounter.Add(dropped)
+		}
+	}
+	enqueue := func(block []float32) {
+		if dropped := enqueueRXBlock(output, block); dropped > 0 && droppedCounter != nil {
+			droppedCounter.Add(dropped)
+		}
 	}
 	for {
 		select {
@@ -520,7 +527,7 @@ func aggregateRXAudio(ctx context.Context, input <-chan []float32, output chan [
 				// Samples before a known capture gap must reach the decoder before
 				// the reset marker; never merge samples across a missing interval.
 				flush()
-				enqueueRXBlock(output, nil)
+				enqueue(nil)
 				continue
 			}
 			if len(block) == 0 {
