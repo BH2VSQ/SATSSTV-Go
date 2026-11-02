@@ -460,7 +460,7 @@ func DecodeMode(ctx context.Context, samples []int16, sampleRate int, modeID str
 // frequency track. StreamDecoder uses it to refresh a live preview without
 // re-running the PLL over the audio received so far.
 func decodeModeFromFrequency(ctx context.Context, freq []float64, sampleRate int, spec ModeSpec, bodyStart int, pcm []int16, offset float64) (*image.NRGBA, error) {
-	return decodeModeFromFrequencyWithAFC(ctx, freq, sampleRate, spec, bodyStart, pcm, offset, true, 300)
+	return decodeModeFromFrequencyWithAFC(ctx, freq, sampleRate, spec, bodyStart, pcm, offset, false, 300)
 }
 
 func decodeModeFromFrequencyWithAFC(ctx context.Context, freq []float64, sampleRate int, spec ModeSpec, bodyStart int, pcm []int16, offset float64, afcEnabled bool, afcMaxOffsetHz float64) (*image.NRGBA, error) {
@@ -474,7 +474,7 @@ func decodeModeFromFrequencyWithAFC(ctx context.Context, freq []float64, sampleR
 // still goes through decodeModeFromFrequency with the full row count and PCM
 // sync recovery.
 func decodeModeRowsFromFrequency(ctx context.Context, freq []float64, sampleRate int, spec ModeSpec, bodyStart int, pcm []int16, offset float64, rows int) (*image.NRGBA, error) {
-	return decodeModeRowsFromFrequencyWithAFC(ctx, freq, sampleRate, spec, bodyStart, pcm, offset, true, 300, rows)
+	return decodeModeRowsFromFrequencyWithAFC(ctx, freq, sampleRate, spec, bodyStart, pcm, offset, false, 300, rows)
 }
 
 func decodeModeRowsFromFrequencyWithAFC(ctx context.Context, freq []float64, sampleRate int, spec ModeSpec, bodyStart int, pcm []int16, offset float64, afcEnabled bool, afcMaxOffsetHz float64, rows int) (*image.NRGBA, error) {
@@ -1462,7 +1462,7 @@ func NewStreamDecoder(sampleRate int) (*StreamDecoder, error) {
 	if sampleRate < 8_000 || sampleRate > 192_000 {
 		return nil, fmt.Errorf("invalid sample rate %d", sampleRate)
 	}
-	return &StreamDecoder{rate: sampleRate, maxIdle: sampleRate * 12, afcEnabled: true, afcMaxOffsetHz: 300}, nil
+	return &StreamDecoder{rate: sampleRate, maxIdle: sampleRate * 12, afcMaxOffsetHz: 300}, nil
 }
 
 // SetAFC configures line-sync frequency-offset tracking. A maximum of 300 Hz
