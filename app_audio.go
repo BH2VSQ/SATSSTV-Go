@@ -470,7 +470,7 @@ func (a *App) startRX(modeID string) error {
 		return err
 	}
 	a.rxModeRequest.Store(&modeID)
-	go a.runRXTelemetryWorker(rxCtx, telemetryQueue, cfg.SampleRate, session, &latestAFCOffset, &latestDecodeMS, &decodeQueueDepth, cap(decodeQueue))
+	go a.runRXTelemetryWorker(rxCtx, telemetryQueue, cfg.SampleRate, session, &latestAFCOffset, &latestDecodeMS, &decodeQueueDepth, cap(decodeQueue), &a.rxQueueDrops)
 	go aggregateRXAudio(rxCtx, captureQueue, decodeQueue, telemetryQueue, cfg.SampleRate, cfg, session, a, &a.rxQueueDrops)
 	go a.runRXWorker(rxCtx, decodeQueue, decoder, fskidDecoder, cfg.SampleRate, session, modeID, cfg, &latestAFCOffset, &latestDecodeMS, &decodeQueueDepth)
 	a.emitAudioState()
@@ -546,8 +546,16 @@ func aggregateRXAudio(
 			capture.appendCaptureDump(rawBlock, sampleRate*10)
 		}
 		processedBlock, attenuation := attenuator.Process(rawBlock)
-		if dropped := enqueueRXBlock(output, processedBlock); dropped > 0 && droppedCounter != nil {
-			droppedCounter.Add(dropped)
+		dropped := enqueueRXBlock(output, processedBlock)
+		if dropped > 0 {
+			if droppedCounter != nil {
+				droppedCounter.Add(dropped)
+			}
+			// Decoder PCM was dropped and its queue now contains a discontinuity
+			// marker. Keep the visualization timeline honest by inserting the
+			// same marker before this block's spectrum data.
+			attenuator.Reset()
+			enqueueRXTelemetry(telemetryOutput, rxTelemetryBlock{Discontinuity: true})
 		}
 		if telemetryOutput != nil {
 			var captureDropped uint64
