@@ -33,6 +33,10 @@ func main() {
 		if err := decode(os.Args[2:]); err != nil {
 			log.Fatal(err)
 		}
+	case "decode-stream":
+		if err := decodeStream(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -47,7 +51,10 @@ func usage() {
 Usage:
   sstv-go modes
   sstv-go encode -in image.png -out transmission.wav [-mode robot36] [-rate 48000]
+  sstv-go decode-stream -in capture.wav -out-dir decoded [-afc-max 1000] [-chunk-ms 20]
 
+decode-stream replays PCM through the production StreamDecoder and dynamic
+attenuator in ordered chunks and reports per-block real-time processing cost.
 The CLI lists, encodes, and decodes the registered SSTV mode catalog.`)
 }
 
