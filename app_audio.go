@@ -774,16 +774,19 @@ func (c *rxFSKIDCycle) ResetAfterCaptureGap() bool {
 	return c != nil && c.Searching()
 }
 
-func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *sstv.StreamDecoder, fskidDecoder *sstv.FSKIDDecoder, sampleRate int, session appAudioRuntime, initialMode string, settings AudioSettings) {
-	attenuator := audio.NewAutoAttenuator(sampleRate, audio.AutoAttenuatorConfig{
-		Enabled: settings.AutoAttenuatorEnabled, TargetDBFS: settings.AttenuatorTargetDBFS,
-		MaxAttenuationDB: settings.AttenuatorMaxReductionDB, Release: 500 * time.Millisecond,
-	})
-	var receivedSamples uint64
+func (a *App) runRXWorker(
+	ctx context.Context,
+	queue <-chan []float32,
+	decoder *sstv.StreamDecoder,
+	fskidDecoder *sstv.FSKIDDecoder,
+	sampleRate int,
+	session appAudioRuntime,
+	initialMode string,
+	settings AudioSettings,
+	latestAFCOffset, latestDecodeMS *atomic.Uint64,
+	decodeQueueDepth *atomic.Int64,
+) {
 	lastProgress := time.Time{}
-	// Display telemetry is expendable. Two blocks are enough for short
-	// scheduler hiccups; the queue always keeps the newest audio window.
-	telemetryQueue := make(chan rxTelemetryBlock, 2)
 	previewQueue := make(chan sstv.StreamUpdate, 1) // latest preview wins; never back-pressure DSP
 	frameQueue := make(chan sstv.StreamEvent, 2)
 	// Forty-millisecond batches keep channel overhead low. A 512-entry queue
@@ -795,11 +798,8 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 	fskidBatch := make([]int16, 0, fskidBatchSamples*2)
 	var latestPreviewSequence atomic.Uint64
 	var completedPreviewFrame atomic.Uint64
-	var latestAFCOffset atomic.Uint64
-	latestAFCOffset.Store(math.Float64bits(0))
 	var fskidDecodedCycle atomic.Uint64
 	var fskidFinishedCycle atomic.Uint64
-	go a.runRXTelemetryWorker(ctx, telemetryQueue, sampleRate, session)
 	go a.runRXPreviewWorker(ctx, previewQueue, &latestPreviewSequence, &completedPreviewFrame, &latestAFCOffset)
 	go a.runRXFrameWorker(ctx, frameQueue)
 	go a.runRXFSKIDWorker(ctx, fskidQueue, fskidDecoder, &fskidDecodedCycle, &fskidFinishedCycle)
@@ -816,9 +816,13 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 				return
 			}
 			queueDepth := len(queue)
+			if decodeQueueDepth != nil {
+				decodeQueueDepth.Store(int64(queueDepth))
+			}
 			if block == nil {
-				attenuator.Reset()
-				latestAFCOffset.Store(math.Float64bits(0))
+				if latestAFCOffset != nil {
+					latestAFCOffset.Store(math.Float64bits(0))
+				}
 				// The capture backend discarded a stale queue backlog. The SSTV
 				// raster must be reset because its line/sample clock crossed a gap.
 				// However, if a picture has already completed, MMSSTV sends FSKID
@@ -830,7 +834,6 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 				resetRXFSKIDAfterCaptureDiscontinuity(
 					fskidQueue, &fskidCycle, &fskidBatch, &fskidDecodedCycle,
 				)
-				enqueueRXTelemetry(telemetryQueue, rxTelemetryBlock{Discontinuity: true})
 				lastProgress = time.Time{}
 				if a.ctx != nil {
 					runtime.EventsEmit(a.ctx, "rx:progress", map[string]any{"active": false, "percent": 0})
@@ -841,30 +844,10 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 			if len(block) == 0 {
 				continue
 			}
-			receivedSamples += uint64(len(block))
 			blockMS := float64(len(block)) * 1000 / float64(max(1, sampleRate))
-			// Preserve raw samples for diagnostics, but attenuate before PCM
-			// conversion so the decoder and spectrum share the same safe signal.
-			rawBlock := block
-			processedBlock, attenuation := attenuator.Process(rawBlock)
-			pcm := audio.Float32ToPCM16(processedBlock)
-			var droppedBlocks uint64
-			if diagnostics, ok := session.(captureDiagnostics); ok {
-				droppedBlocks = diagnostics.DroppedCaptureBlocks()
-			}
-			telemetry := rxTelemetryBlock{
-				Samples: processedBlock, InputDBFS: rmsDBFS(rawBlock),
-				InputPeak: attenuation.InputPeak, OutputPeak: attenuation.OutputPeak,
-				AttenuationDB: attenuation.AttenuationDB,
-				InputClippedSamples: attenuation.InputClippedSamples,
-				AutoAttenuator: settings.AutoAttenuatorEnabled,
-				AFCEnabled: settings.AFCEnabled, AFCMaxOffsetHz: settings.AFCMaxOffsetHz,
-				ReceivedSamples: receivedSamples, DroppedBlocks: droppedBlocks,
-				QueueDepth: queueDepth, QueueCapacity: cap(queue), BlockMS: blockMS,
-			}
-			// Spectrum is visualization-only and must never hold SSTV decoding.
-			// Capture dumps intentionally retain the unprocessed input for diagnosis.
-			a.appendCaptureDump(rawBlock, sampleRate*10)
+			// Automatic gain control and spectrum fan-out already happened in the
+			// upstream aggregator. Decode exactly the same processed PCM samples.
+			pcm := audio.Float32ToPCM16(block)
 
 			// FSKID is transmitted after the analog picture. Scanning every live
 			// SSTV pixel as a possible preamble is expensive and can false-lock on
@@ -885,12 +868,17 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 			}
 			decodeStarted := time.Now()
 			events, err := decoder.Feed(ctx, pcm)
+			decodeMS := float64(time.Since(decodeStarted)) / float64(time.Millisecond)
+			if latestDecodeMS != nil {
+				latestDecodeMS.Store(math.Float64bits(decodeMS))
+			}
 			if frameID, offsetHz, active := decoder.AFCState(); active && frameID != afcFrameID {
 				afcFrameID = frameID
-				latestAFCOffset.Store(math.Float64bits(offsetHz))
+				if latestAFCOffset != nil {
+					latestAFCOffset.Store(math.Float64bits(offsetHz))
+				}
 			}
 			progress, progressActive := decoder.Progress()
-			telemetry.DecodeMS = float64(time.Since(decodeStarted)) / float64(time.Millisecond)
 			progressiveUpdates := decoder.DrainUpdates()
 			var trailingFrameAudio []int16
 			if len(events) > 0 {
@@ -900,8 +888,6 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 				trailingFrameAudio = decoder.PendingAudio()
 			}
 			a.rxDecoderMu.Unlock()
-			telemetry.AFCOffsetHz = math.Float64frombits(latestAFCOffset.Load())
-			enqueueRXTelemetry(telemetryQueue, telemetry)
 
 			// Process the completion signal before checking ActiveMode. Feed may
 			// finish one frame and detect the next frame from the tail of the same
@@ -947,7 +933,7 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 			// further whenever the ordered PCM queue or Feed cost indicates load.
 			for _, update := range progressiveUpdates {
 				minRowsDelta := max(1, update.TotalRows/4)
-				if queueDepth >= 2 || (blockMS > 0 && telemetry.DecodeMS >= blockMS*0.50) {
+				if queueDepth >= 2 || (blockMS > 0 && decodeMS >= blockMS*0.50) {
 					minRowsDelta = max(minRowsDelta, update.TotalRows/2)
 				}
 				if update.Rows < update.TotalRows && update.Rows-lastPreviewRows < minRowsDelta {
