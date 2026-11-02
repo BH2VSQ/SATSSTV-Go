@@ -655,11 +655,12 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 	latestAFCOffset.Store(math.Float64bits(0))
 	var fskidDecodedCycle atomic.Uint64
 	var fskidFinishedCycle atomic.Uint64
-	go a.runRXTelemetryWorker(ctx, telemetryQueue, sampleRate, session, &latestAFCOffset)
+	go a.runRXTelemetryWorker(ctx, telemetryQueue, sampleRate, session)
 	go a.runRXPreviewWorker(ctx, previewQueue, &latestPreviewSequence, &completedPreviewFrame, &latestAFCOffset)
-	go a.runRXFrameWorker(ctx, frameQueue, &latestAFCOffset)
+	go a.runRXFrameWorker(ctx, frameQueue)
 	go a.runRXFSKIDWorker(ctx, fskidQueue, fskidDecoder, &fskidDecodedCycle, &fskidFinishedCycle)
 	activeMode := initialMode
+	var afcFrameID uint64
 	var fskidCycle rxFSKIDCycle
 	for {
 		select {
@@ -669,6 +670,7 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 			queueDepth := len(queue)
 			if block == nil {
 				attenuator.Reset()
+				latestAFCOffset.Store(math.Float64bits(0))
 				// The capture backend discarded a stale queue backlog. The SSTV
 				// raster must be reset because its line/sample clock crossed a gap.
 				// However, if a picture has already completed, MMSSTV sends FSKID
@@ -734,6 +736,10 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 			}
 			decodeStarted := time.Now()
 			events, err := decoder.Feed(ctx, pcm)
+			if frameID, offsetHz, active := decoder.AFCState(); active && frameID != afcFrameID {
+				afcFrameID = frameID
+				latestAFCOffset.Store(math.Float64bits(offsetHz))
+			}
 			progress, progressActive := decoder.Progress()
 			telemetry.DecodeMS = float64(time.Since(decodeStarted)) / float64(time.Millisecond)
 			progressiveUpdates := decoder.DrainUpdates()
@@ -1052,7 +1058,7 @@ func materializeRXFrameEvent(ctx context.Context, event sstv.StreamEvent) (sstv.
 	return event, nil
 }
 
-func (a *App) runRXFrameWorker(ctx context.Context, queue <-chan sstv.StreamEvent, latestAFCOffset *atomic.Uint64) {
+func (a *App) runRXFrameWorker(ctx context.Context, queue <-chan sstv.StreamEvent) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -1077,9 +1083,6 @@ func (a *App) runRXFrameWorker(ctx context.Context, queue <-chan sstv.StreamEven
 			offsetHz := 0.0
 			if len(event.AFCOffsets) > 0 {
 				offsetHz = event.AFCOffsets[len(event.AFCOffsets)-1].OffsetHz
-				if latestAFCOffset != nil {
-					latestAFCOffset.Store(math.Float64bits(offsetHz))
-				}
 			}
 			waterfallURL := ""
 			if len(event.WaterfallPNG) > 0 {
@@ -1128,7 +1131,7 @@ func enqueueRXTelemetry(queue chan rxTelemetryBlock, item rxTelemetryBlock) {
 // runRXTelemetryWorker computes UI-only spectrum data away from the ordered
 // decoder path. Intermediate telemetry blocks may be coalesced; the SSTV PCM
 // stream itself is never coalesced here.
-func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetryBlock, sampleRate int, session appAudioRuntime, latestAFCOffset *atomic.Uint64) {
+func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetryBlock, sampleRate int, session appAudioRuntime) {
 	lastTelemetry := time.Time{}
 	lastCaptureError := ""
 	receivedSamples := uint64(0)
@@ -1142,7 +1145,8 @@ func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetry
 			return
 		case item := <-queue:
 			if item.Discontinuity {
-					frequencyWindow = frequencyWindow[:0]
+				frequencyWindow = frequencyWindow[:0]
+				displayTracker = sstv.NewCorrectedDisplayFrequencyTracker(sampleRate)
 				lastTelemetry = time.Time{}
 				continue
 			}
