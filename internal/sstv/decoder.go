@@ -1720,6 +1720,17 @@ func (d *StreamDecoder) SetAFC(enabled bool, maxOffsetHz float64) {
 	d.afcMaxOffsetHz = maxOffsetHz
 }
 
+// AFCState returns the active frame ID and its initial VIS-leader offset.
+// The frame ID changes only when a new valid header is acquired, allowing an
+// audio pipeline to reset display correction once per frame without overwriting
+// the line-by-line AFC updates with the original leader estimate.
+func (d *StreamDecoder) AFCState() (frameID uint64, offsetHz float64, active bool) {
+	if d == nil || d.mode == nil {
+		return 0, 0, false
+	}
+	return d.frameID, d.offset, true
+}
+
 // Feed appends one captured PCM block and returns every complete image now
 // available. It also prepares progressive image snapshots as raster rows
 // arrive, keeping PLL state between input blocks.
