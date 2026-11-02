@@ -1,6 +1,10 @@
 package sstv
 
-import "math"
+import (
+	"image"
+	"image/color"
+	"math"
+)
 
 // MMSSTVSpectrumWindowSamples returns the raw mono PCM window length used by
 // MMSSTV's frequency-occupancy spectrum at the supplied input sample rate.
@@ -158,4 +162,163 @@ func (f *mmsstvFQC) Do(sample float64) float64 {
 	f.previous = sample
 	f.samplePos++
 	return 1900 + filtered*400
+}
+
+
+// CorrectedDisplayFrequencyTracker produces the discriminator track used by the
+// RX spectrum and waterfall. It consumes the same attenuated PCM as the image
+// decoder and subtracts the current AFC offset before frequency histogramming.
+type CorrectedDisplayFrequencyTracker struct {
+	tracker *frequencyTracker
+	filter  biquad
+}
+
+// NewCorrectedDisplayFrequencyTracker creates a wide-offset display tracker.
+// The wide passband is required because the radio may be retuned several
+// hundred hertz away from nominal SSTV tones before AFC reacquires the signal.
+func NewCorrectedDisplayFrequencyTracker(sampleRate int) *CorrectedDisplayFrequencyTracker {
+	if sampleRate < 8_000 || sampleRate > 192_000 {
+		return nil
+	}
+	filter := mmsstvFQCLowPass(400, float64(sampleRate))
+	const zeroFrequency = -1900.0 / 400.0
+	filter.x1, filter.x2 = zeroFrequency, zeroFrequency
+	filter.y1, filter.y2 = zeroFrequency, zeroFrequency
+	return &CorrectedDisplayFrequencyTracker{
+		tracker: newStreamFrequencyTracker(sampleRate, true),
+		filter:  filter,
+	}
+}
+
+// Process returns sample-aligned frequency values after applying the supplied
+// AFC offset. A positive measured receiver offset is subtracted from the input
+// frequencies so standard SSTV tones return to their nominal coordinates.
+func (t *CorrectedDisplayFrequencyTracker) Process(samples []int16, afcOffsetHz float64) []float64 {
+	if t == nil || t.tracker == nil || len(samples) == 0 {
+		return nil
+	}
+	raw := t.tracker.Process(samples)
+	out := make([]float64, len(raw))
+	for i, frequency := range raw {
+		if frequency < 80 || frequency > 3_900 || math.IsNaN(frequency) || math.IsInf(frequency, 0) {
+			continue
+		}
+		normalized := (frequency - afcOffsetHz - 1900) / 400
+		out[i] = 1900 + t.filter.Do(normalized)*400
+	}
+	return out
+}
+
+// FrequencyHistogramFromTrack creates an MMSSTV-style frequency-occupancy
+// spectrum from an already AFC-corrected discriminator track. Unlike the
+// legacy PCM histogram, it does not apply a second independent discriminator.
+func FrequencyHistogramFromTrack(frequency []float64, sampleRate, bins int, minHz, maxHz float64) []float64 {
+	out := make([]float64, max(0, bins))
+	if len(frequency) < 16 || sampleRate < 8_000 || bins < 2 || minHz < 0 || maxHz <= minHz {
+		return out
+	}
+	decimation := 1
+	switch {
+	case sampleRate >= 43_000:
+		decimation = 4
+	case sampleRate >= 23_000:
+		decimation = 2
+	}
+	effectiveRate := sampleRate / decimation
+	const fftSize = 2048.0
+	const adjacent = 15.0
+	const centre = 30.0
+	const ceiling = 720.0
+	occupancy := make([]float64, 2048)
+	for i := 0; i < len(frequency); i += decimation {
+		f := frequency[i]
+		if f < minHz || f > maxHz || math.IsNaN(f) || math.IsInf(f, 0) {
+			continue
+		}
+		index := int(f * fftSize / float64(effectiveRate))
+		if index < 1 || index >= len(occupancy)-1 {
+			continue
+		}
+		if occupancy[index] < ceiling {
+			occupancy[index] = math.Min(ceiling, occupancy[index]+centre)
+			occupancy[index-1] += adjacent
+			occupancy[index+1] += adjacent
+		}
+	}
+	maximum := 0.0
+	for _, value := range occupancy {
+		if value > maximum {
+			maximum = value
+		}
+	}
+	if maximum <= 0 {
+		return out
+	}
+	for i := range out {
+		f := minHz + float64(i)*(maxHz-minHz)/float64(bins-1)
+		index := int(f * fftSize / float64(effectiveRate))
+		if index >= 0 && index < len(occupancy) {
+			out[i] = math.Min(1, occupancy[index]/maximum)
+		}
+	}
+	return out
+}
+
+// BuildAFCFrameWaterfall creates a complete, frame-aligned waterfall from the
+// exact discriminator track and AFC correction points used by the decoder.
+// Each image row represents one SSTV raster-line time interval; x represents
+// standard corrected audio frequency from minHz to maxHz.
+func BuildAFCFrameWaterfall(frequency []float64, sampleRate int, spec ModeSpec, bodyStart int, offsets []AFCOffsetPoint, width int, minHz, maxHz float64) *image.Gray {
+	if sampleRate < 8_000 || spec.Height <= 0 || bodyStart < 0 || bodyStart >= len(frequency) || width < 2 || maxHz <= minHz {
+		return nil
+	}
+	bodyEnd := min(len(frequency), bodyStart+int(math.Round(BodyDurationMS(spec)*float64(sampleRate)/1000)))
+	if bodyEnd <= bodyStart {
+		return nil
+	}
+	img := image.NewGray(image.Rect(0, 0, width, spec.Height))
+	offsetIndex := 0
+	currentOffset := 0.0
+	for row := 0; row < spec.Height; row++ {
+		start := bodyStart + (bodyEnd-bodyStart)*row/spec.Height
+		end := bodyStart + (bodyEnd-bodyStart)*(row+1)/spec.Height
+		if end <= start {
+			continue
+		}
+		hist := make([]float64, width)
+		for sample := start; sample < end; sample++ {
+			for offsetIndex < len(offsets) && offsets[offsetIndex].SampleIndex <= sample {
+				currentOffset = offsets[offsetIndex].OffsetHz
+				offsetIndex++
+			}
+			f := frequency[sample]
+			if f <= 80 || f >= 3_900 || math.IsNaN(f) || math.IsInf(f, 0) {
+				continue
+			}
+			f -= currentOffset
+			if f < minHz || f > maxHz {
+				continue
+			}
+			x := int(math.Round((f-minHz)*float64(width-1)/(maxHz-minHz)))
+			if x >= 0 && x < width {
+				hist[x]++
+			}
+		}
+		peak := 0.0
+		for _, value := range hist {
+			if value > peak {
+				peak = value
+			}
+		}
+		if peak <= 0 {
+			continue
+		}
+		for x, value := range hist {
+			// Square-root compression keeps weak, narrow tones visible while
+			// retaining strong sync and porch structures without saturation.
+			intensity := math.Sqrt(value / peak)
+			img.SetGray(x, row, color.Gray{Y: uint8(math.Round(255 * intensity))})
+		}
+	}
+	return img
 }
