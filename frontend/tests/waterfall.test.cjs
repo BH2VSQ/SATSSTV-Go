@@ -22,6 +22,8 @@ function createHarness(nextRow) {
     MAX_WATERFALL_ROWS: 64,
     waterfallOff: { width: 2048, height: 64 },
     waterfallNextRow: nextRow,
+    // No completed frame is active in this ring-buffer-only unit test.
+    completedWaterfallImage: null,
   };
   vm.createContext(sandbox);
   vm.runInContext(drawWaterfallSource, sandbox);
