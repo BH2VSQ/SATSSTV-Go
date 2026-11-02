@@ -56,7 +56,7 @@ func detectVISFromRange(samples []int16, freq []float64, sampleRate, startAt int
 	}
 
 	fineStep := max(1, sampleRate/4000)
-	quickStride := max(1, sampleRate/1_000)
+	quickStride := max(1, sampleRate/8_000)
 	for coarse := start; coarse <= maxStart; coarse += step {
 		// Reject noisy windows before entering the raw-PCM Goertzel header
 		// classifier. The 1900 Hz VIS leader is a sustained narrow tone; noise
@@ -88,7 +88,7 @@ func detectVISFromRange(samples []int16, freq []float64, sampleRate, startAt int
 			if breakEnd > len(samples) {
 				continue
 			}
-			breakMean := meanFreqQuick(freq, breakStart, breakN, max(1, sampleRate/1_000))
+			breakMean := meanFreqQuick(freq, breakStart, breakN, max(1, sampleRate/8_000))
 			// A 10 ms break is shorter than the discriminator/filter transient.
 			// Keep a wider coarse gate here and let the raw-PCM narrowband
 			// detector below make the final 1200 Hz symbol decision.
