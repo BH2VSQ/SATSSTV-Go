@@ -1937,11 +1937,11 @@ func (d *StreamDecoder) prepareProgressiveUpdate(ctx context.Context, frameEnd i
 	if rows <= d.lastPreviewRows || rows <= 0 {
 		return
 	}
-	// Publish at most roughly 24 immutable snapshots per image. The preview
-	// worker re-renders all rows received so far; higher cadence creates
-	// quadratic repeated work and competes with the ordered PCM decoder.
-	// The latest-wins worker still paints useful partial images.
-	stride := max(1, d.mode.Height/24)
+	// Publish at most roughly 30 immutable snapshots per image. The preview
+	// worker re-renders all rows received so far; a much higher cadence creates
+	// quadratic repeated work and competes with the ordered PCM decoder. Keep
+	// the row gap bounded so partial images still appear progressively.
+	stride := max(1, d.mode.Height/30)
 	if rows-d.lastPreviewRows < stride && rows < d.mode.Height {
 		return
 	}
