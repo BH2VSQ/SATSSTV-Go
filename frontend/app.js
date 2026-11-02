@@ -838,12 +838,17 @@ function setupCanvasDrag() {
 let waterfallOff = null;
 let waterfallNextRow = 0;
 let waterfallRowImage = null;
+let completedWaterfallImage = null;
+let frameProgressActive = false;
 let currentInputDBFS = -120;
+let currentAttenuationDB = 0;
+let currentAFCOffsetHz = 0;
 function resetWaterfall() {
   waterfallOff = null;
   waterfallRowImage = null;
   waterfallNextRow = 0;
   waterfallHistory = [];
+  completedWaterfallImage = null;
 }
 function appendWaterfallRow(values) {
   if (!Array.isArray(values) || !values.length) return;
@@ -871,7 +876,18 @@ function appendWaterfallRow(values) {
   waterfallNextRow = (waterfallNextRow + 1) % MAX_WATERFALL_ROWS;
 }
 function drawWaterfall(ctx, w, waterfallY, waterfallH, xOffset = 0) {
-  if (!waterfallOff || w <= 0 || waterfallH <= 0) return;
+  if (w <= 0 || waterfallH <= 0) return;
+  // A completed frame replaces the short live history with the complete,
+  // time-aligned waterfall generated from the decoder's AFC-corrected track.
+  if (completedWaterfallImage && completedWaterfallImage.complete && completedWaterfallImage.naturalWidth > 0) {
+    ctx.save();
+    ctx.beginPath(); ctx.rect(xOffset, waterfallY, w, waterfallH); ctx.clip();
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(completedWaterfallImage, xOffset, waterfallY, w, waterfallH);
+    ctx.restore();
+    return;
+  }
+  if (!waterfallOff) return;
 
   // The circular buffer is stored as rows. Once it wraps, the oldest row is
   // waterfallNextRow, so stitch [nextRow..end] followed by [0..nextRow].
@@ -971,11 +987,11 @@ function drawIdleSpectrum() {
   ctx.strokeStyle = '#31465c';
   ctx.beginPath(); ctx.moveTo(plotX, waterfallY); ctx.lineTo(w, waterfallY); ctx.stroke();
 }
-function renderLiveSpectrum(values) {
+function renderLiveSpectrum(values, appendToWaterfall = true) {
   const canvas = $('spectrum'), ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
   if (!Array.isArray(values) || !values.length) { drawIdleSpectrum(); return; }
   const normalized = values.map(v => Math.max(0, Math.min(1, Number(v) || 0)));
-  appendWaterfallRow(normalized);
+  if (appendToWaterfall) appendWaterfallRow(normalized);
 
   drawIdleSpectrum();
   const plotX = 44;
@@ -1043,6 +1059,11 @@ function bindRuntimeEvents() {
     $('spectrumState').textContent = t('spectrumPeak', { peak: peakHz.toFixed(0), crest: crest.toFixed(1) });
     const dbfs = Number(data?.inputDbfs ?? data?.dbfs ?? -120);
     currentInputDBFS = dbfs;
+    currentAttenuationDB = Math.max(0, Number(data?.attenuationDB || 0));
+    currentAFCOffsetHz = Number(data?.afcOffsetHz || 0);
+    const correctionHz = Number(data?.afcCorrectionHz ?? -currentAFCOffsetHz);
+    $('attenuationState').textContent = `ATT ${currentAttenuationDB.toFixed(1)} dB`;
+    $('afcState').textContent = `AFC ${correctionHz >= 0 ? '+' : ''}${correctionHz.toFixed(0)} Hz`;
     const fill = Math.max(0, Math.min(100, (dbfs + 60) / 60 * 100));
     $('inputLevel').style.width = `${fill}%`;
     $('inputLevelText').textContent = `${dbfs.toFixed(1)} dBFS`;
@@ -1071,10 +1092,24 @@ function bindRuntimeEvents() {
       baseHint = t('adcClippingWarning', { count: clipped, level: rawDBFS.toFixed(1) });
     }
     $('rxHint').textContent = [baseHint, ...hints].filter(Boolean).join(' · ');
-    renderLiveSpectrum(data?.spectrum);
+    renderLiveSpectrum(data?.spectrum, true);
     $('spectrumOverlay').style.display = 'none';
   });
+  window.runtime.EventsOn('rx:afc', (data) => {
+    currentAFCOffsetHz = Number(data?.offsetHz || 0);
+    const correction = Number(data?.correctionHz ?? -currentAFCOffsetHz);
+    $('afcState').textContent = `AFC ${correction >= 0 ? '+' : ''}${correction.toFixed(0)} Hz`;
+  });
   window.runtime.EventsOn('rx:progress', (data) => {
+    if (data?.active && !frameProgressActive) {
+      // Start a fresh frame history. The live waterfall is shown until the
+      // decoder publishes the complete AFC-corrected frame waterfall.
+      resetWaterfall();
+      frameProgressActive = true;
+      drawIdleSpectrum();
+    } else if (!data?.active) {
+      frameProgressActive = false;
+    }
     const percent = Math.max(0, Math.min(100, Number(data?.percent) || 0));
     $('rxProgressFill').style.width = `${percent}%`;
     $('rxProgressText').textContent = `${Math.round(percent)}%`;
@@ -1132,6 +1167,20 @@ function bindRuntimeEvents() {
   });
   window.runtime.EventsOn('rx:frame', async (data) => {
     latestRXImageData = data.image || latestRXImageData;
+    if (Number.isFinite(Number(data?.afcOffsetHz))) {
+      currentAFCOffsetHz = Number(data.afcOffsetHz);
+      const correction = Number(data?.afcCorrectionHz ?? -currentAFCOffsetHz);
+      $('afcState').textContent = `AFC ${correction >= 0 ? '+' : ''}${correction.toFixed(0)} Hz`;
+    }
+    if (data?.waterfallImage) {
+      const completed = new Image();
+      completed.onload = () => {
+        completedWaterfallImage = completed;
+        if (Array.isArray(data?.frameSpectrum)) renderLiveSpectrum(data.frameSpectrum, false);
+        else drawIdleSpectrum();
+      };
+      completed.src = data.waterfallImage;
+    }
     templateImageCache.clear();
     renderCanvas();
     const frame = $('rxImageFrame'); frame.innerHTML = '';
