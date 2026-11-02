@@ -388,6 +388,27 @@ func goertzelPower(samples []int16, sampleRate int, frequency float64) float64 {
 // mistuned SSB audio maps back onto the standard video band. It reads the
 // leader's average frequency from an already demodulated track (zero cost) and
 // returns the offset in hertz, or zero when no clean leader is available.
+// streamLeaderOffset estimates the current receiver offset from the stable
+// 1900 Hz VIS leader. The live decoder uses the configured AFC window instead
+// of a hard-coded ±200 Hz so the standard ±300 Hz range can lock near its edge.
+func streamLeaderOffset(freq []float64, sampleRate int, maxOffsetHz float64) float64 {
+	if sampleRate <= 0 {
+		return 0
+	}
+	if maxOffsetHz < 20 || maxOffsetHz > 1_000 {
+		maxOffsetHz = 200
+	}
+	leaderSamples := int(math.Round(0.300 * float64(sampleRate)))
+	if leaderSamples <= 0 || leaderSamples > len(freq) {
+		return 0
+	}
+	frequency := meanFreq(freq, 0, leaderSamples)
+	if frequency < 1_900-maxOffsetHz || frequency > 1_900+maxOffsetHz {
+		return 0
+	}
+	return frequency - 1_900
+}
+
 func frameOffset(freq []float64, sampleRate int, spec ModeSpec, bodyStart int) float64 {
 	headerMS := 910.0
 	switch spec.Header {
@@ -1590,12 +1611,11 @@ func (d *StreamDecoder) Feed(ctx context.Context, samples []int16) ([]StreamEven
 			// The header now begins at offset zero, so its 300 ms leader is the
 			// first window. Measure its average frequency from the demodulated
 			// track to compensate the receiver's offset.
-			d.offset = 0
-			if leaderN := int(math.Round(0.300 * float64(d.rate))); leaderN <= d.freqLen {
-				if f := meanFreq(d.freqChunks[0], 0, leaderN); f >= 1_700 && f <= 2_100 {
-					d.offset = f - 1_900
-				}
+			leaderOffsetRange := 200.0
+			if d.afcEnabled {
+				leaderOffsetRange = d.afcMaxOffsetHz
 			}
+			d.offset = streamLeaderOffset(d.freqChunks[0], d.rate, leaderOffsetRange)
 			d.lastPreviewRows = 0
 			d.updates = nil
 		}

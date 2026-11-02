@@ -228,3 +228,17 @@ func TestSampleClockAFCCanBeDisabled(t *testing.T) {
 		t.Fatalf("disabled AFC changed offset to %.2f Hz", clock.offset)
 	}
 }
+
+func TestStreamLeaderOffsetHonorsAFCWindow(t *testing.T) {
+	const rate = 48_000
+	leader := make([]float64, int(math.Round(0.300*rate)))
+	for i := range leader {
+		leader[i] = 2_150
+	}
+	if got := streamLeaderOffset(leader, rate, 300); math.Abs(got-250) > 0.1 {
+		t.Fatalf("±300 Hz AFC window offset = %.1f Hz, want 250 Hz", got)
+	}
+	if got := streamLeaderOffset(leader, rate, 200); got != 0 {
+		t.Fatalf("offset outside ±200 Hz window should be rejected, got %.1f Hz", got)
+	}
+}
