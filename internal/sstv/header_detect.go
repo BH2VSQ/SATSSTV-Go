@@ -67,9 +67,9 @@ func stableMeanFreqQuick(freq []float64, start, n, stride int) (mean, spread, co
 // of broadband receiver noise.
 func maxLeaderSpread(sampleRate int) float64 {
 	if sampleRate < 12_000 {
-		return 260
+		return 520
 	}
-	return 190
+	return 450
 }
 
 func detectModeHeaderFromRange(samples []int16, freq []float64, sampleRate, startAt int, maxOffsetHz float64) (spec ModeSpec, vis uint8, bodyStart, headerStart, nextStart int, retErr error) {
@@ -210,7 +210,7 @@ func detectFixedModePrefixRange(samples []int16, freq []float64, rate, startAt i
 	step := max(1, rate/500)
 	start, step := alignedStart(startAt, step)
 	maxStart := min(len(samples)-headerN, rate*3)
-	quickStride := max(1, rate/1_000)
+	quickStride := max(1, rate/8_000)
 	for coarse := start; coarse <= maxStart; coarse += step {
 		leaderMean, leaderSpread, leaderCoverage := stableMeanFreqQuick(freq, coarse, leaderN, quickStride)
 		if leaderCoverage < 0.65 || leaderSpread > maxLeaderSpread(rate) {
@@ -265,7 +265,7 @@ func detectExtendedVISFromRange(samples []int16, freq []float64, rate, startAt i
 	leaderN := int(math.Round(.300 * float64(rate)))
 	breakN := int(math.Round(.010 * float64(rate)))
 	bitN := int(math.Round(.030 * float64(rate)))
-	quickStride := max(1, rate/1_000)
+	quickStride := max(1, rate/8_000)
 	for ; start <= maxStart; start += step {
 		p := start
 		// Broadband noise can have a plausible average zero-crossing frequency
@@ -338,7 +338,7 @@ func detectNarrowVISFromRange(samples []int16, freq []float64, rate, startAt int
 	leaderN := int(math.Round(.300 * float64(rate)))
 	breakN := int(math.Round(.100 * float64(rate)))
 	bitN := int(math.Round(.022 * float64(rate)))
-	quickStride := max(1, rate/1_000)
+	quickStride := max(1, rate/8_000)
 	for ; start <= maxStart; start += step {
 		p := start
 		leader, spread, coverage := stableMeanFreqQuick(freq, p, leaderN, quickStride)
