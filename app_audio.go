@@ -743,7 +743,10 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 		select {
 		case <-ctx.Done():
 			return
-		case block := <-queue:
+		case block, ok := <-queue:
+			if !ok {
+				return
+			}
 			queueDepth := len(queue)
 			if block == nil {
 				attenuator.Reset()
