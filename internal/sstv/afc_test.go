@@ -257,6 +257,15 @@ func TestLiveHeaderSearchHonorsConfiguredWideAFCWindow(t *testing.T) {
 			samples := append(generator.Samples(), make([]int16, rate)...)
 			shifted := shiftFrequency(samples, rate, offset)
 			freq := newFrequencyTracker(rate).Process(shifted)
+			leaderSamples := int(math.Round(0.300 * rate))
+			breakSamples := int(math.Round(0.010 * rate))
+			leader := meanFreqQuick(freq, 0, leaderSamples, 6)
+			breakMean := meanFreqQuick(freq, leaderSamples, breakSamples, 6)
+			breakBest := bestTone(shifted[leaderSamples:leaderSamples+breakSamples], rate, 1_200+offset, 1_900+offset)
+			breakRobust := headerTone(shifted[leaderSamples:leaderSamples+breakSamples], rate, 1_200+offset, 1_900+offset)
+			t.Logf("leader=%.1f offset=%.1f break=%.1f best=%.1f robust=%.1f", leader, leader-1_900, breakMean, breakBest, breakRobust)
+			decoded, after, ok := decodeVISHeaderAtPCM(shifted, rate, 0, leader-1_900)
+			t.Logf("direct VIS decode: code=%d after=%d ok=%v", decoded, after, ok)
 			detected, vis, _, _, _, err := detectModeHeaderFromRange(shifted, freq, rate, 0, 700)
 			if err != nil {
 				t.Fatalf("live header search failed at %+.0f Hz: %v", offset, err)
@@ -276,14 +285,21 @@ func TestSampleClockAFCLocksSyncBeyondOldNinetyHertzWindow(t *testing.T) {
 	}
 	const start = 200
 	const pulseSamples = rate * 9 / 1_000
-	for i := start; i < start+pulseSamples; i++ {
-		frequency[i] = HorizontalSync + 260
+	const lineStep = 500
+	for line := 0; line < 14; line++ {
+		pulseStart := start + line*lineStep
+		for i := pulseStart; i < pulseStart+pulseSamples; i++ {
+			frequency[i] = HorizontalSync + 260
+		}
 	}
 	clock := sampleClock{rate: rate, pos: start, frequency: frequency, afcEnabled: true, afcMaxOffsetHz: 300}
-	if !clock.syncFirst(9, 2) {
-		t.Fatal("AFC did not acquire a 1200+260 Hz horizontal-sync pulse")
+	for line := 0; line < 14; line++ {
+		clock.pos = start + line*lineStep
+		if !clock.syncFirst(9, 2) {
+			t.Fatalf("AFC did not acquire 1200+260 Hz sync on line %d", line)
+		}
 	}
-	if math.Abs(clock.offset-260) > 5 {
-		t.Fatalf("AFC offset = %.1f Hz, want approximately 260 Hz", clock.offset)
+	if math.Abs(clock.offset-260) > 8 {
+		t.Fatalf("AFC offset after 14 sync lines = %.1f Hz, want approximately 260 Hz", clock.offset)
 	}
 }

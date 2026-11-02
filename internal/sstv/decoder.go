@@ -1725,7 +1725,7 @@ func (d *StreamDecoder) prepareProgressiveUpdate(ctx context.Context, frameEnd i
 	// every earlier row for 60 snapshots made preview work compete with the
 	// real-time capture path, especially on slower laptops and high-resolution
 	// modes. The latest-wins preview worker still paints partial images.
-	stride := max(1, d.mode.Height/24)
+	stride := max(1, d.mode.Height/60)
 	if rows-d.lastPreviewRows < stride && rows < d.mode.Height {
 		return
 	}
