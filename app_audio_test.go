@@ -454,3 +454,39 @@ func TestRXFSKIDWorkerDrainsQueuedAudioBeforeFinishAndIgnoresStaleFinish(t *test
 		t.Fatalf("worker acknowledged finish before decoding queued FSKID: decoded cycle=%d, want %d", got, activeID)
 	}
 }
+
+func TestDefaultAudioSettingsEnableRXProtection(t *testing.T) {
+	cfg := defaultAudioSettings()
+	if !cfg.AutoAttenuatorEnabled || !cfg.AFCEnabled {
+		t.Fatalf("RX protection defaults should be enabled: %+v", cfg)
+	}
+	if cfg.AttenuatorTargetDBFS != -3 || cfg.AttenuatorMaxReductionDB != 24 || cfg.AFCMaxOffsetHz != 300 {
+		t.Fatalf("unexpected RX protection defaults: %+v", cfg)
+	}
+}
+
+func TestNormalizeAudioSettingsPreservesExplicitRXProtectionOptOut(t *testing.T) {
+	cfg := defaultAudioSettings()
+	cfg.AutoAttenuatorEnabled = false
+	cfg.AFCEnabled = false
+	normalized, err := normalizeAudioSettings(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.AutoAttenuatorEnabled || normalized.AFCEnabled {
+		t.Fatalf("explicitly disabled RX processing was re-enabled: %+v", normalized)
+	}
+}
+
+func TestNormalizeAudioSettingsRejectsInvalidAFCAndAttenuatorTargets(t *testing.T) {
+	cfg := defaultAudioSettings()
+	cfg.AFCMaxOffsetHz = 1_500
+	if _, err := normalizeAudioSettings(cfg); err == nil {
+		t.Fatal("expected invalid AFC range to be rejected")
+	}
+	cfg = defaultAudioSettings()
+	cfg.AttenuatorTargetDBFS = -30
+	if _, err := normalizeAudioSettings(cfg); err == nil {
+		t.Fatal("expected invalid attenuator target to be rejected")
+	}
+}

@@ -34,7 +34,12 @@ type AudioSettings struct {
 	SerialPort       string `json:"serialPort"`
 	ActiveHigh       bool   `json:"activeHigh"`
 	PTTLeadMS        int    `json:"pttLeadMs"`
-	PTTTailMS        int    `json:"pttTailMs"`
+	PTTTailMS        int     `json:"pttTailMs"`
+	AutoAttenuatorEnabled bool    `json:"autoAttenuatorEnabled"`
+	AttenuatorTargetDBFS float64 `json:"attenuatorTargetDbfs"`
+	AttenuatorMaxReductionDB float64 `json:"attenuatorMaxReductionDb"`
+	AFCEnabled bool `json:"afcEnabled"`
+	AFCMaxOffsetHz float64 `json:"afcMaxOffsetHz"`
 }
 
 type AudioDeviceInfo struct {
@@ -65,7 +70,12 @@ type appAudioRuntime interface {
 }
 
 func defaultAudioSettings() AudioSettings {
-	return AudioSettings{SampleRate: 48_000, PTTMode: string(ptt.ModeVOX), ActiveHigh: true, PTTLeadMS: 300, PTTTailMS: 250}
+	return AudioSettings{
+		SampleRate: 48_000, PTTMode: string(ptt.ModeVOX), ActiveHigh: true,
+		PTTLeadMS: 300, PTTTailMS: 250,
+		AutoAttenuatorEnabled: true, AttenuatorTargetDBFS: -3,
+		AttenuatorMaxReductionDB: 24, AFCEnabled: true, AFCMaxOffsetHz: 300,
+	}
 }
 
 func (a *App) audioSettingsPath() (string, error) {
@@ -123,6 +133,26 @@ func normalizeAudioSettings(cfg AudioSettings) (AudioSettings, error) {
 	}
 	if cfg.PTTLeadMS < 0 || cfg.PTTLeadMS > 10_000 || cfg.PTTTailMS < 0 || cfg.PTTTailMS > 10_000 {
 		return AudioSettings{}, errors.New("PTT 前后延时必须在 0 至 10000 ms 之间")
+	}
+	// Zero-valued numeric fields are migrated to safe defaults for settings
+	// written by older versions. Boolean false remains an explicit opt-out.
+	if cfg.AttenuatorTargetDBFS == 0 {
+		cfg.AttenuatorTargetDBFS = -3
+	}
+	if cfg.AttenuatorMaxReductionDB == 0 {
+		cfg.AttenuatorMaxReductionDB = 24
+	}
+	if cfg.AttenuatorTargetDBFS < -18 || cfg.AttenuatorTargetDBFS > -0.5 {
+		return AudioSettings{}, errors.New("自动衰减目标峰值必须在 -18 至 -0.5 dBFS 之间")
+	}
+	if cfg.AttenuatorMaxReductionDB < 0 || cfg.AttenuatorMaxReductionDB > 48 {
+		return AudioSettings{}, errors.New("自动衰减最大范围必须在 0 至 48 dB 之间")
+	}
+	if cfg.AFCMaxOffsetHz == 0 {
+		cfg.AFCMaxOffsetHz = 300
+	}
+	if cfg.AFCMaxOffsetHz < 20 || cfg.AFCMaxOffsetHz > 1000 {
+		return AudioSettings{}, errors.New("AFC 最大频偏范围必须在 20 至 1000 Hz 之间")
 	}
 	return cfg, nil
 }
@@ -371,6 +401,9 @@ func (a *App) startRX(modeID string) error {
 	if err == nil {
 		err = decoder.SetMode(modeID)
 	}
+	if err == nil {
+		decoder.SetAFC(cfg.AFCEnabled, cfg.AFCMaxOffsetHz)
+	}
 	if err != nil {
 		return err
 	}
@@ -429,7 +462,7 @@ func (a *App) startRX(modeID string) error {
 		return err
 	}
 	a.rxModeRequest.Store(&modeID)
-	go a.runRXWorker(rxCtx, queue, decoder, fskidDecoder, cfg.SampleRate, session, modeID)
+	go a.runRXWorker(rxCtx, queue, decoder, fskidDecoder, cfg.SampleRate, session, modeID, cfg)
 	a.emitAudioState()
 	return nil
 }
@@ -491,10 +524,18 @@ type captureDiagnostics interface {
 }
 
 type rxTelemetryBlock struct {
-	Samples         []float32
-	ReceivedSamples uint64
-	DroppedBlocks   uint64
-	Discontinuity   bool
+	Samples              []float32 // processed samples used by both spectrum and decoder
+	InputDBFS            float64
+	InputPeak            float64
+	OutputPeak           float64
+	AttenuationDB         float64
+	InputClippedSamples  uint64
+	AutoAttenuator       bool
+	AFCEnabled           bool
+	AFCMaxOffsetHz       float64
+	ReceivedSamples      uint64
+	DroppedBlocks        uint64
+	Discontinuity        bool
 }
 
 // rxFSKIDWork is routed to its own worker so the sliding one-millisecond
@@ -587,7 +628,11 @@ func (c *rxFSKIDCycle) ResetAfterCaptureGap() bool {
 	return c != nil && c.Searching()
 }
 
-func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *sstv.StreamDecoder, fskidDecoder *sstv.FSKIDDecoder, sampleRate int, session appAudioRuntime, initialMode string) {
+func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *sstv.StreamDecoder, fskidDecoder *sstv.FSKIDDecoder, sampleRate int, session appAudioRuntime, initialMode string, settings AudioSettings) {
+	attenuator := audio.NewAutoAttenuator(sampleRate, audio.AutoAttenuatorConfig{
+		Enabled: settings.AutoAttenuatorEnabled, TargetDBFS: settings.AttenuatorTargetDBFS,
+		MaxAttenuationDB: settings.AttenuatorMaxReductionDB, Release: 500 * time.Millisecond,
+	})
 	var receivedSamples uint64
 	lastProgress := time.Time{}
 	telemetryQueue := make(chan rxTelemetryBlock, 8)
@@ -616,6 +661,7 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 			return
 		case block := <-queue:
 			if block == nil {
+				attenuator.Reset()
 				// The capture backend discarded a stale queue backlog. The SSTV
 				// raster must be reset because its line/sample clock crossed a gap.
 				// However, if a picture has already completed, MMSSTV sends FSKID
@@ -639,15 +685,28 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 				continue
 			}
 			receivedSamples += uint64(len(block))
-			pcm := audio.Float32ToPCM16(block)
+			// Preserve raw samples for diagnostics, but attenuate before PCM
+			// conversion so the decoder and spectrum share the same safe signal.
+			rawBlock := block
+			processedBlock, attenuation := attenuator.Process(rawBlock)
+			pcm := audio.Float32ToPCM16(processedBlock)
 			var droppedBlocks uint64
 			if diagnostics, ok := session.(captureDiagnostics); ok {
 				droppedBlocks = diagnostics.DroppedCaptureBlocks()
 			}
-			telemetry := rxTelemetryBlock{Samples: block, ReceivedSamples: receivedSamples, DroppedBlocks: droppedBlocks}
+			telemetry := rxTelemetryBlock{
+				Samples: processedBlock, InputDBFS: rmsDBFS(rawBlock),
+				InputPeak: attenuation.InputPeak, OutputPeak: attenuation.OutputPeak,
+				AttenuationDB: attenuation.AttenuationDB,
+				InputClippedSamples: attenuation.InputClippedSamples,
+				AutoAttenuator: settings.AutoAttenuatorEnabled,
+				AFCEnabled: settings.AFCEnabled, AFCMaxOffsetHz: settings.AFCMaxOffsetHz,
+				ReceivedSamples: receivedSamples, DroppedBlocks: droppedBlocks,
+			}
 			// Spectrum is visualization-only and must never hold SSTV decoding.
 			enqueueRXTelemetry(telemetryQueue, telemetry)
-			a.appendCaptureDump(block, sampleRate*10)
+			// Capture dumps intentionally retain the unprocessed input for diagnosis.
+			a.appendCaptureDump(rawBlock, sampleRate*10)
 
 			// FSKID is transmitted after the analog picture. Scanning every live
 			// SSTV pixel as a possible preamble is expensive and can false-lock on
@@ -1045,7 +1104,16 @@ func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetry
 				}
 			}
 			if a.ctx != nil {
-				runtime.EventsEmit(a.ctx, "audio:telemetry", map[string]any{"dbfs": level, "spectrum": spectrum, "peakHz": peakHz, "crest": crest, "droppedBlocks": droppedBlocks, "samplesReceived": receivedSamples, "blockSamples": len(item.Samples)})
+				runtime.EventsEmit(a.ctx, "audio:telemetry", map[string]any{
+					"dbfs": level, "inputDbfs": item.InputDBFS, "spectrum": spectrum,
+					"peakHz": peakHz, "crest": crest, "droppedBlocks": droppedBlocks,
+					"samplesReceived": receivedSamples, "blockSamples": len(item.Samples),
+					"inputPeak": item.InputPeak, "outputPeak": item.OutputPeak,
+					"attenuationDB": item.AttenuationDB,
+					"inputClippedSamples": item.InputClippedSamples,
+					"autoAttenuator": item.AutoAttenuator,
+					"afcEnabled": item.AFCEnabled, "afcMaxOffsetHz": item.AFCMaxOffsetHz,
+				})
 			}
 			lastTelemetry = time.Now()
 		}

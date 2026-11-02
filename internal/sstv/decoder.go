@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"math"
+	"sort"
 	"strings"
 )
 
@@ -459,7 +460,11 @@ func DecodeMode(ctx context.Context, samples []int16, sampleRate int, modeID str
 // frequency track. StreamDecoder uses it to refresh a live preview without
 // re-running the PLL over the audio received so far.
 func decodeModeFromFrequency(ctx context.Context, freq []float64, sampleRate int, spec ModeSpec, bodyStart int, pcm []int16, offset float64) (*image.NRGBA, error) {
-	return decodeModeRowsFromFrequency(ctx, freq, sampleRate, spec, bodyStart, pcm, offset, spec.Height)
+	return decodeModeFromFrequencyWithAFC(ctx, freq, sampleRate, spec, bodyStart, pcm, offset, true, 300)
+}
+
+func decodeModeFromFrequencyWithAFC(ctx context.Context, freq []float64, sampleRate int, spec ModeSpec, bodyStart int, pcm []int16, offset float64, afcEnabled bool, afcMaxOffsetHz float64) (*image.NRGBA, error) {
+	return decodeModeRowsFromFrequencyWithAFC(ctx, freq, sampleRate, spec, bodyStart, pcm, offset, afcEnabled, afcMaxOffsetHz, spec.Height)
 }
 
 // decodeModeRowsFromFrequency decodes only the requested leading raster rows,
@@ -469,6 +474,10 @@ func decodeModeFromFrequency(ctx context.Context, freq []float64, sampleRate int
 // still goes through decodeModeFromFrequency with the full row count and PCM
 // sync recovery.
 func decodeModeRowsFromFrequency(ctx context.Context, freq []float64, sampleRate int, spec ModeSpec, bodyStart int, pcm []int16, offset float64, rows int) (*image.NRGBA, error) {
+	return decodeModeRowsFromFrequencyWithAFC(ctx, freq, sampleRate, spec, bodyStart, pcm, offset, true, 300, rows)
+}
+
+func decodeModeRowsFromFrequencyWithAFC(ctx context.Context, freq []float64, sampleRate int, spec ModeSpec, bodyStart int, pcm []int16, offset float64, afcEnabled bool, afcMaxOffsetHz float64, rows int) (*image.NRGBA, error) {
 	if sampleRate < 8_000 || sampleRate > 192_000 {
 		return nil, fmt.Errorf("invalid sample rate %d", sampleRate)
 	}
@@ -505,7 +514,10 @@ func decodeModeRowsFromFrequency(ctx context.Context, freq []float64, sampleRate
 			pcm = append(pcm, make([]int16, pad)...)
 		}
 	}
-	clock := sampleClock{rate: sampleRate, pos: bodyStart, samples: pcm, offset: offset}
+	clock := sampleClock{
+		rate: sampleRate, pos: bodyStart, samples: pcm, frequency: freq,
+		offset: offset, afcEnabled: afcEnabled, afcMaxOffsetHz: afcMaxOffsetHz,
+	}
 	img := image.NewNRGBA(image.Rect(0, 0, spec.Width, fullHeight))
 
 	switch spec.Family {
@@ -543,9 +555,12 @@ type sampleClock struct {
 	rate       int
 	pos        int
 	fractional float64
-	samples    []int16
-	syncSeen   bool
-	offset     float64
+	samples        []int16
+	frequency      []float64
+	syncSeen       bool
+	offset         float64
+	afcEnabled     bool
+	afcMaxOffsetHz float64
 }
 
 func (c *sampleClock) skip(ms float64) {
@@ -580,6 +595,9 @@ func (c *sampleClock) syncInternal(durationMS, searchMS float64, detectFirst boo
 		}
 	}
 	if len(c.samples) == 0 {
+		if len(c.frequency) > 0 {
+			return c.syncFromFrequency(durationMS, searchMS)
+		}
 		c.skip(durationMS)
 		return false
 	}
@@ -671,7 +689,132 @@ func (c *sampleClock) syncInternal(durationMS, searchMS float64, detectFirst boo
 	}
 	c.pos = bestStart + pulseSamples
 	c.fractional = 0
+	c.updateAFC(bestStart, pulseSamples)
 	return true
+}
+
+// syncFromFrequency keeps progressive previews synchronized even though they
+// intentionally do not retain raw PCM. The discriminator track is sufficient
+// to identify the stable 1200 Hz line-sync segment and estimate its offset.
+func (c *sampleClock) syncFromFrequency(durationMS, searchMS float64) bool {
+	pulseSamples := int(math.Round(durationMS / 1000 * float64(c.rate)))
+	if pulseSamples <= 0 || pulseSamples > len(c.frequency) {
+		c.skip(durationMS)
+		return false
+	}
+	expected := c.pos
+	searchSamples := int(math.Round(math.Max(0, searchMS) / 1000 * float64(c.rate)))
+	minStart := max(0, expected-searchSamples)
+	maxStart := min(len(c.frequency)-pulseSamples, expected+searchSamples)
+	if maxStart < minStart {
+		c.skip(durationMS)
+		return false
+	}
+	target := HorizontalSync + c.offset
+	scoreAt := func(start int) float64 {
+		lo := start + pulseSamples/5
+		hi := start + pulseSamples*4/5
+		valid, matched := 0, 0
+		for i := lo; i < hi; i++ {
+			f := c.frequency[i]
+			if f < 100 || f > 4_000 || math.IsNaN(f) || math.IsInf(f, 0) {
+				continue
+			}
+			valid++
+			if math.Abs(f-target) <= 90 {
+				matched++
+			}
+		}
+		if valid < max(6, (hi-lo)/4) {
+			return 0
+		}
+		return float64(matched) / float64(valid)
+	}
+	bestStart, bestScore := expected, 0.0
+	bestDistance := int(^uint(0) >> 1)
+	step := max(1, c.rate/4_000)
+	for start := minStart; start <= maxStart; start += step {
+		score := scoreAt(start)
+		distance := absInt(start - expected)
+		if score > bestScore+1e-9 || (math.Abs(score-bestScore) <= 1e-9 && distance < bestDistance) {
+			bestStart, bestScore, bestDistance = start, score, distance
+		}
+	}
+	if bestScore < 0.25 {
+		c.skip(durationMS)
+		return false
+	}
+	refineStart, refineEnd := max(minStart, bestStart-step), min(maxStart, bestStart+step)
+	for start := refineStart; start <= refineEnd; start++ {
+		score := scoreAt(start)
+		distance := absInt(start - expected)
+		if score > bestScore+1e-9 || (math.Abs(score-bestScore) <= 1e-9 && distance < bestDistance) {
+			bestStart, bestScore, bestDistance = start, score, distance
+		}
+	}
+	c.pos = bestStart + pulseSamples
+	c.fractional = 0
+	c.updateAFC(bestStart, pulseSamples)
+	return true
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func medianFloat64(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sorted := append([]float64(nil), values...)
+	sort.Float64s(sorted)
+	mid := len(sorted) / 2
+	if len(sorted)%2 == 1 {
+		return sorted[mid]
+	}
+	return (sorted[mid-1] + sorted[mid]) / 2
+}
+
+// updateAFC estimates frequency offset only from the stable centre of a
+// detected horizontal-sync pulse. Median/MAD reject edge transitions, noise,
+// and picture pixels; bounded steps prevent one bad row from moving the tune.
+func (c *sampleClock) updateAFC(start, pulseSamples int) {
+	if c == nil || !c.afcEnabled || len(c.frequency) == 0 || pulseSamples <= 0 {
+		return
+	}
+	maxOffset := c.afcMaxOffsetHz
+	if maxOffset < 20 || maxOffset > 1_000 {
+		maxOffset = 300
+	}
+	lo := max(0, start+pulseSamples/5)
+	hi := min(len(c.frequency), start+pulseSamples*4/5)
+	values := make([]float64, 0, max(0, hi-lo))
+	for i := lo; i < hi; i++ {
+		f := c.frequency[i]
+		if f >= 100 && f <= 4_000 && !math.IsNaN(f) && !math.IsInf(f, 0) {
+			values = append(values, f)
+		}
+	}
+	if len(values) < max(8, (hi-lo)/3) {
+		return
+	}
+	centre := medianFloat64(values)
+	deviations := make([]float64, len(values))
+	for i, value := range values {
+		deviations[i] = math.Abs(value - centre)
+	}
+	if medianFloat64(deviations) > 45 {
+		return
+	}
+	targetOffset := centre - HorizontalSync
+	if math.Abs(targetOffset) > maxOffset {
+		return
+	}
+	delta := math.Max(-20, math.Min(20, targetOffset-c.offset))
+	c.offset += delta * 0.45
 }
 
 func (c *sampleClock) scan(freq []float64, width int, totalMS float64) ([]uint8, error) {
@@ -1200,6 +1343,8 @@ type StreamDecoder struct {
 	previewSequence  uint64
 	updates          []StreamUpdate
 	deferFrameDecode bool
+	afcEnabled       bool
+	afcMaxOffsetHz   float64
 }
 
 // StreamUpdate is an immutable request to reconstruct a progressive raster.
@@ -1226,6 +1371,8 @@ type StreamUpdate struct {
 	// request represents a final raster, preserving all mode-specific fallback
 	// paths used by the synchronous decoder. Progressive previews leave it nil.
 	PCM []int16
+	AFCEnabled bool
+	AFCMaxOffsetHz float64
 }
 
 // Decode reconstructs the currently received rows represented by this update.
@@ -1253,7 +1400,7 @@ func (u StreamUpdate) DecodeFinal(ctx context.Context) (*image.NRGBA, error) {
 	if len(u.PCM) == 0 {
 		return u.DecodeWithFrequency(ctx, frequency)
 	}
-	return decodeModeFromFrequency(ctx, frequency, u.SampleRate, u.Mode, u.BodyStart, u.PCM, u.Offset)
+	return decodeModeFromFrequencyWithAFC(ctx, frequency, u.SampleRate, u.Mode, u.BodyStart, u.PCM, u.Offset, u.AFCEnabled, u.AFCMaxOffsetHz)
 }
 
 // DecodeWithFrequency reconstructs a preview from a caller-maintained,
@@ -1266,7 +1413,7 @@ func (u StreamUpdate) DecodeWithFrequency(ctx context.Context, frequency []float
 	if u.Mode.ID == "" || u.SampleRate <= 0 || u.FrequencyLength <= 0 || len(frequency) < u.FrequencyLength {
 		return nil, errors.New("invalid progressive SSTV preview request")
 	}
-	return decodeModeRowsFromFrequency(ctx, frequency[:u.FrequencyLength:u.FrequencyLength], u.SampleRate, u.Mode, u.BodyStart, nil, u.Offset, u.Rows)
+	return decodeModeRowsFromFrequencyWithAFC(ctx, frequency[:u.FrequencyLength:u.FrequencyLength], u.SampleRate, u.Mode, u.BodyStart, nil, u.Offset, u.AFCEnabled, u.AFCMaxOffsetHz, u.Rows)
 }
 
 func flattenFrequencyChunks(chunks [][]float64, limit int) []float64 {
@@ -1315,7 +1462,20 @@ func NewStreamDecoder(sampleRate int) (*StreamDecoder, error) {
 	if sampleRate < 8_000 || sampleRate > 192_000 {
 		return nil, fmt.Errorf("invalid sample rate %d", sampleRate)
 	}
-	return &StreamDecoder{rate: sampleRate, maxIdle: sampleRate * 12}, nil
+	return &StreamDecoder{rate: sampleRate, maxIdle: sampleRate * 12, afcEnabled: true, afcMaxOffsetHz: 300}, nil
+}
+
+// SetAFC configures line-sync frequency-offset tracking. A maximum of 300 Hz
+// is used for legacy/out-of-range values; supported UI values are 100..1000 Hz.
+func (d *StreamDecoder) SetAFC(enabled bool, maxOffsetHz float64) {
+	if d == nil {
+		return
+	}
+	if maxOffsetHz < 20 || maxOffsetHz > 1_000 {
+		maxOffsetHz = 300
+	}
+	d.afcEnabled = enabled
+	d.afcMaxOffsetHz = maxOffsetHz
 }
 
 // Feed appends one captured PCM block and returns every complete image now
@@ -1456,6 +1616,8 @@ func (d *StreamDecoder) Feed(ctx context.Context, samples []int16) ([]StreamEven
 				SampleRate:      d.rate,
 				BodyStart:       d.bodyStart,
 				Offset:          d.offset,
+			AFCEnabled:      d.afcEnabled,
+			AFCMaxOffsetHz:  d.afcMaxOffsetHz,
 				FrameID:         d.frameID,
 				Sequence:        d.previewSequence + 1,
 				FrequencyChunks: append([][]float64(nil), d.freqChunks...),

@@ -184,3 +184,47 @@ func TestFixedModePrefixSupportsWideFrequencyOffsets(t *testing.T) {
 		})
 	}
 }
+
+func TestSampleClockAFCTracksSlowLineSyncDrift(t *testing.T) {
+	const rate = 12_000
+	frequency := make([]float64, rate*2)
+	for i := range frequency {
+		frequency[i] = 1_900
+	}
+	clock := sampleClock{rate: rate, frequency: frequency, offset: 20, afcEnabled: true, afcMaxOffsetHz: 100}
+	const pulseSamples = rate * 9 / 1_000
+	const lineSamples = 600
+	for line := 0; line < 16; line++ {
+		expected := 200 + line*lineSamples
+		offset := 20 + float64(line)*1.5
+		for i := expected; i < expected+pulseSamples; i++ {
+			frequency[i] = HorizontalSync + offset
+		}
+		clock.pos = expected
+		if !clock.syncFirst(9, 2) {
+			t.Fatalf("line %d: frequency sync was not found", line)
+		}
+	}
+	want := 20 + 15*1.5
+	if delta := math.Abs(clock.offset - want); delta > 5 {
+		t.Fatalf("tracked offset %.2f Hz, want %.2f Hz (delta %.2f)", clock.offset, want, delta)
+	}
+}
+
+func TestSampleClockAFCCanBeDisabled(t *testing.T) {
+	const rate = 12_000
+	frequency := make([]float64, rate/2)
+	for i := range frequency {
+		frequency[i] = 1_900
+	}
+	for i := 0; i < rate*9/1_000; i++ {
+		frequency[i] = HorizontalSync + 10
+	}
+	clock := sampleClock{rate: rate, frequency: frequency, offset: 0, afcEnabled: false, afcMaxOffsetHz: 100}
+	if !clock.syncFirst(9, 2) {
+		t.Fatal("frequency sync was not found with AFC disabled")
+	}
+	if clock.offset != 0 {
+		t.Fatalf("disabled AFC changed offset to %.2f Hz", clock.offset)
+	}
+}

@@ -256,3 +256,10 @@ Settings are no longer dismissed by clicking the dialog backdrop or pressing Esc
 ### Default station identity
 
 On first launch, the station callsign defaults to `N0CALL` and the Maidenhead locator defaults to `JJ00`. Existing empty station settings are migrated to these defaults. In TX templates, `{HISCALL}` displays `ToCall` until a callsign is entered in the HisCall field.
+
+### v3.8 RX input protection and line-sync AFC
+
+- RX adds a feed-forward automatic digital attenuator before PCM conversion. It applies immediate linear peak reduction toward a configurable target (default -3 dBFS), with a 500 ms smoothed release and a 24 dB maximum reduction. The same processed samples feed the SSTV decoder and live spectrum; raw samples are retained in capture diagnostics.
+- Telemetry reports the applied attenuation and counts near-full-scale input samples. Software attenuation cannot undo clipping that already occurred in the sound card/radio input stage; reduce the hardware input gain when the clipping warning appears.
+- Linear-satellite AFC now tracks the frequency offset from each detected 1200 Hz horizontal-sync pulse. The sync estimate uses a median/MAD rejection window and a bounded low-pass update; it corrects the per-line video-frequency mapping without resampling or changing SSTV pixel/line timing. The progressive preview path uses the frequency track for the same AFC/sync behavior as final decoding.
+- Audio settings expose independent auto-attenuator and AFC toggles, target peak level, and AFC search range (100–1000 Hz). Both features are enabled by default.

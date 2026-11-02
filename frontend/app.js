@@ -1041,13 +1041,26 @@ function bindRuntimeEvents() {
     const peakHz = Number(data?.peakHz || 0);
     const crest = Number(data?.crest || 0);
     $('spectrumState').textContent = t('spectrumPeak', { peak: peakHz.toFixed(0), crest: crest.toFixed(1) });
-    const dbfs = Number(data?.dbfs ?? -120);
+    const dbfs = Number(data?.inputDbfs ?? data?.dbfs ?? -120);
     currentInputDBFS = dbfs;
     const fill = Math.max(0, Math.min(100, (dbfs + 60) / 60 * 100));
     $('inputLevel').style.width = `${fill}%`;
     $('inputLevelText').textContent = `${dbfs.toFixed(1)} dBFS`;
     const samplesReceived = Number(data?.samplesReceived) || 0;
-    $('rxHint').textContent = data?.droppedBlocks ? t('droppedAudioBlocks', { count: data.droppedBlocks }) : (dbfs < -90 ? t('inputNearSilence', { count: samplesReceived.toLocaleString() }) : t('samplesCount', { count: samplesReceived.toLocaleString() }));
+    const rawDBFS = Number(data?.inputDbfs ?? dbfs);
+    const clipped = Number(data?.inputClippedSamples || 0);
+    const hints = [];
+    if (data?.autoAttenuator && Number(data?.attenuationDB || 0) > 0.1) {
+      hints.push(t('attenuationApplied', { db: Number(data.attenuationDB).toFixed(1) }));
+    }
+    if (data?.afcEnabled) hints.push(t('afcApplied', { range: Number(data.afcMaxOffsetHz || 300).toFixed(0) }));
+    let baseHint = data?.droppedBlocks
+      ? t('droppedAudioBlocks', { count: data.droppedBlocks })
+      : (dbfs < -90 ? t('inputNearSilence', { count: samplesReceived.toLocaleString() }) : t('samplesCount', { count: samplesReceived.toLocaleString() }));
+    if (clipped > 0) {
+      baseHint = t('adcClippingWarning', { count: clipped, level: rawDBFS.toFixed(1) });
+    }
+    $('rxHint').textContent = [baseHint, ...hints].filter(Boolean).join(' · ');
     renderLiveSpectrum(data?.spectrum);
     $('spectrumOverlay').style.display = 'none';
   });
@@ -1215,6 +1228,10 @@ async function loadAudioSettings() {
     portSelect.value = cfg.serialPort || '';
     $('pttActiveHigh').checked = cfg.activeHigh !== false;
     $('pttLead').value = cfg.pttLeadMs ?? 300; $('pttTail').value = cfg.pttTailMs ?? 250;
+    $('autoAttenuator').checked = cfg.autoAttenuatorEnabled !== false;
+    $('attenuatorTarget').value = cfg.attenuatorTargetDbfs ?? -3;
+    $('afcEnabled').checked = cfg.afcEnabled !== false;
+    $('afcRange').value = String(cfg.afcMaxOffsetHz ?? 300);
     updatePTTFields();
   } catch (e) { $('settingsStatus').textContent = `读取音频设置失败：${String(e)}`; $('settingsStatus').classList.add('error'); }
 }
@@ -1341,6 +1358,11 @@ async function saveAllSettings() {
       sampleRate: Number($('rate').value), captureDeviceId: $('audioInput').value, playbackDeviceId: $('audioOutput').value,
       pttMode: $('pttMode').value, rigctlAddress: $('rigctlAddress').value.trim(), serialPort: $('serialPort').value.trim(),
       activeHigh: $('pttActiveHigh').checked, pttLeadMs: Number($('pttLead').value), pttTailMs: Number($('pttTail').value),
+      autoAttenuatorEnabled: $('autoAttenuator').checked,
+      attenuatorTargetDbfs: Number($('attenuatorTarget').value),
+      attenuatorMaxReductionDb: 24,
+      afcEnabled: $('afcEnabled').checked,
+      afcMaxOffsetHz: Number($('afcRange').value),
     };
     await app().ApplyAudioSettings(cfg, currentRXModeID());
     updateAudioState(await app().GetAudioState());

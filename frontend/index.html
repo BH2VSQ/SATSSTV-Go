@@ -116,6 +116,14 @@
         <div class="settings-button-row"><button id="refreshAudioDevices" class="small-btn" data-i18n="refreshDevices">刷新设备</button></div>
         <p data-i18n="audioSharedHint">输入与输出均采用共享模式，不独占系统音频设备。保存设置时会短暂重建音频流并自动恢复 RX。</p>
         <div id="audioSettingsStatus" class="station-settings-status" data-i18n="audioAutoHint">启动工作台时自动接收。</div>
+        <div class="rx-processing-options">
+          <strong data-i18n="rxDSP">RX 数字处理</strong>
+          <label class="settings-check"><input id="autoAttenuator" type="checkbox" checked><span data-i18n="autoAttenuator">自动输入衰减</span></label>
+          <label><span data-i18n="attenuatorTarget">目标峰值 (dBFS)</span><input id="attenuatorTarget" type="number" min="-18" max="-0.5" step="0.5" value="-3"></label>
+          <label class="settings-check"><input id="afcEnabled" type="checkbox" checked><span data-i18n="afcEnabled">线性卫星 AFC（逐行跟踪）</span></label>
+          <label><span data-i18n="afcRange">最大频偏范围</span><select id="afcRange"><option value="100">±100 Hz</option><option value="200">±200 Hz</option><option value="300" selected>±300 Hz</option><option value="500">±500 Hz</option><option value="750">±750 Hz</option><option value="1000">±1000 Hz</option></select></label>
+        </div>
+        <p class="processing-hint" data-i18n="processingHint">自动衰减只调整数字增益；若输入级已经削波，请降低声卡或电台的硬件输入增益。AFC 通过每行 1200 Hz 同步脉冲跟踪频偏，不改变采样时钟。</p>
       </section>
       <section class="radio-settings">
         <h3 data-i18n="pttTitle">PTT 发射控制</h3>
