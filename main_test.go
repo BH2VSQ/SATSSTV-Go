@@ -85,8 +85,8 @@ func TestStationSettingsPersistAndNormalize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetStationSettings() on first run: %v", err)
 	}
-	if initial.MyCall != "" || initial.Locator != "" {
-		t.Fatalf("expected empty first-run settings, got %+v", initial)
+	if initial.MyCall != "N0CALL" || initial.Locator != "JJ00" {
+		t.Fatalf("expected safe first-run station defaults N0CALL/JJ00, got %+v", initial)
 	}
 
 	saved, err := app.SaveStationSettings(StationSettings{MyCall: " n0call ", Locator: "aa00aa "})
@@ -134,7 +134,11 @@ func TestAudioSettingsPersistAndNormalize(t *testing.T) {
 		t.Fatalf("first-run audio defaults must not contain radio endpoint examples: %+v", initial)
 	}
 
-	want := AudioSettings{SampleRate: 44_100, CaptureDeviceID: "capture-example-id", PlaybackDeviceID: "playback-example-id", PTTMode: "vox", ActiveHigh: true, PTTLeadMS: 400, PTTTailMS: 300}
+	want := AudioSettings{
+		SampleRate: 44_100, CaptureDeviceID: "capture-example-id", PlaybackDeviceID: "playback-example-id",
+		PTTMode: "vox", ActiveHigh: true, PTTLeadMS: 400, PTTTailMS: 300,
+		AttenuatorTargetDBFS: -3, AttenuatorMaxReductionDB: 24, AFCMaxOffsetHz: 300,
+	}
 	saved, err := app.saveAudioSettings(want)
 	if err != nil {
 		t.Fatalf("SaveAudioSettings(): %v", err)

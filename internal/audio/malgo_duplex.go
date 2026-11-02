@@ -169,33 +169,29 @@ func (m *MalgoDuplex) StartCapture(ctx context.Context, onSamples func([]float32
 		defer freeMalgoDeviceID(deviceID)
 	}
 
-	// Keep a modest jitter buffer on the native callback side. The application
-	// worker has its own 16-block queue; 16 blocks absorb short scheduler/UI
-	// pauses without hiding seconds of stale audio. Sustained overload still
-	// produces an explicit discontinuity marker rather than unbounded latency.
-	queue := make(chan []float32, 16)
-	workerCtx, cancel := context.WithCancel(context.Background())
+	// The application owns the single bounded RX queue. Avoid a second native
+	// queue and forwarding goroutine: two small queues could independently
+	// overflow and reset SSTV timing even when the DSP worker caught up.
+	captureCtx, cancel := context.WithCancel(ctx)
 	dev, err := malgo.InitDevice(m.ctx.Context, cfg, malgo.DeviceCallbacks{Data: func(_, input []byte, _ uint32) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				m.captureError.Store(fmt.Sprintf("capture callback panic: %v", recovered))
 			}
 		}()
-		if len(input) < 4 || workerCtx.Err() != nil {
+		if len(input) < 4 || captureCtx.Err() != nil {
 			return
 		}
 		block := make([]float32, len(input)/4)
 		for i := range block {
 			block[i] = math.Float32frombits(binary.LittleEndian.Uint32(input[i*4 : i*4+4]))
 		}
-		if workerCtx.Err() != nil {
+		if captureCtx.Err() != nil {
 			return
 		}
-		if discarded := enqueueCaptureBlock(queue, block); discarded > 0 {
-			// An ordered nil marker tells the downstream worker to reset its
-			// decoder state before consuming fresh audio.
-			m.droppedBlocks.Add(discarded)
-		}
+		// The application callback only enqueues this immutable block; DSP and
+		// UI work remain on the dedicated application worker.
+		onSamples(block)
 	}})
 	if err != nil {
 		cancel()
@@ -208,29 +204,10 @@ func (m *MalgoDuplex) StartCapture(ctx context.Context, onSamples func([]float32
 	}
 
 	stopWatch := make(chan struct{})
-	done := make(chan struct{})
 	m.capture, m.captureStop, m.captureCancel = dev, stopWatch, cancel
-	m.captureDone = done
+	m.captureDone = nil
 	m.droppedBlocks.Store(0)
 	m.captureError.Store("")
-
-	go func() {
-		defer close(done)
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				m.captureError.Store(fmt.Sprintf("capture worker panic: %v", recovered))
-			}
-		}()
-		for {
-			select {
-			case <-workerCtx.Done():
-				return
-			case block := <-queue:
-				// Nil marks a discontinuity and must reach the application layer.
-				onSamples(block)
-			}
-		}
-	}()
 
 	// If the owner cancels its RX context, stop the native capture device too.
 	go func() {

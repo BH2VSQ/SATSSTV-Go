@@ -184,3 +184,170 @@ func TestFixedModePrefixSupportsWideFrequencyOffsets(t *testing.T) {
 		})
 	}
 }
+
+func TestSampleClockAFCTracksSlowLineSyncDrift(t *testing.T) {
+	const rate = 12_000
+	frequency := make([]float64, rate*2)
+	for i := range frequency {
+		frequency[i] = 1_900
+	}
+	clock := sampleClock{rate: rate, frequency: frequency, offset: 20, afcEnabled: true, afcMaxOffsetHz: 100}
+	const pulseSamples = rate * 9 / 1_000
+	const lineSamples = 600
+	for line := 0; line < 16; line++ {
+		expected := 200 + line*lineSamples
+		offset := 20 + float64(line)*1.5
+		for i := expected; i < expected+pulseSamples; i++ {
+			frequency[i] = HorizontalSync + offset
+		}
+		clock.pos = expected
+		if !clock.syncFirst(9, 2) {
+			t.Fatalf("line %d: frequency sync was not found", line)
+		}
+	}
+	want := 20 + 15*1.5
+	if delta := math.Abs(clock.offset - want); delta > 5 {
+		t.Fatalf("tracked offset %.2f Hz, want %.2f Hz (delta %.2f)", clock.offset, want, delta)
+	}
+}
+
+func TestSampleClockAFCCanBeDisabled(t *testing.T) {
+	const rate = 12_000
+	frequency := make([]float64, rate/2)
+	for i := range frequency {
+		frequency[i] = 1_900
+	}
+	for i := 0; i < rate*9/1_000; i++ {
+		frequency[i] = HorizontalSync + 10
+	}
+	clock := sampleClock{rate: rate, frequency: frequency, offset: 0, afcEnabled: false, afcMaxOffsetHz: 100}
+	if !clock.syncFirst(9, 2) {
+		t.Fatal("frequency sync was not found with AFC disabled")
+	}
+	if clock.offset != 0 {
+		t.Fatalf("disabled AFC changed offset to %.2f Hz", clock.offset)
+	}
+}
+
+func TestStreamLeaderOffsetHonorsAFCWindow(t *testing.T) {
+	const rate = 48_000
+	leader := make([]float64, int(math.Round(0.300*rate)))
+	for i := range leader {
+		leader[i] = 2_150
+	}
+	if got := streamLeaderOffset(leader, rate, 300); math.Abs(got-250) > 0.1 {
+		t.Fatalf("±300 Hz AFC window offset = %.1f Hz, want 250 Hz", got)
+	}
+	if got := streamLeaderOffset(leader, rate, 200); got != 0 {
+		t.Fatalf("offset outside ±200 Hz window should be rejected, got %.1f Hz", got)
+	}
+}
+
+func TestLiveHeaderSearchHonorsConfiguredWideAFCWindow(t *testing.T) {
+	const rate = 48_000
+	for _, offset := range []float64{-600, 600} {
+		t.Run(fmt.Sprintf("offset_%+.0fHz", offset), func(t *testing.T) {
+			generator, err := NewToneGenerator(rate, 0.35)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := WriteVIS(generator, 8); err != nil {
+				t.Fatal(err)
+			}
+			samples := append(generator.Samples(), make([]int16, rate)...)
+			shifted := shiftFrequency(samples, rate, offset)
+			freq := newStreamFrequencyTracker(rate, true).Process(shifted)
+			leaderSamples := int(math.Round(0.300 * rate))
+			breakSamples := int(math.Round(0.010 * rate))
+			leader := meanFreqQuick(freq, 0, leaderSamples, 6)
+			breakMean := meanFreqQuick(freq, leaderSamples, breakSamples, 6)
+			breakBest := bestTone(shifted[leaderSamples:leaderSamples+breakSamples], rate, 1_200+offset, 1_900+offset)
+			breakRobust := headerTone(shifted[leaderSamples:leaderSamples+breakSamples], rate, 1_200+offset, 1_900+offset)
+			t.Logf("leader=%.1f offset=%.1f break=%.1f best=%.1f robust=%.1f", leader, leader-1_900, breakMean, breakBest, breakRobust)
+			decoded, after, ok := decodeVISHeaderAtPCM(shifted, rate, 0, leader-1_900)
+			t.Logf("direct VIS decode: code=%d after=%d ok=%v", decoded, after, ok)
+			detected, vis, _, _, _, err := detectModeHeaderFromRange(shifted, freq, rate, 0, 700)
+			if err != nil {
+				t.Fatalf("live header search failed at %+.0f Hz: %v", offset, err)
+			}
+			if detected.ID != Robot36ID || vis != 8 {
+				t.Fatalf("detected %s / VIS %d at %+.0f Hz", detected.ID, vis, offset)
+			}
+		})
+	}
+}
+
+func TestSampleClockAFCLocksSyncBeyondOldNinetyHertzWindow(t *testing.T) {
+	const rate = 12_000
+	frequency := make([]float64, rate)
+	for i := range frequency {
+		frequency[i] = 1_900
+	}
+	const start = 200
+	const pulseSamples = rate * 9 / 1_000
+	const lineStep = 500
+	for line := 0; line < 14; line++ {
+		pulseStart := start + line*lineStep
+		for i := pulseStart; i < pulseStart+pulseSamples; i++ {
+			frequency[i] = HorizontalSync + 260
+		}
+	}
+	clock := sampleClock{rate: rate, pos: start, frequency: frequency, afcEnabled: true, afcMaxOffsetHz: 300}
+	for line := 0; line < 14; line++ {
+		clock.pos = start + line*lineStep
+		if !clock.syncFirst(9, 2) {
+			t.Fatalf("AFC did not acquire 1200+260 Hz sync on line %d", line)
+		}
+	}
+	if math.Abs(clock.offset-260) > 8 {
+		t.Fatalf("AFC offset after 14 sync lines = %.1f Hz, want approximately 260 Hz", clock.offset)
+	}
+}
+
+
+func TestSampleClockAFCImmediatelyReacquiresCleanRetuneStep(t *testing.T) {
+	const rate = 12_000
+	const lineSamples = rate * 150 / 1_000
+	const pulseSamples = rate * 9 / 1_000
+	const start = 200
+	frequency := make([]float64, lineSamples*3)
+	for i := range frequency {
+		frequency[i] = 1_900
+	}
+	// First line is tuned normally; the second line simulates a 350 Hz
+	// receiver-frequency change made by the operator between SSTV lines.
+	for i := start; i < start+pulseSamples; i++ {
+		frequency[i] = HorizontalSync
+	}
+	second := start + lineSamples
+	for i := second; i < second+pulseSamples; i++ {
+		frequency[i] = HorizontalSync + 350
+	}
+
+	clock := sampleClock{
+		rate: rate, frequency: frequency, offset: 0,
+		afcEnabled: true, afcMaxOffsetHz: 500,
+	}
+	clock.pos = start
+	if !clock.syncFirst(9, 2) {
+		t.Fatal("failed to acquire initial 1200 Hz sync")
+	}
+	clock.pos = second
+	if !clock.syncFirst(9, 2) {
+		t.Fatal("failed to acquire retuned 1550 Hz sync")
+	}
+	if math.Abs(clock.offset-350) > 1 {
+		t.Fatalf("AFC offset after clean retune = %.1f Hz, want 350 Hz", clock.offset)
+	}
+}
+
+func TestStreamDecoderDefaultAFCWindowCoversModerateManualRetune(t *testing.T) {
+	const rate = 48_000
+	decoder, err := NewStreamDecoder(rate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoder.afcMaxOffsetHz != 500 {
+		t.Fatalf("default AFC window = ±%.0f Hz, want ±500 Hz", decoder.afcMaxOffsetHz)
+	}
+}

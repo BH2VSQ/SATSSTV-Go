@@ -20,6 +20,8 @@
       settingsTitle: '设备设置', language: '界面语言', languageChinese: '简体中文', languageEnglish: 'English', languageJapanese: '日本語',
       audioDevices: '音频设备', rxInput: 'RX 输入设备', txOutput: 'TX 输出设备', systemDefaultInput: '系统默认输入设备', systemDefaultOutput: '系统默认输出设备', refreshDevices: '刷新设备',
       audioSharedHint: '输入与输出均采用共享模式，不独占系统音频设备。保存设置时会短暂重建音频流并自动恢复 RX。', audioAutoHint: '启动工作台时自动接收。',
+      rxDSP: 'RX 数字处理', autoAttenuator: '自动输入衰减', attenuatorTarget: '目标峰值 (dBFS)', afcEnabled: '线性卫星 AFC（逐行跟踪）', afcRange: '最大频偏范围', processingHint: '自动衰减只调整数字增益；若输入级已经削波，请降低声卡或电台的硬件输入增益。AFC 通过每行 1200 Hz 同步脉冲跟踪频偏，不改变采样时钟。',
+      attenuationApplied: '自动衰减 {db} dB', afcApplied: 'AFC ±{range} Hz', rxDSPTiming: 'DSP {decode} / {block} ms · 队列 {queue}/{capacity}', adcClippingWarning: '检测到 {count} 个输入削波采样（{level} dBFS）；请降低声卡/电台硬件输入增益',
       pttTitle: 'PTT 发射控制', pttMode: '控制方式', pttVOX: 'VOX（电台自动发射）', pttRTS: '串口 RTS', pttDTR: '串口 DTR', pttHamlib: 'Hamlib Rigctld', rigctlAddress: 'Rigctl 地址', hostPort: '主机名:端口', serialPort: '串口名称', chooseSerial: '选择串口', refreshSerial: '刷新',
       pttLead: 'PTT 前置延时 (ms)', pttTail: 'PTT 释放延时 (ms)', pttActiveHigh: 'RTS/DTR 高电平发射', pttHint: '默认使用 VOX，由电台根据 SSTV 音频自动切换发射。也可选择串口 RTS/DTR 或 Hamlib Rigctld 控制电台 PTT。',
       pttTest: '测试 PTT（最长 15 秒）', pttTestStop: '停止 PTT 测试', pttTestStarting: '正在触发 PTT…', pttTestRunning: 'PTT 测试中 · {seconds}s 后自动停止', pttTestStarted: 'PTT 已触发，15 秒后自动释放', pttTestStopped: 'PTT 测试已停止', pttTestFailed: 'PTT 测试失败：{error}', pttVoxUnavailable: 'VOX 模式不需要软件 PTT 测试',
@@ -48,7 +50,7 @@
       imageReceivedStatus: '图像接收完成', imageAddedAlbum: '，已加入相册', txStatePlaying: '发射中', txStateEncoding: '编码中', txStateCompleted: '完成', txStateStopped: '已停止', txStateError: '错误', txStateDraft: '草稿',
       audioDeviceCount: '发现 {inputs} 个输入设备和 {outputs} 个输出设备', audioDeviceEnumFailed: '设备枚举失败：{error}', serialDisconnected: '（已断开）', serialNotFound: '未发现串口', serialEnumFailed: '串口枚举失败', audioInputOpening: '正在打开共享模式音频输入设备…', rxInitFailedShort: '音频初始化失败',
       rxInitFailed: '音频初始化失败：{error}。请检查设备设置。', rxAutoStartFailed: '自动启动 RX 失败：{error}', txOutputNotReady: 'TX 音频输出尚未初始化，请在设备设置中选择输出设备并应用', txEncoderUnavailable: '当前 TX 模式的编码器不可用',
-      spectrumPeak: '峰值 {peak} Hz · 峰度 {crest}', callsignSource: '来源：{source}', callsignFilled: '已通过 {source} 识别到呼号 {callsign}，已填入对方呼号', callsignPreserved: '已通过 {source} 识别到呼号 {callsign}；保留了已手动填写的对方呼号',
+      spectrumPeak: '峰值 {peak} Hz · 峰度 {crest}', noStableTone: '未检测到稳定音调', callsignSource: '来源：{source}', callsignFilled: '已通过 {source} 识别到呼号 {callsign}，已填入对方呼号', callsignPreserved: '已通过 {source} 识别到呼号 {callsign}；保留了已手动填写的对方呼号',
     },
     'en': {
       appTitle: 'SATSSTV-Go', audioRate: 'Audio Sample Rate', toneStop: 'Stop Tone', txStop: 'Stop TX', rxLevel: 'RX level is shown on the left of the spectrum', ready: 'Ready', librarySubtitle: 'Images are stored in your user data directory; templates embed their own copies.', navWorkbench: 'Workbench', navAlbum: 'Album', audioDisconnected: 'Audio device disconnected',
@@ -67,6 +69,8 @@
       settingsTitle: 'Device Settings', language: 'Language', languageChinese: '简体中文', languageEnglish: 'English', languageJapanese: '日本語',
       audioDevices: 'Audio Devices', rxInput: 'RX Input Device', txOutput: 'TX Output Device', systemDefaultInput: 'System Default Input', systemDefaultOutput: 'System Default Output', refreshDevices: 'Refresh Devices',
       audioSharedHint: 'Input and output use shared mode. Saving briefly rebuilds the audio streams and resumes RX automatically.', audioAutoHint: 'RX starts automatically when the workbench opens.',
+      rxDSP: 'RX signal processing', autoAttenuator: 'Automatic input attenuator', attenuatorTarget: 'Target peak (dBFS)', afcEnabled: 'Linear-satellite AFC (track each line)', afcRange: 'Maximum frequency offset', processingHint: 'The attenuator changes digital gain only. If the input stage is already clipping, lower the sound-card or radio hardware input gain. AFC tracks the 1200 Hz line-sync pulse without changing the sample clock.',
+      attenuationApplied: 'Auto attenuation {db} dB', afcApplied: 'AFC ±{range} Hz', rxDSPTiming: 'DSP {decode} / {block} ms · queue {queue}/{capacity}', adcClippingWarning: '{count} clipped input samples detected ({level} dBFS); lower the sound-card/radio hardware input gain',
       pttTitle: 'PTT Control', pttMode: 'Control Method', pttVOX: 'VOX (Radio VOX)', pttRTS: 'Serial RTS', pttDTR: 'Serial DTR', pttHamlib: 'Hamlib Rigctld', rigctlAddress: 'Rigctl Address', hostPort: 'Host:Port', serialPort: 'Serial Port', chooseSerial: 'Select Serial Port', refreshSerial: 'Refresh',
       pttLead: 'PTT Lead-in (ms)', pttTail: 'PTT Release Tail (ms)', pttActiveHigh: 'RTS/DTR active-high', pttHint: 'VOX is the default and lets the radio key from SSTV audio. Serial RTS/DTR and Hamlib Rigctld are also supported.',
       pttTest: 'Test PTT (15 s max)', pttTestStop: 'Stop PTT Test', pttTestStarting: 'Keying PTT…', pttTestRunning: 'PTT test active · auto-release in {seconds}s', pttTestStarted: 'PTT keyed; it will release automatically in 15 seconds', pttTestStopped: 'PTT test stopped', pttTestFailed: 'PTT test failed: {error}', pttVoxUnavailable: 'Software PTT testing is not available in VOX mode',
@@ -95,7 +99,7 @@
       imageReceivedStatus: 'Image received', imageAddedAlbum: ' · added to album', txStatePlaying: 'Transmitting', txStateEncoding: 'Encoding', txStateCompleted: 'Completed', txStateStopped: 'Stopped', txStateError: 'Error', txStateDraft: 'Draft',
       audioDeviceCount: 'Found {inputs} input and {outputs} output devices', audioDeviceEnumFailed: 'Device enumeration failed: {error}', serialDisconnected: ' (disconnected)', serialNotFound: 'No serial port found', serialEnumFailed: 'Serial port enumeration failed', audioInputOpening: 'Opening shared-mode audio input…', rxInitFailedShort: 'Audio initialization failed',
       rxInitFailed: 'Audio initialization failed: {error}. Check device settings.', rxAutoStartFailed: 'Failed to start RX automatically: {error}', txOutputNotReady: 'TX audio output is not initialized. Select an output device in Settings and apply it.', txEncoderUnavailable: 'The encoder for the current TX mode is unavailable',
-      spectrumPeak: 'Peak {peak} Hz · Crest {crest}', callsignSource: 'Source: {source}', callsignFilled: 'Callsign {callsign} received via {source} and filled into HisCall', callsignPreserved: 'Callsign {callsign} received via {source}; keeping the manually entered HisCall',
+      spectrumPeak: 'Peak {peak} Hz · Crest {crest}', noStableTone: 'No stable tone', callsignSource: 'Source: {source}', callsignFilled: 'Callsign {callsign} received via {source} and filled into HisCall', callsignPreserved: 'Callsign {callsign} received via {source}; keeping the manually entered HisCall',
     },
     'ja': {
       appTitle: 'SATSSTV-Go', audioRate: 'オーディオサンプルレート', toneStop: 'トーン停止', txStop: '送信停止', rxLevel: 'RX レベルはスペクトラム左側に表示', ready: '準備完了', librarySubtitle: '画像はユーザーデータに保存され、テンプレートには個別のコピーが埋め込まれます。', navWorkbench: 'ワークベンチ', navAlbum: 'アルバム', audioDisconnected: 'オーディオデバイス未接続',
@@ -114,6 +118,8 @@
       settingsTitle: 'デバイス設定', language: '表示言語', languageChinese: '简体中文', languageEnglish: 'English', languageJapanese: '日本語',
       audioDevices: 'オーディオデバイス', rxInput: 'RX 入力デバイス', txOutput: 'TX 出力デバイス', systemDefaultInput: 'システム既定の入力', systemDefaultOutput: 'システム既定の出力', refreshDevices: 'デバイスを更新',
       audioSharedHint: '入力と出力は共有モードを使用します。保存時にオーディオストリームを再構築し、RX を自動再開します。', audioAutoHint: 'ワークベンチ起動時に RX を自動受信します。',
+      rxDSP: 'RX デジタル処理', autoAttenuator: '入力自動減衰', attenuatorTarget: '目標ピーク (dBFS)', afcEnabled: 'リニア衛星 AFC（行ごとに追跡）', afcRange: '最大周波数偏移', processingHint: '減衰器はデジタルゲインのみを調整します。入力段で既にクリップしている場合は、サウンドカードまたは無線機のハードウェア入力ゲインを下げてください。AFC はサンプルクロックを変更せず、各行の 1200 Hz 同期パルスを追跡します。',
+      attenuationApplied: '自動減衰 {db} dB', afcApplied: 'AFC ±{range} Hz', rxDSPTiming: 'DSP {decode} / {block} ms · キュー {queue}/{capacity}', adcClippingWarning: '入力クリッピングを {count} サンプル検出（{level} dBFS）。サウンドカード/無線機の入力ゲインを下げてください',
       pttTitle: 'PTT 送信制御', pttMode: '制御方式', pttVOX: 'VOX（無線機の VOX）', pttRTS: 'シリアル RTS', pttDTR: 'シリアル DTR', pttHamlib: 'Hamlib Rigctld', rigctlAddress: 'Rigctl アドレス', hostPort: 'ホスト名:ポート', serialPort: 'シリアルポート', chooseSerial: 'ポートを選択', refreshSerial: '更新',
       pttLead: 'PTT 先行時間 (ms)', pttTail: 'PTT 解除遅延 (ms)', pttActiveHigh: 'RTS/DTR アクティブ High', pttHint: '既定は VOX です。シリアル RTS/DTR または Hamlib Rigctld による PTT 制御も使用できます。',
       pttTest: 'PTT テスト（最大15秒）', pttTestStop: 'PTT テスト停止', pttTestStarting: 'PTT を有効化中…', pttTestRunning: 'PTT テスト中 · {seconds}秒後に自動解除', pttTestStarted: 'PTT を有効にしました。15秒後に自動解除します', pttTestStopped: 'PTT テストを停止しました', pttTestFailed: 'PTT テスト失敗：{error}', pttVoxUnavailable: 'VOX モードではソフトウェア PTT テストを使用できません',
@@ -142,7 +148,7 @@
       imageReceivedStatus: '画像を受信しました', imageAddedAlbum: ' · アルバムに追加しました', txStatePlaying: '送信中', txStateEncoding: 'エンコード中', txStateCompleted: '完了', txStateStopped: '停止', txStateError: 'エラー', txStateDraft: '下書き',
       audioDeviceCount: '入力 {inputs} 台、出力 {outputs} 台を検出', audioDeviceEnumFailed: 'デバイス列挙に失敗：{error}', serialDisconnected: '（切断）', serialNotFound: 'シリアルポートが見つかりません', serialEnumFailed: 'シリアルポートの列挙に失敗しました', audioInputOpening: '共有モードのオーディオ入力を開いています…', rxInitFailedShort: 'オーディオ初期化失敗',
       rxInitFailed: 'オーディオ初期化失敗：{error}。デバイス設定を確認してください。', rxAutoStartFailed: 'RX 自動起動失敗：{error}', txOutputNotReady: 'TX オーディオ出力が未初期化です。設定で出力デバイスを選択して適用してください。', txEncoderUnavailable: '現在の TX モードのエンコーダーは利用できません',
-      spectrumPeak: 'ピーク {peak} Hz · クレスト {crest}', callsignSource: 'ソース：{source}', callsignFilled: '{source} でコールサイン {callsign} を認識し HisCall に入力しました', callsignPreserved: '{source} でコールサイン {callsign} を認識しました。手動入力した HisCall は保持します',
+      spectrumPeak: 'ピーク {peak} Hz · クレスト {crest}', noStableTone: '安定したトーンなし', callsignSource: 'ソース：{source}', callsignFilled: '{source} でコールサイン {callsign} を認識し HisCall に入力しました', callsignPreserved: '{source} でコールサイン {callsign} を認識しました。手動入力した HisCall は保持します',
     }
   };
 

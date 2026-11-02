@@ -92,18 +92,17 @@ func TestEnqueueRXBlockDropsStaleAudioWithDiscontinuity(t *testing.T) {
 	}
 }
 
-func TestEnqueueRXTelemetryPreservesStreamBoundary(t *testing.T) {
+func TestEnqueueRXTelemetryKeepsOnlyLatestDisplayBlock(t *testing.T) {
 	queue := make(chan rxTelemetryBlock, 2)
 	queue <- rxTelemetryBlock{Samples: []float32{1}}
 	queue <- rxTelemetryBlock{Samples: []float32{2}}
 	enqueueRXTelemetry(queue, rxTelemetryBlock{Samples: []float32{3}})
-	first := <-queue
-	if !first.Discontinuity {
-		t.Fatalf("first telemetry item = %+v, want stream boundary", first)
+	if len(queue) != 1 {
+		t.Fatalf("telemetry queue has %d blocks, want only latest block", len(queue))
 	}
 	latest := <-queue
-	if latest.Discontinuity || len(latest.Samples) != 1 || latest.Samples[0] != 3 {
-		t.Fatalf("latest telemetry item = %+v, want latest sample block [3]", latest)
+	if !latest.Discontinuity || len(latest.Samples) != 1 || latest.Samples[0] != 3 {
+		t.Fatalf("latest telemetry item = %+v, want discontinuity + newest sample block [3]", latest)
 	}
 }
 
@@ -452,5 +451,164 @@ func TestRXFSKIDWorkerDrainsQueuedAudioBeforeFinishAndIgnoresStaleFinish(t *test
 	}
 	if got := decodedCycle.Load(); got != activeID {
 		t.Fatalf("worker acknowledged finish before decoding queued FSKID: decoded cycle=%d, want %d", got, activeID)
+	}
+}
+
+func TestDefaultAudioSettingsEnableRXProtection(t *testing.T) {
+	cfg := defaultAudioSettings()
+	if !cfg.AutoAttenuatorEnabled || !cfg.AFCEnabled {
+		t.Fatalf("RX protection defaults should be enabled: %+v", cfg)
+	}
+	if cfg.AttenuatorTargetDBFS != -3 || cfg.AttenuatorMaxReductionDB != 24 || cfg.AFCMaxOffsetHz != 500 {
+		t.Fatalf("unexpected RX protection defaults: %+v", cfg)
+	}
+}
+
+func TestNormalizeAudioSettingsPreservesExplicitRXProtectionOptOut(t *testing.T) {
+	cfg := defaultAudioSettings()
+	cfg.AutoAttenuatorEnabled = false
+	cfg.AFCEnabled = false
+	normalized, err := normalizeAudioSettings(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.AutoAttenuatorEnabled || normalized.AFCEnabled {
+		t.Fatalf("explicitly disabled RX processing was re-enabled: %+v", normalized)
+	}
+}
+
+func TestNormalizeAudioSettingsRejectsInvalidAFCAndAttenuatorTargets(t *testing.T) {
+	cfg := defaultAudioSettings()
+	cfg.AFCMaxOffsetHz = 1_500
+	if _, err := normalizeAudioSettings(cfg); err == nil {
+		t.Fatal("expected invalid AFC range to be rejected")
+	}
+	cfg = defaultAudioSettings()
+	cfg.AttenuatorTargetDBFS = -30
+	if _, err := normalizeAudioSettings(cfg); err == nil {
+		t.Fatal("expected invalid attenuator target to be rejected")
+	}
+}
+
+func TestRXAudioQueueHasSingleJitterBufferBudget(t *testing.T) {
+	const rxQueueCapacity = 64
+	queue := make(chan []float32, rxQueueCapacity)
+	for i := 0; i < rxQueueCapacity; i++ {
+		queue <- []float32{float32(i)}
+	}
+	if dropped := enqueueRXBlock(queue, []float32{99}); dropped != rxQueueCapacity {
+		t.Fatalf("full jitter queue discarded %d blocks, want %d", dropped, rxQueueCapacity)
+	}
+	if got := <-queue; got != nil {
+		t.Fatalf("first item after overflow = %v, want discontinuity marker", got)
+	}
+	if got := <-queue; len(got) != 1 || got[0] != 99 {
+		t.Fatalf("newest item after overflow = %v, want [99]", got)
+	}
+}
+
+
+func TestValidDisplayFrequencyRatioIgnoresMissingAndOutOfBandSamples(t *testing.T) {
+	track := []float64{0, 0, 1_200, 1_500, 1_900, 2_300, 3_200, math.NaN()}
+	got := validDisplayFrequencyRatio(track, 700, 2700)
+	if math.Abs(got-0.5) > 1e-9 {
+		t.Fatalf("display tone coverage = %.3f, want 0.500", got)
+	}
+	if validDisplayFrequencyRatio(nil, 700, 2700) != 0 {
+		t.Fatal("empty track should have zero tone coverage")
+	}
+}
+
+func TestTelemetryWindowDoesNotRequireFullRateAudioBuffer(t *testing.T) {
+	const rate = 48_000
+	tracker := sstv.NewCorrectedDisplayFrequencyTracker(rate)
+	if got := tracker.SampleRate(); got < 10_000 || got > 16_000 {
+		t.Fatalf("display discriminator rate = %d Hz, want approximately 12 kHz", got)
+	}
+	input := make([]int16, rate/8)
+	for i := range input {
+		input[i] = int16(0.3 * math.Sin(2*math.Pi*1_900*float64(i)/rate) * 32767)
+	}
+	track := tracker.Process(input, 0)
+	if len(track) < len(input)/5 || len(track) > len(input)/3 {
+		t.Fatalf("display frequency track has %d samples from %d input samples; expected approximately one quarter", len(track), len(input))
+	}
+}
+
+func TestAggregateRXAudioCoalescesBlocksAndFansOutSameProcessedSamples(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	input := make(chan []float32, 4)
+	output := make(chan []float32, 4)
+	telemetry := make(chan rxTelemetryBlock, 4)
+	input <- []float32{0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10}
+	input <- []float32{0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20}
+	close(input)
+	aggregateRXAudio(ctx, input, output, telemetry, 1_000, AudioSettings{}, nil, nil, nil) // 20 samples = 20 ms
+	var decoded []float32
+	for block := range output {
+		if block == nil {
+			t.Fatal("unexpected discontinuity marker")
+		}
+		if len(block) != 20 {
+			t.Fatalf("aggregated decoder block length = %d, want 20", len(block))
+		}
+		decoded = append(decoded, block...)
+	}
+	var displayed []float32
+	for item := range telemetry {
+		if item.Discontinuity {
+			t.Fatal("unexpected display discontinuity")
+		}
+		displayed = append(displayed, item.Samples...)
+	}
+	if len(decoded) != 20 || len(displayed) != 20 {
+		t.Fatalf("decoder received %d samples and telemetry received %d; want 20 each", len(decoded), len(displayed))
+	}
+	for i := range decoded {
+		if decoded[i] != float32(i+1)/100 {
+			t.Fatalf("decoder sample %d = %.3f, want %.3f", i, decoded[i], float32(i+1)/100)
+		}
+		if displayed[i] != decoded[i] {
+			t.Fatalf("display sample %d = %.3f differs from decoder sample %.3f", i, displayed[i], decoded[i])
+		}
+	}
+}
+
+func TestAggregateRXAudioPreservesDiscontinuityBoundaryForBothConsumers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	input := make(chan []float32, 8)
+	output := make(chan []float32, 8)
+	telemetry := make(chan rxTelemetryBlock, 8)
+	input <- []float32{0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10}
+	input <- []float32{0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20}
+	input <- nil
+	input <- []float32{0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, 0.28, 0.29, 0.30}
+	input <- []float32{0.31, 0.32, 0.33, 0.34, 0.35, 0.36, 0.37, 0.38, 0.39, 0.40}
+	close(input)
+	aggregateRXAudio(ctx, input, output, telemetry, 1_000, AudioSettings{}, nil, nil, nil)
+	var decoderBlocks [][]float32
+	for block := range output {
+		decoderBlocks = append(decoderBlocks, block)
+	}
+	var displayItems []rxTelemetryBlock
+	for item := range telemetry {
+		displayItems = append(displayItems, item)
+	}
+	if len(decoderBlocks) != 3 || len(displayItems) != 3 {
+		t.Fatalf("decoder items=%d, telemetry items=%d; want data + gap + data",
+			len(decoderBlocks), len(displayItems))
+	}
+	if len(decoderBlocks[0]) != 20 || decoderBlocks[1] != nil || len(decoderBlocks[2]) != 20 {
+		t.Fatalf("unexpected decoder boundaries: lengths %d, gap=%v, %d",
+			len(decoderBlocks[0]), decoderBlocks[1] == nil, len(decoderBlocks[2]))
+	}
+	if !displayItems[1].Discontinuity || len(displayItems[0].Samples) != 20 || len(displayItems[2].Samples) != 20 {
+		t.Fatalf("unexpected display discontinuity markers or sample lengths: %+v", displayItems)
+	}
+	if decoderBlocks[0][0] != 0.01 || decoderBlocks[0][19] != 0.20 ||
+		decoderBlocks[2][0] != 0.21 || decoderBlocks[2][19] != 0.40 {
+		t.Fatalf("aggregator changed sample order across discontinuity: %+v", decoderBlocks)
 	}
 }

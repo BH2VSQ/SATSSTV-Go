@@ -32,7 +32,7 @@
           </div>
           <div class="image-status"><span><span data-i18n="rxMode">模式</span> <b id="rxDetectedMode">Auto</b></span><span><span data-i18n="rxSize">尺寸</span> <b id="rxResolution">---</b></span><span><span data-i18n="rxCallsign">呼号</span> <b id="rxCallsign">等待 FSKID</b></span><span><span data-i18n="rxTime">接收时间</span> <b id="rxTimestamp">--</b></span></div>
           <div class="rx-decode-progress"><div class="rx-progress-meta"><span id="rxProgressLabel" data-i18n="rxWaitSignal">等待 SSTV 信号</span><b id="rxProgressText">0%</b></div><div class="rx-progress-track"><i id="rxProgressFill"></i></div></div>
-          <div class="spectrum-head"><b>Audio Spectrum / Waterfall</b><span id="spectrumState">INPUT IDLE</span><button id="saveCapture" class="small-btn" title="保存最近约 10 秒采集音频用于诊断" data-i18n="saveCapture">保存采集</button></div>
+          <div class="spectrum-head"><b>Audio Spectrum / Waterfall</b><div class="spectrum-metrics"><span id="attenuationState">ATT 0.0 dB</span><span id="afcState">AFC +0 Hz</span><span id="spectrumState">INPUT IDLE</span></div><button id="saveCapture" class="small-btn" title="保存最近约 10 秒采集音频用于诊断" data-i18n="saveCapture">保存采集</button></div>
           <div class="spectrum-frame"><canvas id="spectrum" width="900" height="230"></canvas><div id="spectrumOverlay" data-i18n="rxSpectrumHint">实时显示 900 至 2800 Hz SSTV 音频频谱与瀑布图</div></div>
           <div class="rx-footer"><span class="level-label" data-i18n="rxLevel">接收电平见频谱左侧</span><div class="level-meter" hidden><i id="inputLevel"></i></div><span id="inputLevelText" hidden>-- dBFS</span><span class="rx-hint" id="rxHint" data-i18n="rxAutoStart">RX 将随工作台自动启动</span></div>
         </section>
@@ -116,6 +116,14 @@
         <div class="settings-button-row"><button id="refreshAudioDevices" class="small-btn" data-i18n="refreshDevices">刷新设备</button></div>
         <p data-i18n="audioSharedHint">输入与输出均采用共享模式，不独占系统音频设备。保存设置时会短暂重建音频流并自动恢复 RX。</p>
         <div id="audioSettingsStatus" class="station-settings-status" data-i18n="audioAutoHint">启动工作台时自动接收。</div>
+        <div class="rx-processing-options">
+          <strong data-i18n="rxDSP">RX 数字处理</strong>
+          <label class="settings-check"><input id="autoAttenuator" type="checkbox" checked><span data-i18n="autoAttenuator">自动输入衰减</span></label>
+          <label><span data-i18n="attenuatorTarget">目标峰值 (dBFS)</span><input id="attenuatorTarget" type="number" min="-18" max="-0.5" step="0.5" value="-3"></label>
+          <label class="settings-check"><input id="afcEnabled" type="checkbox" checked><span data-i18n="afcEnabled">线性卫星 AFC（逐行跟踪）</span></label>
+          <label><span data-i18n="afcRange">最大频偏范围</span><select id="afcRange"><option value="100">±100 Hz</option><option value="200">±200 Hz</option><option value="300" selected>±300 Hz</option><option value="500">±500 Hz</option><option value="750">±750 Hz</option><option value="1000">±1000 Hz</option></select></label>
+        </div>
+        <p class="processing-hint" data-i18n="processingHint">自动衰减只调整数字增益；若输入级已经削波，请降低声卡或电台的硬件输入增益。AFC 通过每行 1200 Hz 同步脉冲跟踪频偏，不改变采样时钟。</p>
       </section>
       <section class="radio-settings">
         <h3 data-i18n="pttTitle">PTT 发射控制</h3>

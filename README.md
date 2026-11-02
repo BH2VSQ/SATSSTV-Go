@@ -256,3 +256,20 @@ Settings are no longer dismissed by clicking the dialog backdrop or pressing Esc
 ### Default station identity
 
 On first launch, the station callsign defaults to `N0CALL` and the Maidenhead locator defaults to `JJ00`. Existing empty station settings are migrated to these defaults. In TX templates, `{HISCALL}` displays `ToCall` until a callsign is entered in the HisCall field.
+
+### v3.8 RX input protection and line-sync AFC
+
+- RX adds a feed-forward automatic digital attenuator before PCM conversion. It applies immediate linear peak reduction toward a configurable target (default -3 dBFS), with a 500 ms smoothed release and a 24 dB maximum reduction. The same processed samples feed the SSTV decoder and live spectrum; raw samples are retained in capture diagnostics.
+- Telemetry reports the applied attenuation and counts near-full-scale input samples. Software attenuation cannot undo clipping that already occurred in the sound card/radio input stage; reduce the hardware input gain when the clipping warning appears.
+- Linear-satellite AFC now tracks the frequency offset from each detected 1200 Hz horizontal-sync pulse. The sync estimate uses a median/MAD rejection window and a bounded low-pass update; it corrects the per-line video-frequency mapping without resampling or changing SSTV pixel/line timing. The progressive preview path uses the frequency track for the same AFC/sync behavior as final decoding.
+- Audio settings expose independent auto-attenuator and AFC toggles, target peak level, and AFC search range (100–1000 Hz). Both features are enabled by default; the default AFC acquisition window is ±500 Hz.
+- AFC distinguishes slow line-to-line Doppler drift from a clean abrupt receiver retune: stable large sync-frequency steps trigger rapid reacquisition, while ordinary small changes retain bounded low-pass tracking.
+- Narrow-band modes at low audio sample rates use a short weighted neighbourhood within the same colour scan to estimate each pixel frequency, reducing phase-dependent errors when a pixel contains fewer than one complete carrier cycle. Raster timing and channel boundaries are unchanged.
+- The RX spectrum and live waterfall are built from the same attenuated PCM path as the decoder, then shifted by the current AFC correction before frequency binning. The UI reports the actual dynamic attenuation in dB and the signed AFC correction in Hz; neither value is a fixed display constant.
+- When a frame completes, the workbench replaces the short rolling waterfall with a full-height frame waterfall and frame-wide spectrum generated from the exact per-line AFC correction trace used for image reconstruction. The 1200 Hz sync pulses and image tones therefore share the decoder's corrected frequency axis.
+- Live spectrum analysis runs in its own best-effort worker at a 5 Hz cadence over a 200 ms rolling window. Its discriminator is prefiltered and decimated to approximately 12 kHz before frequency analysis; low-level/noise-only windows do not append waterfall rows.
+- Visualization telemetry uses a two-block latest-wins queue. Dropped display windows reset only the display tracker and never reset or block the ordered SSTV decoder queue.
+- Progressive image previews are capped at approximately 30 snapshots per frame to avoid repeatedly decoding the already-received raster at an unnecessarily high cadence.
+- Native audio callbacks are coalesced into approximately 20 ms decoder batches before the ordered SSTV worker. Samples remain unchanged and ordered; a capture discontinuity flushes the preceding tail before forwarding the reset marker.
+- Standard VIS, MMSSTV extended VIS, N-VIS and fixed-mode prefix searches use a sparse leader-frequency stability/coverage gate before raw-PCM Goertzel symbol classification, reducing expensive false candidates in broadband noise.
+- Progressive preview delivery is adaptive: normally at most four checkpoints per frame, reduced to approximately two when the decode queue is non-empty or Feed cost approaches half the audio block duration. Final-frame decoding is never skipped.

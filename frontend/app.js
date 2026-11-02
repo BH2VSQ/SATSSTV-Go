@@ -838,12 +838,19 @@ function setupCanvasDrag() {
 let waterfallOff = null;
 let waterfallNextRow = 0;
 let waterfallRowImage = null;
+let completedWaterfallImage = null;
+let completedFrameViewHeld = false;
+let frameProgressActive = false;
 let currentInputDBFS = -120;
+let currentAttenuationDB = 0;
+let currentAFCOffsetHz = 0;
 function resetWaterfall() {
   waterfallOff = null;
   waterfallRowImage = null;
   waterfallNextRow = 0;
   waterfallHistory = [];
+  completedWaterfallImage = null;
+  completedFrameViewHeld = false;
 }
 function appendWaterfallRow(values) {
   if (!Array.isArray(values) || !values.length) return;
@@ -871,7 +878,18 @@ function appendWaterfallRow(values) {
   waterfallNextRow = (waterfallNextRow + 1) % MAX_WATERFALL_ROWS;
 }
 function drawWaterfall(ctx, w, waterfallY, waterfallH, xOffset = 0) {
-  if (!waterfallOff || w <= 0 || waterfallH <= 0) return;
+  if (w <= 0 || waterfallH <= 0) return;
+  // A completed frame replaces the short live history with the complete,
+  // time-aligned waterfall generated from the decoder's AFC-corrected track.
+  if (completedWaterfallImage && completedWaterfallImage.complete && completedWaterfallImage.naturalWidth > 0) {
+    ctx.save();
+    ctx.beginPath(); ctx.rect(xOffset, waterfallY, w, waterfallH); ctx.clip();
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(completedWaterfallImage, xOffset, waterfallY, w, waterfallH);
+    ctx.restore();
+    return;
+  }
+  if (!waterfallOff) return;
 
   // The circular buffer is stored as rows. Once it wraps, the oldest row is
   // waterfallNextRow, so stitch [nextRow..end] followed by [0..nextRow].
@@ -971,11 +989,11 @@ function drawIdleSpectrum() {
   ctx.strokeStyle = '#31465c';
   ctx.beginPath(); ctx.moveTo(plotX, waterfallY); ctx.lineTo(w, waterfallY); ctx.stroke();
 }
-function renderLiveSpectrum(values) {
+function renderLiveSpectrum(values, appendToWaterfall = true) {
   const canvas = $('spectrum'), ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
   if (!Array.isArray(values) || !values.length) { drawIdleSpectrum(); return; }
   const normalized = values.map(v => Math.max(0, Math.min(1, Number(v) || 0)));
-  appendWaterfallRow(normalized);
+  if (appendToWaterfall) appendWaterfallRow(normalized);
 
   drawIdleSpectrum();
   const plotX = 44;
@@ -1040,18 +1058,70 @@ function bindRuntimeEvents() {
     captureTelemetrySeen = true;
     const peakHz = Number(data?.peakHz || 0);
     const crest = Number(data?.crest || 0);
-    $('spectrumState').textContent = t('spectrumPeak', { peak: peakHz.toFixed(0), crest: crest.toFixed(1) });
-    const dbfs = Number(data?.dbfs ?? -120);
+    const signalPresent = data?.signalPresent !== false;
+    $('spectrumState').textContent = signalPresent
+      ? t('spectrumPeak', { peak: peakHz.toFixed(0), crest: crest.toFixed(1) })
+      : t('noStableTone');
+    const dbfs = Number(data?.inputDbfs ?? data?.dbfs ?? -120);
     currentInputDBFS = dbfs;
+    currentAttenuationDB = Math.max(0, Number(data?.attenuationDB || 0));
+    currentAFCOffsetHz = Number(data?.afcOffsetHz || 0);
+    const correctionHz = Number(data?.afcCorrectionHz ?? -currentAFCOffsetHz);
+    $('attenuationState').textContent = `ATT ${currentAttenuationDB.toFixed(1)} dB`;
+    $('afcState').textContent = `AFC ${correctionHz >= 0 ? '+' : ''}${correctionHz.toFixed(0)} Hz`;
     const fill = Math.max(0, Math.min(100, (dbfs + 60) / 60 * 100));
     $('inputLevel').style.width = `${fill}%`;
     $('inputLevelText').textContent = `${dbfs.toFixed(1)} dBFS`;
     const samplesReceived = Number(data?.samplesReceived) || 0;
-    $('rxHint').textContent = data?.droppedBlocks ? t('droppedAudioBlocks', { count: data.droppedBlocks }) : (dbfs < -90 ? t('inputNearSilence', { count: samplesReceived.toLocaleString() }) : t('samplesCount', { count: samplesReceived.toLocaleString() }));
-    renderLiveSpectrum(data?.spectrum);
+    const rawDBFS = Number(data?.inputDbfs ?? dbfs);
+    const clipped = Number(data?.inputClippedSamples || 0);
+    const hints = [];
+    if (data?.autoAttenuator && Number(data?.attenuationDB || 0) > 0.1) {
+      hints.push(t('attenuationApplied', { db: Number(data.attenuationDB).toFixed(1) }));
+    }
+    if (data?.afcEnabled) hints.push(t('afcApplied', { range: Number(data.afcMaxOffsetHz || 300).toFixed(0) }));
+    const decodeMS = Number(data?.decodeMs || 0);
+    const blockMS = Number(data?.blockMs || 0);
+    const queueDepth = Number(data?.rxQueueDepth || 0);
+    const queueCapacity = Number(data?.rxQueueCapacity || 64);
+    if (blockMS > 0 && (decodeMS > blockMS * 0.6 || queueDepth >= 8)) {
+      hints.push(t('rxDSPTiming', {
+        decode: decodeMS.toFixed(1), block: blockMS.toFixed(1),
+        queue: queueDepth, capacity: queueCapacity
+      }));
+    }
+    let baseHint = data?.droppedBlocks
+      ? t('droppedAudioBlocks', { count: data.droppedBlocks })
+      : (dbfs < -90 ? t('inputNearSilence', { count: samplesReceived.toLocaleString() }) : t('samplesCount', { count: samplesReceived.toLocaleString() }));
+    if (clipped > 0) {
+      baseHint = t('adcClippingWarning', { count: clipped, level: rawDBFS.toFixed(1) });
+    }
+    $('rxHint').textContent = [baseHint, ...hints].filter(Boolean).join(' · ');
+    // After a complete SSTV raster, keep its exact AFC-corrected spectrum
+    // visible while unrelated trailing FSKID/silence audio continues. The
+    // attenuation and AFC metrics above remain live.
+    if (!completedFrameViewHeld || frameProgressActive) {
+      // Noise-only windows may refresh the level meter, but must not append
+      // waterfall rows or fabricate a wideband noise trace as SSTV activity.
+      renderLiveSpectrum(data?.signalPresent === false ? null : data?.spectrum, data?.signalPresent !== false);
+    }
     $('spectrumOverlay').style.display = 'none';
   });
+  window.runtime.EventsOn('rx:afc', (data) => {
+    currentAFCOffsetHz = Number(data?.offsetHz || 0);
+    const correction = Number(data?.correctionHz ?? -currentAFCOffsetHz);
+    $('afcState').textContent = `AFC ${correction >= 0 ? '+' : ''}${correction.toFixed(0)} Hz`;
+  });
   window.runtime.EventsOn('rx:progress', (data) => {
+    if (data?.active && !frameProgressActive) {
+      // Start a fresh frame history. The live waterfall is shown until the
+      // decoder publishes the complete AFC-corrected frame waterfall.
+      resetWaterfall();
+      frameProgressActive = true;
+      drawIdleSpectrum();
+    } else if (!data?.active) {
+      frameProgressActive = false;
+    }
     const percent = Math.max(0, Math.min(100, Number(data?.percent) || 0));
     $('rxProgressFill').style.width = `${percent}%`;
     $('rxProgressText').textContent = `${Math.round(percent)}%`;
@@ -1109,6 +1179,21 @@ function bindRuntimeEvents() {
   });
   window.runtime.EventsOn('rx:frame', async (data) => {
     latestRXImageData = data.image || latestRXImageData;
+    if (Number.isFinite(Number(data?.afcOffsetHz))) {
+      currentAFCOffsetHz = Number(data.afcOffsetHz);
+      const correction = Number(data?.afcCorrectionHz ?? -currentAFCOffsetHz);
+      $('afcState').textContent = `AFC ${correction >= 0 ? '+' : ''}${correction.toFixed(0)} Hz`;
+    }
+    if (data?.waterfallImage) {
+      const completed = new Image();
+      completed.onload = () => {
+        completedWaterfallImage = completed;
+        completedFrameViewHeld = Array.isArray(data?.frameSpectrum) && data.frameSpectrum.length > 0;
+        if (completedFrameViewHeld) renderLiveSpectrum(data.frameSpectrum, false);
+        else drawIdleSpectrum();
+      };
+      completed.src = data.waterfallImage;
+    }
     templateImageCache.clear();
     renderCanvas();
     const frame = $('rxImageFrame'); frame.innerHTML = '';
@@ -1215,6 +1300,10 @@ async function loadAudioSettings() {
     portSelect.value = cfg.serialPort || '';
     $('pttActiveHigh').checked = cfg.activeHigh !== false;
     $('pttLead').value = cfg.pttLeadMs ?? 300; $('pttTail').value = cfg.pttTailMs ?? 250;
+    $('autoAttenuator').checked = cfg.autoAttenuatorEnabled !== false;
+    $('attenuatorTarget').value = cfg.attenuatorTargetDbfs ?? -3;
+    $('afcEnabled').checked = cfg.afcEnabled !== false;
+    $('afcRange').value = String(cfg.afcMaxOffsetHz ?? 300);
     updatePTTFields();
   } catch (e) { $('settingsStatus').textContent = `读取音频设置失败：${String(e)}`; $('settingsStatus').classList.add('error'); }
 }
@@ -1341,6 +1430,11 @@ async function saveAllSettings() {
       sampleRate: Number($('rate').value), captureDeviceId: $('audioInput').value, playbackDeviceId: $('audioOutput').value,
       pttMode: $('pttMode').value, rigctlAddress: $('rigctlAddress').value.trim(), serialPort: $('serialPort').value.trim(),
       activeHigh: $('pttActiveHigh').checked, pttLeadMs: Number($('pttLead').value), pttTailMs: Number($('pttTail').value),
+      autoAttenuatorEnabled: $('autoAttenuator').checked,
+      attenuatorTargetDbfs: Number($('attenuatorTarget').value),
+      attenuatorMaxReductionDb: 24,
+      afcEnabled: $('afcEnabled').checked,
+      afcMaxOffsetHz: Number($('afcRange').value),
     };
     await app().ApplyAudioSettings(cfg, currentRXModeID());
     updateAudioState(await app().GetAudioState());

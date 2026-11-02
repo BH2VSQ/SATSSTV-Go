@@ -34,7 +34,12 @@ type AudioSettings struct {
 	SerialPort       string `json:"serialPort"`
 	ActiveHigh       bool   `json:"activeHigh"`
 	PTTLeadMS        int    `json:"pttLeadMs"`
-	PTTTailMS        int    `json:"pttTailMs"`
+	PTTTailMS        int     `json:"pttTailMs"`
+	AutoAttenuatorEnabled bool    `json:"autoAttenuatorEnabled"`
+	AttenuatorTargetDBFS float64 `json:"attenuatorTargetDbfs"`
+	AttenuatorMaxReductionDB float64 `json:"attenuatorMaxReductionDb"`
+	AFCEnabled bool `json:"afcEnabled"`
+	AFCMaxOffsetHz float64 `json:"afcMaxOffsetHz"`
 }
 
 type AudioDeviceInfo struct {
@@ -65,7 +70,12 @@ type appAudioRuntime interface {
 }
 
 func defaultAudioSettings() AudioSettings {
-	return AudioSettings{SampleRate: 48_000, PTTMode: string(ptt.ModeVOX), ActiveHigh: true, PTTLeadMS: 300, PTTTailMS: 250}
+	return AudioSettings{
+		SampleRate: 48_000, PTTMode: string(ptt.ModeVOX), ActiveHigh: true,
+		PTTLeadMS: 300, PTTTailMS: 250,
+		AutoAttenuatorEnabled: true, AttenuatorTargetDBFS: -3,
+		AttenuatorMaxReductionDB: 24, AFCEnabled: true, AFCMaxOffsetHz: 500,
+	}
 }
 
 func (a *App) audioSettingsPath() (string, error) {
@@ -123,6 +133,26 @@ func normalizeAudioSettings(cfg AudioSettings) (AudioSettings, error) {
 	}
 	if cfg.PTTLeadMS < 0 || cfg.PTTLeadMS > 10_000 || cfg.PTTTailMS < 0 || cfg.PTTTailMS > 10_000 {
 		return AudioSettings{}, errors.New("PTT 前后延时必须在 0 至 10000 ms 之间")
+	}
+	// Zero-valued numeric fields are migrated to safe defaults for settings
+	// written by older versions. Boolean false remains an explicit opt-out.
+	if cfg.AttenuatorTargetDBFS == 0 {
+		cfg.AttenuatorTargetDBFS = -3
+	}
+	if cfg.AttenuatorMaxReductionDB == 0 {
+		cfg.AttenuatorMaxReductionDB = 24
+	}
+	if cfg.AttenuatorTargetDBFS < -18 || cfg.AttenuatorTargetDBFS > -0.5 {
+		return AudioSettings{}, errors.New("自动衰减目标峰值必须在 -18 至 -0.5 dBFS 之间")
+	}
+	if cfg.AttenuatorMaxReductionDB < 0 || cfg.AttenuatorMaxReductionDB > 48 {
+		return AudioSettings{}, errors.New("自动衰减最大范围必须在 0 至 48 dB 之间")
+	}
+	if cfg.AFCMaxOffsetHz == 0 {
+		cfg.AFCMaxOffsetHz = 500
+	}
+	if cfg.AFCMaxOffsetHz < 20 || cfg.AFCMaxOffsetHz > 1000 {
+		return AudioSettings{}, errors.New("AFC 最大频偏范围必须在 20 至 1000 Hz 之间")
 	}
 	return cfg, nil
 }
@@ -371,6 +401,9 @@ func (a *App) startRX(modeID string) error {
 	if err == nil {
 		err = decoder.SetMode(modeID)
 	}
+	if err == nil {
+		decoder.SetAFC(cfg.AFCEnabled, cfg.AFCMaxOffsetHz)
+	}
 	if err != nil {
 		return err
 	}
@@ -383,11 +416,18 @@ func (a *App) startRX(modeID string) error {
 		baseCtx = context.Background()
 	}
 	rxCtx, cancel := context.WithCancel(baseCtx)
-	// Keep the end-to-end backlog below a few capture periods. SSTV timing is
-	// sensitive, but multi-second buffering is worse: it makes RX appear frozen
-	// and eventually overflows the native queue. If this short queue fills, the
-	// sender inserts an explicit discontinuity marker and keeps the newest data.
-	queue := make(chan []float32, 16)
+	// Keep a bounded native-callback queue, then coalesce tiny callback blocks
+	// into 20 ms PCM batches before the ordered decoder worker. This preserves
+	// every sample while reducing per-block DSP/filter/allocator overhead.
+	captureQueue := make(chan []float32, 32)
+	decodeQueue := make(chan []float32, 8)
+	// Spectrum telemetry is forked before the ordered decoder. A slow Feed()
+	// must never starve the independent spectrum/waterfall view.
+	telemetryQueue := make(chan rxTelemetryBlock, 8)
+	var latestAFCOffset atomic.Uint64
+	var latestDecodeMS atomic.Uint64
+	var decodeQueueDepth atomic.Int64
+	latestAFCOffset.Store(math.Float64bits(0))
 	a.rxQueueDrops.Store(0)
 
 	a.rxDecoderMu.Lock()
@@ -406,10 +446,11 @@ func (a *App) startRX(modeID string) error {
 	a.audioMu.Unlock()
 
 	if err := session.StartReceive(rxCtx, func(block []float32) {
-		// Do not block the capture worker behind DSP/UI work. Bound latency and
-		// explicitly reset the decoder if an exceptional overload loses samples.
+		// Native backends may reuse their callback buffer after returning. Take
+		// one owned copy, then fan it into the capture/aggregation path.
 		if rxCtx.Err() == nil {
-			if dropped := enqueueRXBlock(queue, block); dropped > 0 {
+			owned := append([]float32(nil), block...)
+			if dropped := enqueueRXBlock(captureQueue, owned); dropped > 0 {
 				a.rxQueueDrops.Add(dropped)
 			}
 		}
@@ -429,9 +470,150 @@ func (a *App) startRX(modeID string) error {
 		return err
 	}
 	a.rxModeRequest.Store(&modeID)
-	go a.runRXWorker(rxCtx, queue, decoder, fskidDecoder, cfg.SampleRate, session, modeID)
+	go a.runRXTelemetryWorker(rxCtx, telemetryQueue, cfg.SampleRate, session, &latestAFCOffset, &latestDecodeMS, &decodeQueueDepth, cap(decodeQueue), &a.rxQueueDrops)
+	go aggregateRXAudio(rxCtx, captureQueue, decodeQueue, telemetryQueue, cfg.SampleRate, cfg, session, a, &a.rxQueueDrops)
+	go a.runRXWorker(rxCtx, decodeQueue, decoder, fskidDecoder, cfg.SampleRate, session, modeID, cfg, &latestAFCOffset, &latestDecodeMS, &decodeQueueDepth)
 	a.emitAudioState()
 	return nil
+}
+
+// aggregateRXAudio joins small native callback blocks into roughly 20 ms
+// batches. It preserves exact sample order and forwards discontinuity markers
+// only after flushing the pre-gap tail. Both queues remain bounded and use the
+// same stale-audio policy, so capture callbacks never wait for DSP.
+// aggregateRXAudio coalesces native callback blocks into roughly 20 ms batches,
+// applies the automatic attenuator once, and fans the exact same processed PCM
+// to the ordered decoder and the independent spectrum/waterfall worker. The
+// display queue is lossy/latest-wins; the decoder queue remains ordered and
+// reports discontinuities if its bounded capacity is exceeded.
+func aggregateRXAudio(
+	ctx context.Context,
+	input <-chan []float32,
+	output chan []float32,
+	telemetryOutput chan rxTelemetryBlock,
+	sampleRate int,
+	settings AudioSettings,
+	session appAudioRuntime,
+	capture *App,
+	droppedCounter *atomic.Uint64,
+) {
+	defer close(output)
+	if telemetryOutput != nil {
+		defer close(telemetryOutput)
+	}
+	targetSamples := max(1, sampleRate/50)
+	flushAfter := 20 * time.Millisecond
+	pending := make([]float32, 0, targetSamples*2)
+	attenuator := audio.NewAutoAttenuator(sampleRate, audio.AutoAttenuatorConfig{
+		Enabled: settings.AutoAttenuatorEnabled,
+		TargetDBFS: settings.AttenuatorTargetDBFS,
+		MaxAttenuationDB: settings.AttenuatorMaxReductionDB,
+		Release: 500 * time.Millisecond,
+	})
+	var receivedSamples uint64
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	timerActive := false
+	stopTimer := func() {
+		if !timerActive {
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timerActive = false
+	}
+	enqueueDiscontinuity := func() {
+		if dropped := enqueueRXBlock(output, nil); dropped > 0 && droppedCounter != nil {
+			droppedCounter.Add(dropped)
+		}
+		enqueueRXTelemetry(telemetryOutput, rxTelemetryBlock{Discontinuity: true})
+	}
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		rawBlock := append([]float32(nil), pending...)
+		pending = pending[:0]
+		stopTimer()
+		receivedSamples += uint64(len(rawBlock))
+		if capture != nil {
+			capture.appendCaptureDump(rawBlock, sampleRate*10)
+		}
+		processedBlock, attenuation := attenuator.Process(rawBlock)
+		dropped := enqueueRXBlock(output, processedBlock)
+		if dropped > 0 {
+			if droppedCounter != nil {
+				droppedCounter.Add(dropped)
+			}
+			// Decoder PCM was dropped and its queue now contains a discontinuity
+			// marker. Keep the visualization timeline honest by inserting the
+			// same marker before this block's spectrum data.
+			attenuator.Reset()
+			enqueueRXTelemetry(telemetryOutput, rxTelemetryBlock{Discontinuity: true})
+		}
+		if telemetryOutput != nil {
+			var captureDropped uint64
+			if diagnostics, ok := session.(captureDiagnostics); ok {
+				captureDropped = diagnostics.DroppedCaptureBlocks()
+			}
+			enqueueRXTelemetry(telemetryOutput, rxTelemetryBlock{
+				Samples: processedBlock,
+				InputDBFS: rmsDBFS(rawBlock),
+				InputPeak: attenuation.InputPeak,
+				OutputPeak: attenuation.OutputPeak,
+				AttenuationDB: attenuation.AttenuationDB,
+				InputClippedSamples: attenuation.InputClippedSamples,
+				AutoAttenuator: settings.AutoAttenuatorEnabled,
+				AFCEnabled: settings.AFCEnabled,
+				AFCMaxOffsetHz: settings.AFCMaxOffsetHz,
+				QueueDepth: len(output),
+				QueueCapacity: cap(output),
+				BlockMS: float64(len(processedBlock)) * 1000 / float64(max(1, sampleRate)),
+				ReceivedSamples: receivedSamples,
+				DroppedBlocks: captureDropped,
+			})
+		}
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return
+		case <-timer.C:
+			timerActive = false
+			flush()
+		case block, ok := <-input:
+			if !ok {
+				flush()
+				return
+			}
+			if block == nil {
+				// Never combine samples across a known gap. Deliver the pre-gap
+				// samples first, then reset both independent consumers.
+				flush()
+				attenuator.Reset()
+				enqueueDiscontinuity()
+				continue
+			}
+			if len(block) == 0 {
+				continue
+			}
+			if len(pending) == 0 && !timerActive {
+				timer.Reset(flushAfter)
+				timerActive = true
+			}
+			pending = append(pending, block...)
+			if len(pending) >= targetSamples {
+				flush()
+			}
+		}
+	}
 }
 
 // enqueueRXBlock is the application-side low-latency queue policy. When full,
@@ -491,10 +673,23 @@ type captureDiagnostics interface {
 }
 
 type rxTelemetryBlock struct {
-	Samples         []float32
-	ReceivedSamples uint64
-	DroppedBlocks   uint64
-	Discontinuity   bool
+	Samples              []float32 // processed samples used by both spectrum and decoder
+	InputDBFS            float64
+	InputPeak            float64
+	OutputPeak           float64
+	AttenuationDB        float64
+	AFCOffsetHz          float64
+	InputClippedSamples  uint64
+	AutoAttenuator       bool
+	AFCEnabled           bool
+	AFCMaxOffsetHz       float64
+	QueueDepth           int
+	QueueCapacity        int
+	DecodeMS             float64
+	BlockMS              float64
+	ReceivedSamples      uint64
+	DroppedBlocks        uint64
+	Discontinuity        bool
 }
 
 // rxFSKIDWork is routed to its own worker so the sliding one-millisecond
@@ -587,10 +782,19 @@ func (c *rxFSKIDCycle) ResetAfterCaptureGap() bool {
 	return c != nil && c.Searching()
 }
 
-func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *sstv.StreamDecoder, fskidDecoder *sstv.FSKIDDecoder, sampleRate int, session appAudioRuntime, initialMode string) {
-	var receivedSamples uint64
+func (a *App) runRXWorker(
+	ctx context.Context,
+	queue <-chan []float32,
+	decoder *sstv.StreamDecoder,
+	fskidDecoder *sstv.FSKIDDecoder,
+	sampleRate int,
+	session appAudioRuntime,
+	initialMode string,
+	settings AudioSettings,
+	latestAFCOffset, latestDecodeMS *atomic.Uint64,
+	decodeQueueDepth *atomic.Int64,
+) {
 	lastProgress := time.Time{}
-	telemetryQueue := make(chan rxTelemetryBlock, 8)
 	previewQueue := make(chan sstv.StreamUpdate, 1) // latest preview wins; never back-pressure DSP
 	frameQueue := make(chan sstv.StreamEvent, 2)
 	// Forty-millisecond batches keep channel overhead low. A 512-entry queue
@@ -604,18 +808,29 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 	var completedPreviewFrame atomic.Uint64
 	var fskidDecodedCycle atomic.Uint64
 	var fskidFinishedCycle atomic.Uint64
-	go a.runRXTelemetryWorker(ctx, telemetryQueue, sampleRate, session)
-	go a.runRXPreviewWorker(ctx, previewQueue, &latestPreviewSequence, &completedPreviewFrame)
+	go a.runRXPreviewWorker(ctx, previewQueue, &latestPreviewSequence, &completedPreviewFrame, latestAFCOffset)
 	go a.runRXFrameWorker(ctx, frameQueue)
 	go a.runRXFSKIDWorker(ctx, fskidQueue, fskidDecoder, &fskidDecodedCycle, &fskidFinishedCycle)
 	activeMode := initialMode
+	var afcFrameID uint64
+	lastPreviewRows := 0
 	var fskidCycle rxFSKIDCycle
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case block := <-queue:
+		case block, ok := <-queue:
+			if !ok {
+				return
+			}
+			queueDepth := len(queue)
+			if decodeQueueDepth != nil {
+				decodeQueueDepth.Store(int64(queueDepth))
+			}
 			if block == nil {
+				if latestAFCOffset != nil {
+					latestAFCOffset.Store(math.Float64bits(0))
+				}
 				// The capture backend discarded a stale queue backlog. The SSTV
 				// raster must be reset because its line/sample clock crossed a gap.
 				// However, if a picture has already completed, MMSSTV sends FSKID
@@ -627,7 +842,6 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 				resetRXFSKIDAfterCaptureDiscontinuity(
 					fskidQueue, &fskidCycle, &fskidBatch, &fskidDecodedCycle,
 				)
-				enqueueRXTelemetry(telemetryQueue, rxTelemetryBlock{Discontinuity: true})
 				lastProgress = time.Time{}
 				if a.ctx != nil {
 					runtime.EventsEmit(a.ctx, "rx:progress", map[string]any{"active": false, "percent": 0})
@@ -638,16 +852,10 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 			if len(block) == 0 {
 				continue
 			}
-			receivedSamples += uint64(len(block))
+			blockMS := float64(len(block)) * 1000 / float64(max(1, sampleRate))
+			// Automatic gain control and spectrum fan-out already happened in the
+			// upstream aggregator. Decode exactly the same processed PCM samples.
 			pcm := audio.Float32ToPCM16(block)
-			var droppedBlocks uint64
-			if diagnostics, ok := session.(captureDiagnostics); ok {
-				droppedBlocks = diagnostics.DroppedCaptureBlocks()
-			}
-			telemetry := rxTelemetryBlock{Samples: block, ReceivedSamples: receivedSamples, DroppedBlocks: droppedBlocks}
-			// Spectrum is visualization-only and must never hold SSTV decoding.
-			enqueueRXTelemetry(telemetryQueue, telemetry)
-			a.appendCaptureDump(block, sampleRate*10)
 
 			// FSKID is transmitted after the analog picture. Scanning every live
 			// SSTV pixel as a possible preamble is expensive and can false-lock on
@@ -663,9 +871,21 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 					continue
 				}
 				activeMode = *requested
+				lastPreviewRows = 0
 				latestPreviewSequence.Add(1) // do not paint a stale image after mode changes
 			}
+			decodeStarted := time.Now()
 			events, err := decoder.Feed(ctx, pcm)
+			decodeMS := float64(time.Since(decodeStarted)) / float64(time.Millisecond)
+			if latestDecodeMS != nil {
+				latestDecodeMS.Store(math.Float64bits(decodeMS))
+			}
+			if frameID, offsetHz, active := decoder.AFCState(); active && frameID != afcFrameID {
+				afcFrameID = frameID
+				if latestAFCOffset != nil {
+					latestAFCOffset.Store(math.Float64bits(offsetHz))
+				}
+			}
 			progress, progressActive := decoder.Progress()
 			progressiveUpdates := decoder.DrainUpdates()
 			var trailingFrameAudio []int16
@@ -715,7 +935,19 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 			// JPEG/base64 conversion and Wails event delivery run on a separate
 			// latest-wins worker. A slow webview can skip an obsolete preview, but
 			// it can never stall the ordered PCM decoder and overflow audio queues.
+			// Reconstructing a partial image repeatedly costs more than the
+			// incremental audio path: each preview re-decodes all rows received so
+			// far. Publish only a few checkpoints per frame, and reduce that budget
+			// further whenever the ordered PCM queue or Feed cost indicates load.
 			for _, update := range progressiveUpdates {
+				minRowsDelta := max(1, update.TotalRows/4)
+				if queueDepth >= 2 || (blockMS > 0 && decodeMS >= blockMS*0.50) {
+					minRowsDelta = max(minRowsDelta, update.TotalRows/2)
+				}
+				if update.Rows < update.TotalRows && update.Rows-lastPreviewRows < minRowsDelta {
+					continue
+				}
+				lastPreviewRows = update.Rows
 				latestPreviewSequence.Store(update.Sequence)
 				enqueueLatestRXPreview(previewQueue, update)
 			}
@@ -730,6 +962,7 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 				continue
 			}
 			for _, event := range events {
+				lastPreviewRows = 0
 				completedPreviewFrame.Store(event.FrameID)
 				if a.ctx != nil {
 					runtime.EventsEmit(a.ctx, "rx:progress", map[string]any{"active": false, "percent": 100, "mode": event.Mode.Name, "modeId": event.Mode.ID, "rows": event.Mode.Height, "totalRows": event.Mode.Height, "complete": true})
@@ -888,7 +1121,7 @@ func enqueueLatestRXPreview(queue chan sstv.StreamUpdate, update sstv.StreamUpda
 	}
 }
 
-func (a *App) runRXPreviewWorker(ctx context.Context, queue <-chan sstv.StreamUpdate, latestSequence, completedFrame *atomic.Uint64) {
+func (a *App) runRXPreviewWorker(ctx context.Context, queue <-chan sstv.StreamUpdate, latestSequence, completedFrame, latestAFCOffset *atomic.Uint64) {
 	// Reassemble immutable frequency chunks incrementally. Every update carries
 	// the full slice of chunk headers (not sample copies), so if the latest-wins
 	// queue replaces an older update, this worker can still append all missing
@@ -913,9 +1146,18 @@ func (a *App) runRXPreviewWorker(ctx context.Context, queue <-chan sstv.StreamUp
 				previewFrequency = append(previewFrequency, update.FrequencyChunks[nextChunk]...)
 				nextChunk++
 			}
-			img, err := update.DecodeWithFrequency(ctx, previewFrequency)
+			img, offsets, err := update.DecodeWithFrequencyAndAFC(ctx, previewFrequency)
 			if err != nil || img == nil {
 				continue
+			}
+			if len(offsets) > 0 && latestAFCOffset != nil {
+				offsetHz := offsets[len(offsets)-1].OffsetHz
+				latestAFCOffset.Store(math.Float64bits(offsetHz))
+				runtime.EventsEmit(a.ctx, "rx:afc", map[string]any{
+					"offsetHz": offsetHz, "correctionHz": -offsetHz,
+					"sampleIndex": offsets[len(offsets)-1].SampleIndex,
+					"rangeHz": update.AFCMaxOffsetHz,
+				})
 			}
 			var preview bytes.Buffer
 			if err := jpeg.Encode(&preview, img, &jpeg.Options{Quality: 78}); err != nil {
@@ -927,18 +1169,44 @@ func (a *App) runRXPreviewWorker(ctx context.Context, queue <-chan sstv.StreamUp
 				continue
 			}
 			dataURL := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(preview.Bytes())
-			runtime.EventsEmit(a.ctx, "rx:preview", map[string]any{"image": dataURL, "mode": update.Mode.Name, "modeId": update.Mode.ID, "width": update.Mode.Width, "height": update.Mode.Height, "rows": update.Rows, "totalRows": update.TotalRows})
+			offsetHz := 0.0
+			if len(offsets) > 0 {
+				offsetHz = offsets[len(offsets)-1].OffsetHz
+			}
+			runtime.EventsEmit(a.ctx, "rx:preview", map[string]any{
+				"image": dataURL, "mode": update.Mode.Name, "modeId": update.Mode.ID,
+				"width": update.Mode.Width, "height": update.Mode.Height,
+				"rows": update.Rows, "totalRows": update.TotalRows,
+				"afcOffsetHz": offsetHz, "afcCorrectionHz": -offsetHz,
+			})
 		}
 	}
 }
 
 func materializeRXFrameEvent(ctx context.Context, event sstv.StreamEvent) (sstv.StreamEvent, error) {
 	if event.Image == nil && event.DecodeRequest != nil {
-		img, err := event.DecodeRequest.DecodeFinal(ctx)
+		img, offsets, err := event.DecodeRequest.DecodeFinalWithAFC(ctx)
 		if err != nil {
 			return event, err
 		}
 		event.Image = img
+		event.AFCOffsets = offsets
+		track := event.DecodeRequest.FrequencyTrack()
+		event.FrequencySpectrum = sstv.BuildAFCFrameSpectrum(
+			track, event.DecodeRequest.SampleRate, event.DecodeRequest.Mode,
+			event.DecodeRequest.BodyStart, offsets, 900, 700, 2700,
+		)
+		waterfall := sstv.BuildAFCFrameWaterfall(
+			track, event.DecodeRequest.SampleRate, event.DecodeRequest.Mode,
+			event.DecodeRequest.BodyStart, offsets, 512, 700, 2700,
+		)
+		if waterfall != nil {
+			var encoded bytes.Buffer
+			if err := png.Encode(&encoded, waterfall); err != nil {
+				return event, fmt.Errorf("encode AFC-corrected waterfall: %w", err)
+			}
+			event.WaterfallPNG = encoded.Bytes()
+		}
 	}
 	if event.Image == nil {
 		return event, errors.New("completed RX frame has neither an image nor a decode request")
@@ -968,9 +1236,25 @@ func (a *App) runRXFrameWorker(ctx context.Context, queue <-chan sstv.StreamEven
 				continue
 			}
 			dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes())
+			offsetHz := 0.0
+			if len(event.AFCOffsets) > 0 {
+				offsetHz = event.AFCOffsets[len(event.AFCOffsets)-1].OffsetHz
+			}
+			waterfallURL := ""
+			if len(event.WaterfallPNG) > 0 {
+				waterfallURL = "data:image/png;base64," + base64.StdEncoding.EncodeToString(event.WaterfallPNG)
+			}
 			now := time.Now()
 			_, saveErr := a.saveAlbumImage(event.Image, "rx", event.Mode.ID, "实时接收完成")
-			payload := map[string]any{"image": dataURL, "mode": event.Mode.Name, "modeId": event.Mode.ID, "width": event.Mode.Width, "height": event.Mode.Height, "timestamp": now.Format("2006-01-02 15:04:05"), "albumSaved": saveErr == nil}
+			payload := map[string]any{
+				"image": dataURL, "waterfallImage": waterfallURL,
+				"frameSpectrum": event.FrequencySpectrum,
+				"mode": event.Mode.Name, "modeId": event.Mode.ID,
+				"width": event.Mode.Width, "height": event.Mode.Height,
+				"timestamp": now.Format("2006-01-02 15:04:05"),
+				"albumSaved": saveErr == nil,
+				"afcOffsetHz": offsetHz, "afcCorrectionHz": -offsetHz,
+			}
 			if saveErr != nil {
 				payload["albumError"] = saveErr.Error()
 			}
@@ -982,61 +1266,121 @@ func (a *App) runRXFrameWorker(ctx context.Context, queue <-chan sstv.StreamEven
 }
 
 func enqueueRXTelemetry(queue chan rxTelemetryBlock, item rxTelemetryBlock) {
+	if queue == nil {
+		return
+	}
 	select {
 	case queue <- item:
 		return
 	default:
 	}
+	// Spectrum/waterfall are a latest-state display, not a lossless data path.
+	// Discard stale display blocks and mark the newest block as discontinuous
+	// so only the visualization tracker is reset. SSTV PCM is on another queue.
+	item.Discontinuity = true
 	for {
 		select {
 		case <-queue:
 		default:
-			queue <- rxTelemetryBlock{Discontinuity: true}
-			if !item.Discontinuity {
-				queue <- item
+			select {
+			case queue <- item:
+			default:
 			}
 			return
 		}
 	}
 }
 
-// runRXTelemetryWorker computes UI-only spectrum data away from the ordered
-// decoder path. Intermediate telemetry blocks may be coalesced; the SSTV PCM
-// stream itself is never coalesced here.
-func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetryBlock, sampleRate int, session appAudioRuntime) {
+// runRXTelemetryWorker is a best-effort display task. It keeps a short rolling
+// audio window, runs the discriminator only five times per second, and never
+// feeds work back into the ordered SSTV/FSKID queues.
+func (a *App) runRXTelemetryWorker(
+	ctx context.Context,
+	queue <-chan rxTelemetryBlock,
+	sampleRate int,
+	session appAudioRuntime,
+	latestAFCOffset, latestDecodeMS *atomic.Uint64,
+	decodeQueueDepth *atomic.Int64,
+	decodeQueueCapacity int,
+	droppedCounter *atomic.Uint64,
+) {
+	const (
+		analysisWindowMS = 200
+		updateInterval = 200 * time.Millisecond
+		noiseFloorDBFS = -88.0
+		minToneCoverage = 0.22
+		minToneCrest = 1.8
+	)
 	lastTelemetry := time.Time{}
 	lastCaptureError := ""
 	receivedSamples := uint64(0)
-	spectrumWindow := make([]float32, 0, spectrumFFTSize)
-	windowSamples := sstv.MMSSTVSpectrumWindowSamples(sampleRate)
-	cadence := time.Duration(float64(windowSamples) / float64(max(1, sampleRate)) * float64(time.Second))
+	displayTracker := sstv.NewCorrectedDisplayFrequencyTracker(sampleRate)
+	windowSamples := max(256, sampleRate*analysisWindowMS/1000)
+	analysisWindow := make([]float32, 0, windowSamples)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case item := <-queue:
+		case item, ok := <-queue:
+			if !ok {
+				return
+			}
 			if item.Discontinuity {
-				spectrumWindow = spectrumWindow[:0]
-				lastTelemetry = time.Time{}
-				continue
+				analysisWindow = analysisWindow[:0]
+				if displayTracker != nil {
+					displayTracker.Reset()
+				}
+				if len(item.Samples) == 0 {
+					continue
+				}
 			}
 			if len(item.Samples) == 0 {
 				continue
 			}
 			receivedSamples = item.ReceivedSamples
-			spectrumWindow = append(spectrumWindow, item.Samples...)
-			if len(spectrumWindow) > windowSamples {
-				spectrumWindow = append(spectrumWindow[:0], spectrumWindow[len(spectrumWindow)-windowSamples:]...)
+			analysisWindow = append(analysisWindow, item.Samples...)
+			if len(analysisWindow) > windowSamples {
+				excess := len(analysisWindow) - windowSamples
+				copy(analysisWindow, analysisWindow[excess:])
+				analysisWindow = analysisWindow[:windowSamples]
 			}
-			if len(spectrumWindow) < windowSamples || time.Since(lastTelemetry) < cadence {
+			if len(analysisWindow) < windowSamples || time.Since(lastTelemetry) < updateInterval {
 				continue
 			}
-			level := rmsDBFS(item.Samples)
-			spectrum := makeSpectrum(spectrumWindow, sampleRate)
-			peakHz, crest := spectrumPeak(spectrum)
-			droppedBlocks := item.DroppedBlocks + a.rxQueueDrops.Swap(0)
+
+			level := rmsDBFS(analysisWindow)
+			var spectrum []float64
+			peakHz, crest, toneCoverage := 0.0, 0.0, 0.0
+			signalPresent := false
+			if level >= noiseFloorDBFS && displayTracker != nil {
+				// Each analysis window is intentionally independent. A discontinuity
+				// in decoder processing cannot freeze or corrupt this display tracker.
+				displayTracker.Reset()
+				pcm := audio.Float32ToPCM16(analysisWindow)
+				offset := 0.0
+				if latestAFCOffset != nil {
+					offset = math.Float64frombits(latestAFCOffset.Load())
+				}
+				correctedFrequency := displayTracker.Process(pcm, offset)
+				toneCoverage = validDisplayFrequencyRatio(correctedFrequency, spectrumMinHz, spectrumMaxHz)
+				if toneCoverage >= minToneCoverage {
+					spectrum = sstv.FrequencyHistogramFromTrack(
+						correctedFrequency, displayTracker.SampleRate(),
+						spectrumBins, spectrumMinHz, spectrumMaxHz,
+					)
+					peakHz, crest = spectrumPeak(spectrum)
+					signalPresent = crest >= minToneCrest
+				}
+			}
+
+			droppedBlocks := uint64(0)
+			if droppedCounter != nil {
+				droppedBlocks = droppedCounter.Load()
+			}
 			if diagnostics, ok := session.(captureDiagnostics); ok {
-				droppedBlocks = diagnostics.DroppedCaptureBlocks()
+				if count := diagnostics.DroppedCaptureBlocks(); count > droppedBlocks {
+					droppedBlocks = count
+				}
 				if captureErr := diagnostics.CaptureError(); captureErr != "" && captureErr != lastCaptureError {
 					lastCaptureError = captureErr
 					if a.ctx != nil {
@@ -1044,12 +1388,50 @@ func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetry
 					}
 				}
 			}
+			afcOffset := 0.0
+			if latestAFCOffset != nil {
+				afcOffset = math.Float64frombits(latestAFCOffset.Load())
+			}
+			decodeMS := 0.0
+			if latestDecodeMS != nil {
+				decodeMS = math.Float64frombits(latestDecodeMS.Load())
+			}
+			queueDepth := 0
+			if decodeQueueDepth != nil {
+				queueDepth = int(decodeQueueDepth.Load())
+			}
 			if a.ctx != nil {
-				runtime.EventsEmit(a.ctx, "audio:telemetry", map[string]any{"dbfs": level, "spectrum": spectrum, "peakHz": peakHz, "crest": crest, "droppedBlocks": droppedBlocks, "samplesReceived": receivedSamples, "blockSamples": len(item.Samples)})
+				runtime.EventsEmit(a.ctx, "audio:telemetry", map[string]any{
+					"dbfs": level, "inputDbfs": item.InputDBFS, "spectrum": spectrum,
+					"signalPresent": signalPresent, "toneCoverage": toneCoverage,
+					"peakHz": peakHz, "crest": crest, "droppedBlocks": droppedBlocks,
+					"samplesReceived": receivedSamples, "blockSamples": len(item.Samples),
+					"inputPeak": item.InputPeak, "outputPeak": item.OutputPeak,
+					"attenuationDB": item.AttenuationDB,
+					"afcOffsetHz": afcOffset, "afcCorrectionHz": -afcOffset,
+					"inputClippedSamples": item.InputClippedSamples,
+					"autoAttenuator": item.AutoAttenuator,
+					"afcEnabled": item.AFCEnabled, "afcMaxOffsetHz": item.AFCMaxOffsetHz,
+					"rxQueueDepth": queueDepth, "rxQueueCapacity": decodeQueueCapacity,
+					"decodeMs": decodeMS, "blockMs": item.BlockMS,
+				})
 			}
 			lastTelemetry = time.Now()
 		}
 	}
+}
+
+func validDisplayFrequencyRatio(track []float64, minHz, maxHz float64) float64 {
+	if len(track) == 0 || maxHz <= minHz {
+		return 0
+	}
+	valid := 0
+	for _, frequency := range track {
+		if frequency >= minHz && frequency <= maxHz && !math.IsNaN(frequency) && !math.IsInf(frequency, 0) {
+			valid++
+		}
+	}
+	return float64(valid) / float64(len(track))
 }
 
 func rmsDBFS(samples []float32) float64 {
