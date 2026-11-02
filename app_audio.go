@@ -528,6 +528,7 @@ type rxTelemetryBlock struct {
 	InputPeak            float64
 	OutputPeak           float64
 	AttenuationDB        float64
+	AFCOffsetHz          float64
 	InputClippedSamples  uint64
 	AutoAttenuator       bool
 	AFCEnabled           bool
@@ -650,11 +651,13 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 	fskidBatch := make([]int16, 0, fskidBatchSamples*2)
 	var latestPreviewSequence atomic.Uint64
 	var completedPreviewFrame atomic.Uint64
+	var latestAFCOffset atomic.Uint64
+	latestAFCOffset.Store(math.Float64bits(0))
 	var fskidDecodedCycle atomic.Uint64
 	var fskidFinishedCycle atomic.Uint64
-	go a.runRXTelemetryWorker(ctx, telemetryQueue, sampleRate, session)
-	go a.runRXPreviewWorker(ctx, previewQueue, &latestPreviewSequence, &completedPreviewFrame)
-	go a.runRXFrameWorker(ctx, frameQueue)
+	go a.runRXTelemetryWorker(ctx, telemetryQueue, sampleRate, session, &latestAFCOffset)
+	go a.runRXPreviewWorker(ctx, previewQueue, &latestPreviewSequence, &completedPreviewFrame, &latestAFCOffset)
+	go a.runRXFrameWorker(ctx, frameQueue, &latestAFCOffset)
 	go a.runRXFSKIDWorker(ctx, fskidQueue, fskidDecoder, &fskidDecodedCycle, &fskidFinishedCycle)
 	activeMode := initialMode
 	var fskidCycle rxFSKIDCycle
@@ -742,6 +745,7 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 				trailingFrameAudio = decoder.PendingAudio()
 			}
 			a.rxDecoderMu.Unlock()
+			telemetry.AFCOffsetHz = math.Float64frombits(latestAFCOffset.Load())
 			enqueueRXTelemetry(telemetryQueue, telemetry)
 
 			// Process the completion signal before checking ActiveMode. Feed may
@@ -955,7 +959,7 @@ func enqueueLatestRXPreview(queue chan sstv.StreamUpdate, update sstv.StreamUpda
 	}
 }
 
-func (a *App) runRXPreviewWorker(ctx context.Context, queue <-chan sstv.StreamUpdate, latestSequence, completedFrame *atomic.Uint64) {
+func (a *App) runRXPreviewWorker(ctx context.Context, queue <-chan sstv.StreamUpdate, latestSequence, completedFrame, latestAFCOffset *atomic.Uint64) {
 	// Reassemble immutable frequency chunks incrementally. Every update carries
 	// the full slice of chunk headers (not sample copies), so if the latest-wins
 	// queue replaces an older update, this worker can still append all missing
@@ -980,9 +984,18 @@ func (a *App) runRXPreviewWorker(ctx context.Context, queue <-chan sstv.StreamUp
 				previewFrequency = append(previewFrequency, update.FrequencyChunks[nextChunk]...)
 				nextChunk++
 			}
-			img, err := update.DecodeWithFrequency(ctx, previewFrequency)
+			img, offsets, err := update.DecodeWithFrequencyAndAFC(ctx, previewFrequency)
 			if err != nil || img == nil {
 				continue
+			}
+			if len(offsets) > 0 && latestAFCOffset != nil {
+				offsetHz := offsets[len(offsets)-1].OffsetHz
+				latestAFCOffset.Store(math.Float64bits(offsetHz))
+				runtime.EventsEmit(a.ctx, "rx:afc", map[string]any{
+					"offsetHz": offsetHz, "correctionHz": -offsetHz,
+					"sampleIndex": offsets[len(offsets)-1].SampleIndex,
+					"rangeHz": update.AFCMaxOffsetHz,
+				})
 			}
 			var preview bytes.Buffer
 			if err := jpeg.Encode(&preview, img, &jpeg.Options{Quality: 78}); err != nil {
@@ -994,18 +1007,40 @@ func (a *App) runRXPreviewWorker(ctx context.Context, queue <-chan sstv.StreamUp
 				continue
 			}
 			dataURL := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(preview.Bytes())
-			runtime.EventsEmit(a.ctx, "rx:preview", map[string]any{"image": dataURL, "mode": update.Mode.Name, "modeId": update.Mode.ID, "width": update.Mode.Width, "height": update.Mode.Height, "rows": update.Rows, "totalRows": update.TotalRows})
+			offsetHz := 0.0
+			if len(offsets) > 0 {
+				offsetHz = offsets[len(offsets)-1].OffsetHz
+			}
+			runtime.EventsEmit(a.ctx, "rx:preview", map[string]any{
+				"image": dataURL, "mode": update.Mode.Name, "modeId": update.Mode.ID,
+				"width": update.Mode.Width, "height": update.Mode.Height,
+				"rows": update.Rows, "totalRows": update.TotalRows,
+				"afcOffsetHz": offsetHz, "afcCorrectionHz": -offsetHz,
+			})
 		}
 	}
 }
 
 func materializeRXFrameEvent(ctx context.Context, event sstv.StreamEvent) (sstv.StreamEvent, error) {
 	if event.Image == nil && event.DecodeRequest != nil {
-		img, err := event.DecodeRequest.DecodeFinal(ctx)
+		img, offsets, err := event.DecodeRequest.DecodeFinalWithAFC(ctx)
 		if err != nil {
 			return event, err
 		}
 		event.Image = img
+		event.AFCOffsets = offsets
+		track := event.DecodeRequest.FrequencyTrack()
+		waterfall := sstv.BuildAFCFrameWaterfall(
+			track, event.DecodeRequest.SampleRate, event.DecodeRequest.Mode,
+			event.DecodeRequest.BodyStart, offsets, 512, 700, 2700,
+		)
+		if waterfall != nil {
+			var encoded bytes.Buffer
+			if err := png.Encode(&encoded, waterfall); err != nil {
+				return event, fmt.Errorf("encode AFC-corrected waterfall: %w", err)
+			}
+			event.WaterfallPNG = encoded.Bytes()
+		}
 	}
 	if event.Image == nil {
 		return event, errors.New("completed RX frame has neither an image nor a decode request")
@@ -1013,7 +1048,7 @@ func materializeRXFrameEvent(ctx context.Context, event sstv.StreamEvent) (sstv.
 	return event, nil
 }
 
-func (a *App) runRXFrameWorker(ctx context.Context, queue <-chan sstv.StreamEvent) {
+func (a *App) runRXFrameWorker(ctx context.Context, queue <-chan sstv.StreamEvent, latestAFCOffset *atomic.Uint64) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -1035,9 +1070,27 @@ func (a *App) runRXFrameWorker(ctx context.Context, queue <-chan sstv.StreamEven
 				continue
 			}
 			dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes())
+			offsetHz := 0.0
+			if len(event.AFCOffsets) > 0 {
+				offsetHz = event.AFCOffsets[len(event.AFCOffsets)-1].OffsetHz
+				if latestAFCOffset != nil {
+					latestAFCOffset.Store(math.Float64bits(offsetHz))
+				}
+			}
+			waterfallURL := ""
+			if len(event.WaterfallPNG) > 0 {
+				waterfallURL = "data:image/png;base64," + base64.StdEncoding.EncodeToString(event.WaterfallPNG)
+			}
 			now := time.Now()
 			_, saveErr := a.saveAlbumImage(event.Image, "rx", event.Mode.ID, "实时接收完成")
-			payload := map[string]any{"image": dataURL, "mode": event.Mode.Name, "modeId": event.Mode.ID, "width": event.Mode.Width, "height": event.Mode.Height, "timestamp": now.Format("2006-01-02 15:04:05"), "albumSaved": saveErr == nil}
+			payload := map[string]any{
+				"image": dataURL, "waterfallImage": waterfallURL,
+				"mode": event.Mode.Name, "modeId": event.Mode.ID,
+				"width": event.Mode.Width, "height": event.Mode.Height,
+				"timestamp": now.Format("2006-01-02 15:04:05"),
+				"albumSaved": saveErr == nil,
+				"afcOffsetHz": offsetHz, "afcCorrectionHz": -offsetHz,
+			}
 			if saveErr != nil {
 				payload["albumError"] = saveErr.Error()
 			}
@@ -1070,11 +1123,12 @@ func enqueueRXTelemetry(queue chan rxTelemetryBlock, item rxTelemetryBlock) {
 // runRXTelemetryWorker computes UI-only spectrum data away from the ordered
 // decoder path. Intermediate telemetry blocks may be coalesced; the SSTV PCM
 // stream itself is never coalesced here.
-func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetryBlock, sampleRate int, session appAudioRuntime) {
+func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetryBlock, sampleRate int, session appAudioRuntime, latestAFCOffset *atomic.Uint64) {
 	lastTelemetry := time.Time{}
 	lastCaptureError := ""
 	receivedSamples := uint64(0)
-	spectrumWindow := make([]float32, 0, spectrumFFTSize)
+	displayTracker := sstv.NewCorrectedDisplayFrequencyTracker(sampleRate)
+	frequencyWindow := make([]float64, 0, spectrumFFTSize)
 	windowSamples := sstv.MMSSTVSpectrumWindowSamples(sampleRate)
 	cadence := time.Duration(float64(windowSamples) / float64(max(1, sampleRate)) * float64(time.Second))
 	for {
@@ -1083,7 +1137,7 @@ func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetry
 			return
 		case item := <-queue:
 			if item.Discontinuity {
-				spectrumWindow = spectrumWindow[:0]
+					frequencyWindow = frequencyWindow[:0]
 				lastTelemetry = time.Time{}
 				continue
 			}
@@ -1091,15 +1145,17 @@ func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetry
 				continue
 			}
 			receivedSamples = item.ReceivedSamples
-			spectrumWindow = append(spectrumWindow, item.Samples...)
-			if len(spectrumWindow) > windowSamples {
-				spectrumWindow = append(spectrumWindow[:0], spectrumWindow[len(spectrumWindow)-windowSamples:]...)
+			pcm := audio.Float32ToPCM16(item.Samples)
+			correctedFrequency := displayTracker.Process(pcm, item.AFCOffsetHz)
+			frequencyWindow = append(frequencyWindow, correctedFrequency...)
+			if len(frequencyWindow) > windowSamples {
+				frequencyWindow = append(frequencyWindow[:0], frequencyWindow[len(frequencyWindow)-windowSamples:]...)
 			}
-			if len(spectrumWindow) < windowSamples || time.Since(lastTelemetry) < cadence {
+			if len(frequencyWindow) < windowSamples || time.Since(lastTelemetry) < cadence {
 				continue
 			}
 			level := rmsDBFS(item.Samples)
-			spectrum := makeSpectrum(spectrumWindow, sampleRate)
+			spectrum := sstv.FrequencyHistogramFromTrack(frequencyWindow, sampleRate, spectrumBins, spectrumMinHz, spectrumMaxHz)
 			peakHz, crest := spectrumPeak(spectrum)
 			droppedBlocks := item.DroppedBlocks + a.rxQueueDrops.Swap(0)
 			if diagnostics, ok := session.(captureDiagnostics); ok {
@@ -1118,6 +1174,7 @@ func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetry
 					"samplesReceived": receivedSamples, "blockSamples": len(item.Samples),
 					"inputPeak": item.InputPeak, "outputPeak": item.OutputPeak,
 					"attenuationDB": item.AttenuationDB,
+					"afcOffsetHz": item.AFCOffsetHz, "afcCorrectionHz": -item.AFCOffsetHz,
 					"inputClippedSamples": item.InputClippedSamples,
 					"autoAttenuator": item.AutoAttenuator,
 					"afcEnabled": item.AFCEnabled, "afcMaxOffsetHz": item.AFCMaxOffsetHz,
