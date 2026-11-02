@@ -1142,7 +1142,7 @@ func enqueueRXTelemetry(queue chan rxTelemetryBlock, item rxTelemetryBlock) {
 // feeds work back into the ordered SSTV/FSKID queues.
 func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetryBlock, sampleRate int, session appAudioRuntime) {
 	const (
-		analysisWindowMS = 120
+		analysisWindowMS = 200
 		updateInterval   = 200 * time.Millisecond
 		noiseFloorDBFS   = -88.0
 		minToneCoverage  = 0.22
