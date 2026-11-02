@@ -1038,17 +1038,42 @@ func (c *sampleClock) scanRange(freq []float64, width int, totalMS, minHz, maxHz
 		if hi <= lo {
 			lo, hi = start, end
 		}
-		sum, count := 0.0, 0
-		for i := lo; i < hi; i++ {
-			if freq[i] > 80 && freq[i] < 3_900 {
-				sum += freq[i]
-				count++
+
+		// At low audio rates a narrow-band SSTV pixel can contain less than
+		// one carrier cycle (MP73-N is about 3.5 samples/pixel at 8 kHz).
+		// Estimating only the middle half of that interval makes the result
+		// phase-dependent and produces large chroma errors. For narrow video
+		// ranges, borrow a small amount of context from adjacent pixels while
+		// keeping the current pixel centre at full weight. The image tone is
+		// locally smooth in ordinary rasters; the one-sided edge handling
+		// avoids mixing the previous channel at the start of a scan.
+		pixelSamples := pixelSeconds * float64(c.rate)
+		if maxHz-minHz <= 512 && pixelSamples < 8 {
+			margin := max(1, int(math.Ceil(pixelSamples*0.5)))
+			if x > 0 {
+				lo = max(0, lo-margin)
+			}
+			if x+1 < width {
+				hi = min(len(freq), hi+margin)
 			}
 		}
-		if count == 0 {
+		sum, weightSum := 0.0, 0.0
+		for i := lo; i < hi; i++ {
+			if freq[i] <= 80 || freq[i] >= 3_900 {
+				continue
+			}
+			weight := 0.35
+			if i >= start+n/4 && i < end-n/4 {
+				weight = 1.0
+			}
+			sum += freq[i] * weight
+			weightSum += weight
+		}
+		count := int(weightSum)
+		if weightSum <= 0 {
 			return nil, fmt.Errorf("unable to estimate SSTV pixel frequency at pixel %d (samples %d..%d)", x, start, end)
 		}
-		out[x] = frequencyToByteRange(sum/float64(count)-c.offset, minHz, maxHz)
+		out[x] = frequencyToByteRange(sum/weightSum-c.offset, minHz, maxHz)
 	}
 	return out, nil
 }
