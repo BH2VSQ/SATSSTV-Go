@@ -460,7 +460,7 @@ func TestDefaultAudioSettingsEnableRXProtection(t *testing.T) {
 	if !cfg.AutoAttenuatorEnabled || !cfg.AFCEnabled {
 		t.Fatalf("RX protection defaults should be enabled: %+v", cfg)
 	}
-	if cfg.AttenuatorTargetDBFS != -3 || cfg.AttenuatorMaxReductionDB != 24 || cfg.AFCMaxOffsetHz != 300 {
+	if cfg.AttenuatorTargetDBFS != -3 || cfg.AttenuatorMaxReductionDB != 24 || cfg.AFCMaxOffsetHz != 500 {
 		t.Fatalf("unexpected RX protection defaults: %+v", cfg)
 	}
 }
