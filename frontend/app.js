@@ -839,6 +839,7 @@ let waterfallOff = null;
 let waterfallNextRow = 0;
 let waterfallRowImage = null;
 let completedWaterfallImage = null;
+let completedFrameViewHeld = false;
 let frameProgressActive = false;
 let currentInputDBFS = -120;
 let currentAttenuationDB = 0;
@@ -849,6 +850,7 @@ function resetWaterfall() {
   waterfallNextRow = 0;
   waterfallHistory = [];
   completedWaterfallImage = null;
+  completedFrameViewHeld = false;
 }
 function appendWaterfallRow(values) {
   if (!Array.isArray(values) || !values.length) return;
@@ -1092,7 +1094,12 @@ function bindRuntimeEvents() {
       baseHint = t('adcClippingWarning', { count: clipped, level: rawDBFS.toFixed(1) });
     }
     $('rxHint').textContent = [baseHint, ...hints].filter(Boolean).join(' · ');
-    renderLiveSpectrum(data?.spectrum, true);
+    // After a complete SSTV raster, keep its exact AFC-corrected spectrum
+    // visible while unrelated trailing FSKID/silence audio continues. The
+    // attenuation and AFC metrics above remain live.
+    if (!completedFrameViewHeld || frameProgressActive) {
+      renderLiveSpectrum(data?.spectrum, true);
+    }
     $('spectrumOverlay').style.display = 'none';
   });
   window.runtime.EventsOn('rx:afc', (data) => {
@@ -1176,7 +1183,8 @@ function bindRuntimeEvents() {
       const completed = new Image();
       completed.onload = () => {
         completedWaterfallImage = completed;
-        if (Array.isArray(data?.frameSpectrum)) renderLiveSpectrum(data.frameSpectrum, false);
+        completedFrameViewHeld = Array.isArray(data?.frameSpectrum) && data.frameSpectrum.length > 0;
+        if (completedFrameViewHeld) renderLiveSpectrum(data.frameSpectrum, false);
         else drawIdleSpectrum();
       };
       completed.src = data.waterfallImage;
