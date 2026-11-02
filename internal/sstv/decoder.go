@@ -733,7 +733,74 @@ func (c *sampleClock) syncInternal(durationMS, searchMS float64, detectFirst boo
 // syncFromFrequency keeps progressive previews synchronized even though they
 // intentionally do not retain raw PCM. The discriminator track is sufficient
 // to identify the stable 1200 Hz line-sync segment and estimate its offset.
+// syncFromFrequencyLegacy preserves the original frequency-only sync
+// detector used by non-AFC one-shot/progressive decoding. The wider adaptive
+// detector below is reserved for explicitly AFC-enabled live receive.
+func (c *sampleClock) syncFromFrequencyLegacy(durationMS, searchMS float64) bool {
+	pulseSamples := int(math.Round(durationMS / 1000 * float64(c.rate)))
+	if pulseSamples <= 0 || pulseSamples > len(c.frequency) {
+		c.skip(durationMS)
+		return false
+	}
+	expected := c.pos
+	searchSamples := int(math.Round(math.Max(0, searchMS) / 1000 * float64(c.rate)))
+	minStart := max(0, expected-searchSamples)
+	maxStart := min(len(c.frequency)-pulseSamples, expected+searchSamples)
+	if maxStart < minStart {
+		c.skip(durationMS)
+		return false
+	}
+	target := HorizontalSync + c.offset
+	scoreAt := func(start int) float64 {
+		lo := start + pulseSamples/5
+		hi := start + pulseSamples*4/5
+		valid, matched := 0, 0
+		for i := lo; i < hi; i++ {
+			f := c.frequency[i]
+			if f < 100 || f > 4_000 || math.IsNaN(f) || math.IsInf(f, 0) {
+				continue
+			}
+			valid++
+			if math.Abs(f-target) <= 90 {
+				matched++
+			}
+		}
+		if valid < max(6, (hi-lo)/4) {
+			return 0
+		}
+		return float64(matched) / float64(valid)
+	}
+	bestStart, bestScore := expected, 0.0
+	bestDistance := int(^uint(0) >> 1)
+	step := max(1, c.rate/4_000)
+	for start := minStart; start <= maxStart; start += step {
+		score := scoreAt(start)
+		distance := absInt(start - expected)
+		if score > bestScore+1e-9 || (math.Abs(score-bestScore) <= 1e-9 && distance < bestDistance) {
+			bestStart, bestScore, bestDistance = start, score, distance
+		}
+	}
+	if bestScore < 0.25 {
+		c.skip(durationMS)
+		return false
+	}
+	refineStart, refineEnd := max(minStart, bestStart-step), min(maxStart, bestStart+step)
+	for start := refineStart; start <= refineEnd; start++ {
+		score := scoreAt(start)
+		distance := absInt(start - expected)
+		if score > bestScore+1e-9 || (math.Abs(score-bestScore) <= 1e-9 && distance < bestDistance) {
+			bestStart, bestScore, bestDistance = start, score, distance
+		}
+	}
+	c.pos = bestStart + pulseSamples
+	c.fractional = 0
+	return true
+}
+
 func (c *sampleClock) syncFromFrequency(durationMS, searchMS float64) bool {
+	if !c.afcEnabled {
+		return c.syncFromFrequencyLegacy(durationMS, searchMS)
+	}
 	pulseSamples := int(math.Round(durationMS / 1000 * float64(c.rate)))
 	if pulseSamples <= 0 || pulseSamples > len(c.frequency) {
 		c.skip(durationMS)
@@ -981,9 +1048,13 @@ type bandPass struct {
 }
 
 func newBandPass(fs float64) bandPass {
-	// Preserve the complete SSTV audio band when a linear-satellite receiver
-	// translates it by several hundred hertz. A narrow 900..2800 Hz filter
-	// clips useful tones before AFC can measure their offset.
+	// Preserve the established passband for ordinary, non-AFC decoding.
+	return bandPass{hp: biquadHighPass(900, fs), lp: biquadLowPass(2800, fs)}
+}
+
+func newWideBandPass(fs float64) bandPass {
+	// AFC-enabled live reception must retain video and VIS tones after an SSB
+	// receiver translates them by several hundred hertz.
 	return bandPass{
 		hp: biquadHighPass(120, fs),
 		lp: biquadLowPass(math.Min(3_800, fs*0.46), fs),
@@ -1042,11 +1113,22 @@ type frequencyTracker struct {
 }
 
 func newFrequencyTracker(sampleRate int) *frequencyTracker {
+	return newStreamFrequencyTracker(sampleRate, false)
+}
+
+// newStreamFrequencyTracker selects a wide discriminator front-end only for
+// the live AFC path. One-shot/legacy decode keeps the established MMSSTV-like
+// passband so improved satellite offset tolerance cannot alter its baseline.
+func newStreamFrequencyTracker(sampleRate int, wideOffset bool) *frequencyTracker {
+	bp := newBandPass(float64(sampleRate))
+	if wideOffset {
+		bp = newWideBandPass(float64(sampleRate))
+	}
 	return &frequencyTracker{
 		rate: sampleRate,
-		freq: 0, // no tone yet
-		bp:   newBandPass(float64(sampleRate)),
-		agc:  *newAGC(sampleRate),
+		freq: 0,
+		bp: bp,
+		agc: *newAGC(sampleRate),
 	}
 }
 
@@ -1567,7 +1649,7 @@ func (d *StreamDecoder) Feed(ctx context.Context, samples []int16) ([]StreamEven
 			// Idle: maintain an incremental frequency track for header detection
 			// instead of re-demodulating the whole pending buffer every feed.
 			if d.idleTracker == nil {
-				d.idleTracker = newFrequencyTracker(d.rate)
+				d.idleTracker = newStreamFrequencyTracker(d.rate, d.afcEnabled)
 			}
 			d.idleFreq = append(d.idleFreq, d.idleTracker.Process(samples)...)
 		}
@@ -1648,7 +1730,7 @@ func (d *StreamDecoder) Feed(ctx context.Context, samples []int16) ([]StreamEven
 			bodyStart -= headerStart
 			d.mode, d.bodyStart, d.activeVIS = &spec, bodyStart, vis
 			d.frameID++
-			d.tracker = newFrequencyTracker(d.rate)
+			d.tracker = newStreamFrequencyTracker(d.rate, d.afcEnabled)
 			initialFrequency := d.tracker.Process(d.pending)
 			d.freqChunks = nil
 			if len(initialFrequency) > 0 {
@@ -1783,7 +1865,7 @@ func (d *StreamDecoder) finishActiveFrame(frameEnd int) {
 		d.idleFreq = frequencyChunksTail(d.freqChunks, frameEnd)
 		d.idleTracker = d.tracker
 	} else {
-		d.idleTracker = newFrequencyTracker(d.rate)
+		d.idleTracker = newStreamFrequencyTracker(d.rate, d.afcEnabled)
 		d.idleFreq = d.idleTracker.Process(remaining)
 	}
 
