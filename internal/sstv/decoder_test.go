@@ -1220,11 +1220,11 @@ func TestStableMeanFreqQuickRejectsBroadbandFrequencySpread(t *testing.T) {
 		stable[i] = 1_900 + float64((i%5)-2)*3
 		noisy[i] = 900 + float64((i*7919)%2_400)
 	}
-	mean, spread, coverage := stableMeanFreqQuick(stable, 0, len(stable), 48)
+	mean, spread, coverage := stableMeanFreqQuick(stable, 0, len(stable), 6)
 	if math.Abs(mean-1_900) > 1 || spread > 10 || coverage < 0.99 {
 		t.Fatalf("stable carrier stats = mean %.1f, spread %.1f, coverage %.3f", mean, spread, coverage)
 	}
-	_, noiseSpread, noiseCoverage := stableMeanFreqQuick(noisy, 0, len(noisy), 48)
+	_, noiseSpread, noiseCoverage := stableMeanFreqQuick(noisy, 0, len(noisy), 6)
 	if noiseCoverage < 0.99 {
 		t.Fatalf("broadband track coverage = %.3f, want >0.99", noiseCoverage)
 	}
