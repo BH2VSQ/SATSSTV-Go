@@ -1054,6 +1054,16 @@ function bindRuntimeEvents() {
       hints.push(t('attenuationApplied', { db: Number(data.attenuationDB).toFixed(1) }));
     }
     if (data?.afcEnabled) hints.push(t('afcApplied', { range: Number(data.afcMaxOffsetHz || 300).toFixed(0) }));
+    const decodeMS = Number(data?.decodeMs || 0);
+    const blockMS = Number(data?.blockMs || 0);
+    const queueDepth = Number(data?.rxQueueDepth || 0);
+    const queueCapacity = Number(data?.rxQueueCapacity || 64);
+    if (blockMS > 0 && (decodeMS > blockMS * 0.6 || queueDepth >= 8)) {
+      hints.push(t('rxDSPTiming', {
+        decode: decodeMS.toFixed(1), block: blockMS.toFixed(1),
+        queue: queueDepth, capacity: queueCapacity
+      }));
+    }
     let baseHint = data?.droppedBlocks
       ? t('droppedAudioBlocks', { count: data.droppedBlocks })
       : (dbfs < -90 ? t('inputNearSilence', { count: samplesReceived.toLocaleString() }) : t('samplesCount', { count: samplesReceived.toLocaleString() }));

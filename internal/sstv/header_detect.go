@@ -21,6 +21,13 @@ func DetectModeHeader(samples []int16, sampleRate int) (ModeSpec, uint8, int, er
 }
 
 func detectModeHeaderFrom(samples []int16, freq []float64, sampleRate, startAt int) (spec ModeSpec, vis uint8, bodyStart, headerStart, nextStart int, retErr error) {
+	return detectModeHeaderFromRange(samples, freq, sampleRate, startAt, 350)
+}
+
+func detectModeHeaderFromRange(samples []int16, freq []float64, sampleRate, startAt int, maxOffsetHz float64) (spec ModeSpec, vis uint8, bodyStart, headerStart, nextStart int, retErr error) {
+	if maxOffsetHz < 20 || maxOffsetHz > 1_000 {
+		maxOffsetHz = 350
+	}
 	if sampleRate < 8_000 || sampleRate > 192_000 {
 		return ModeSpec{}, 0, 0, startAt, startAt, fmt.Errorf("invalid sample rate %d", sampleRate)
 	}
@@ -29,7 +36,7 @@ func detectModeHeaderFrom(samples []int16, freq []float64, sampleRate, startAt i
 
 	// Probe ordinary VIS first, then verify any registered code against the
 	// longer MMSSTV header families before committing to Auto mode selection.
-	visCode, afterVIS, nextVIS, visErr := detectVISFrom(samples, freq, sampleRate, startAt)
+	visCode, afterVIS, nextVIS, visErr := detectVISFromRange(samples, freq, sampleRate, startAt, maxOffsetHz)
 	if visErr == nil {
 		headerStart = afterVIS - int(math.Round(0.910*float64(sampleRate)))
 		if found, ok := ModeFromVIS(visCode); ok {
@@ -47,7 +54,7 @@ func detectModeHeaderFrom(samples []int16, freq []float64, sampleRate, startAt i
 			// MMSSTV 16-bit VIS. Always verify the longer header formats before
 			// locking Auto to a standard mode, even when the leader starts at the
 			// current search cursor.
-			if code, offset, next, err := detectExtendedVISFrom(samples, freq, sampleRate, startAt); err == nil {
+			if code, offset, next, err := detectExtendedVISFromRange(samples, freq, sampleRate, startAt, maxOffsetHz); err == nil {
 				extendedStart := offset - int(math.Round(mmsstvExtendedHeaderMS/1000*float64(sampleRate)))
 				if foundExtended, ok := ModeFromExtendedVIS(code); ok && extendedStart <= headerStart {
 					return foundExtended, 0x23, offset, extendedStart, next, nil
@@ -58,7 +65,7 @@ func detectModeHeaderFrom(samples []int16, freq []float64, sampleRate, startAt i
 				}
 				nextCandidates = append(nextCandidates, next)
 			}
-			if code, offset, next, err := detectNarrowVISFrom(samples, freq, sampleRate, startAt); err == nil {
+			if code, offset, next, err := detectNarrowVISFromRange(samples, freq, sampleRate, startAt, maxOffsetHz); err == nil {
 				narrowStart := offset - int(math.Round(narrowVISHeaderMS/1000*float64(sampleRate)))
 				if foundNarrow, ok := ModeFromNarrowVIS(code); ok && narrowStart < headerStart {
 					return foundNarrow, code, offset, narrowStart, next, nil
@@ -76,14 +83,14 @@ func detectModeHeaderFrom(samples []int16, freq []float64, sampleRate, startAt i
 		nextCandidates = append(nextCandidates, nextVIS)
 	}
 
-	if code, offset, next, err := detectExtendedVISFrom(samples, freq, sampleRate, startAt); err == nil {
+	if code, offset, next, err := detectExtendedVISFromRange(samples, freq, sampleRate, startAt, maxOffsetHz); err == nil {
 		if found, ok := ModeFromExtendedVIS(code); ok {
 			return found, 0x23, offset, offset - int(math.Round(mmsstvExtendedHeaderMS/1000*float64(sampleRate))), next, nil
 		}
 	} else {
 		nextCandidates = append(nextCandidates, next)
 	}
-	if code, offset, next, err := detectNarrowVISFrom(samples, freq, sampleRate, startAt); err == nil {
+	if code, offset, next, err := detectNarrowVISFromRange(samples, freq, sampleRate, startAt, maxOffsetHz); err == nil {
 		if found, ok := ModeFromNarrowVIS(code); ok {
 			return found, code, offset, offset - int(math.Round(narrowVISHeaderMS/1000*float64(sampleRate))), next, nil
 		}
@@ -115,6 +122,13 @@ func detectModeHeaderFrom(samples []int16, freq []float64, sampleRate, startAt i
 // the mode-family leader and break sequence, so random audio cannot immediately
 // open a raster. Auto mode always requires a fully valid header.
 func detectFixedModePrefix(samples []int16, freq []float64, rate, startAt int, spec ModeSpec) (ModeSpec, uint8, int, int, int, error) {
+	return detectFixedModePrefixRange(samples, freq, rate, startAt, spec, 350)
+}
+
+func detectFixedModePrefixRange(samples []int16, freq []float64, rate, startAt int, spec ModeSpec, maxOffsetHz float64) (ModeSpec, uint8, int, int, int, error) {
+	if maxOffsetHz < 20 || maxOffsetHz > 1_000 {
+		maxOffsetHz = 350
+	}
 	if rate < 8_000 || rate > 192_000 {
 		return ModeSpec{}, 0, 0, startAt, startAt, fmt.Errorf("invalid sample rate %d", rate)
 	}
@@ -150,7 +164,7 @@ func detectFixedModePrefix(samples []int16, freq []float64, rate, startAt int, s
 	maxStart := min(len(samples)-headerN, rate*3)
 	for coarse := start; coarse <= maxStart; coarse += step {
 		offset := meanFreqQuick(freq, coarse, leaderN, max(1, rate/8_000)) - 1_900
-		if offset < -350 || offset > 350 {
+		if offset < -maxOffsetHz || offset > maxOffsetHz {
 			continue
 		}
 		low, high := max(startAt, coarse-step), min(maxStart, coarse+step)
@@ -182,6 +196,13 @@ func detectFixedModePrefix(samples []int16, freq []float64, rate, startAt int, s
 }
 
 func detectExtendedVISFrom(samples []int16, freq []float64, rate, startAt int) (uint16, int, int, error) {
+	return detectExtendedVISFromRange(samples, freq, rate, startAt, 350)
+}
+
+func detectExtendedVISFromRange(samples []int16, freq []float64, rate, startAt int, maxOffsetHz float64) (uint16, int, int, error) {
+	if maxOffsetHz < 20 || maxOffsetHz > 1_000 {
+		maxOffsetHz = 350
+	}
 	headerN := int(math.Round(mmsstvExtendedHeaderMS / 1000 * float64(rate)))
 	if len(samples) < headerN {
 		return 0, 0, startAt, errors.New("audio is too short for MMSSTV extended VIS")
@@ -198,7 +219,7 @@ func detectExtendedVISFrom(samples []int16, freq []float64, rate, startAt int) (
 		// expected frequency. A continuous 1900 Hz idle tone must not trigger a
 		// 300 ms Goertzel scan at every 2 ms search position.
 		leader := meanFreqQuick(freq, p, leaderN, quickStride)
-		if leader < 1_550 || leader > 2_250 {
+		if leader < 1_900-maxOffsetHz || leader > 1_900+maxOffsetHz {
 			continue
 		}
 		offset := leader - 1_900
@@ -246,6 +267,13 @@ func detectExtendedVISFrom(samples []int16, freq []float64, rate, startAt int) (
 }
 
 func detectNarrowVISFrom(samples []int16, freq []float64, rate, startAt int) (uint8, int, int, error) {
+	return detectNarrowVISFromRange(samples, freq, rate, startAt, 350)
+}
+
+func detectNarrowVISFromRange(samples []int16, freq []float64, rate, startAt int, maxOffsetHz float64) (uint8, int, int, error) {
+	if maxOffsetHz < 20 || maxOffsetHz > 1_000 {
+		maxOffsetHz = 350
+	}
 	headerN := int(math.Round(narrowVISHeaderMS / 1000 * float64(rate)))
 	if len(samples) < headerN {
 		return 0, 0, startAt, errors.New("audio is too short for N-VIS")
@@ -259,7 +287,7 @@ func detectNarrowVISFrom(samples []int16, freq []float64, rate, startAt int) (ui
 	for ; start <= maxStart; start += step {
 		p := start
 		leader := meanFreqQuick(freq, p, leaderN, quickStride)
-		if leader < 1_550 || leader > 2_250 {
+		if leader < 1_900-maxOffsetHz || leader > 1_900+maxOffsetHz {
 			continue
 		}
 		offset := leader - 1_900

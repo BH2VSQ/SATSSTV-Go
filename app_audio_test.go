@@ -490,3 +490,20 @@ func TestNormalizeAudioSettingsRejectsInvalidAFCAndAttenuatorTargets(t *testing.
 		t.Fatal("expected invalid attenuator target to be rejected")
 	}
 }
+
+func TestRXAudioQueueHasSingleJitterBufferBudget(t *testing.T) {
+	const rxQueueCapacity = 64
+	queue := make(chan []float32, rxQueueCapacity)
+	for i := 0; i < rxQueueCapacity; i++ {
+		queue <- []float32{float32(i)}
+	}
+	if dropped := enqueueRXBlock(queue, []float32{99}); dropped != rxQueueCapacity {
+		t.Fatalf("full jitter queue discarded %d blocks, want %d", dropped, rxQueueCapacity)
+	}
+	if got := <-queue; got != nil {
+		t.Fatalf("first item after overflow = %v, want discontinuity marker", got)
+	}
+	if got := <-queue; len(got) != 1 || got[0] != 99 {
+		t.Fatalf("newest item after overflow = %v, want [99]", got)
+	}
+}

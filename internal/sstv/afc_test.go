@@ -242,3 +242,48 @@ func TestStreamLeaderOffsetHonorsAFCWindow(t *testing.T) {
 		t.Fatalf("offset outside ±200 Hz window should be rejected, got %.1f Hz", got)
 	}
 }
+
+func TestLiveHeaderSearchHonorsConfiguredWideAFCWindow(t *testing.T) {
+	const rate = 48_000
+	for _, offset := range []float64{-600, 600} {
+		t.Run(fmt.Sprintf("offset_%+.0fHz", offset), func(t *testing.T) {
+			generator, err := NewToneGenerator(rate, 0.35)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := WriteVIS(generator, 8); err != nil {
+				t.Fatal(err)
+			}
+			samples := append(generator.Samples(), make([]int16, rate)...)
+			shifted := shiftFrequency(samples, rate, offset)
+			freq := newFrequencyTracker(rate).Process(shifted)
+			detected, vis, _, err := detectModeHeaderFromRange(shifted, freq, rate, 0, 700)
+			if err != nil {
+				t.Fatalf("live header search failed at %+.0f Hz: %v", offset, err)
+			}
+			if detected.ID != Robot36ID || vis != 8 {
+				t.Fatalf("detected %s / VIS %d at %+.0f Hz", detected.ID, vis, offset)
+			}
+		})
+	}
+}
+
+func TestSampleClockAFCLocksSyncBeyondOldNinetyHertzWindow(t *testing.T) {
+	const rate = 12_000
+	frequency := make([]float64, rate/2)
+	for i := range frequency {
+		frequency[i] = 1_900
+	}
+	const start = 200
+	const pulseSamples = rate * 9 / 1_000
+	for i := start; i < start+pulseSamples; i++ {
+		frequency[i] = HorizontalSync + 260
+	}
+	clock := sampleClock{rate: rate, pos: start, frequency: frequency, afcEnabled: true, afcMaxOffsetHz: 300}
+	if !clock.syncFirst(9, 2) {
+		t.Fatal("AFC did not acquire a 1200+260 Hz horizontal-sync pulse")
+	}
+	if math.Abs(clock.offset-260) > 5 {
+		t.Fatalf("AFC offset = %.1f Hz, want approximately 260 Hz", clock.offset)
+	}
+}

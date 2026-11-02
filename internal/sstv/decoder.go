@@ -33,6 +33,13 @@ func DetectVIS(samples []int16, sampleRate int) (uint8, int, error) {
 // 910 ms header was unavailable, or the next offset after this search window.
 // StreamDecoder uses it to avoid rescanning the same idle audio on every feed.
 func detectVISFrom(samples []int16, freq []float64, sampleRate, startAt int) (code uint8, bodyStart, nextStart int, retErr error) {
+	return detectVISFromRange(samples, freq, sampleRate, startAt, 350)
+}
+
+func detectVISFromRange(samples []int16, freq []float64, sampleRate, startAt int, maxOffsetHz float64) (code uint8, bodyStart, nextStart int, retErr error) {
+	if maxOffsetHz < 20 || maxOffsetHz > 1_000 {
+		maxOffsetHz = 350
+	}
 	if sampleRate < 8_000 || sampleRate > 192_000 {
 		return 0, 0, startAt, fmt.Errorf("invalid sample rate %d", sampleRate)
 	}
@@ -54,7 +61,7 @@ func detectVISFrom(samples []int16, freq []float64, sampleRate, startAt int) (co
 		// SSB tuning can move the entire audio passband by several hundred
 		// hertz. A fixed-mode receiver already accepted this broader AFC range;
 		// Auto must search the same practical window before rejecting VIS.
-		if leaderFreq < 1_550 || leaderFreq > 2_250 {
+		if leaderFreq < 1_900-maxOffsetHz || leaderFreq > 1_900+maxOffsetHz {
 			continue
 		}
 		offset := leaderFreq - 1_900
@@ -227,7 +234,7 @@ func meanFreq(freq []float64, start, n int) float64 {
 	end := min(start+n, len(freq))
 	sum, count := 0.0, 0
 	for i := start; i < end; i++ {
-		if freq[i] > 500 && freq[i] < 3_500 {
+		if freq[i] > 80 && freq[i] < 3_900 {
 			sum += freq[i]
 			count++
 		}
@@ -254,7 +261,7 @@ func meanFreqQuick(freq []float64, start, n, stride int) float64 {
 	sum := 0.0
 	count := 0
 	for i := start; i < end; i += stride {
-		if f := freq[i]; f > 500 && f < 3_500 {
+		if f := freq[i]; f > 80 && f < 3_900 {
 			sum += f
 			count++
 		}
@@ -270,7 +277,7 @@ func meanFreqQuick(freq []float64, start, n, stride int) float64 {
 func toneNear(seg []float64, expected, tolerance float64) bool {
 	sum, count := 0.0, 0
 	for _, f := range seg {
-		if f > 500 && f < 3_500 {
+		if f > 80 && f < 3_900 {
 			sum += f
 			count++
 		}
@@ -615,6 +622,12 @@ func (c *sampleClock) syncInternal(durationMS, searchMS float64, detectFirst boo
 			return false
 		}
 	}
+	if len(c.frequency) > 0 && c.afcEnabled {
+		// Use the measured frequency track to find sync across the entire
+		// configured AFC range. A single-frequency Goertzel probe around the
+		// old offset could never acquire a pulse outside its narrow passband.
+		return c.syncFromFrequency(durationMS, searchMS)
+	}
 	if len(c.samples) == 0 {
 		if len(c.frequency) > 0 {
 			return c.syncFromFrequency(durationMS, searchMS)
@@ -731,25 +744,49 @@ func (c *sampleClock) syncFromFrequency(durationMS, searchMS float64) bool {
 		c.skip(durationMS)
 		return false
 	}
+	maxOffset := 90.0
+	if c.afcEnabled {
+		maxOffset = c.afcMaxOffsetHz
+		if maxOffset < 20 || maxOffset > 1_000 {
+			maxOffset = 300
+		}
+	}
 	target := HorizontalSync + c.offset
+	minimumTone := HorizontalSync - maxOffset - 35
+	maximumTone := HorizontalSync + maxOffset + 35
 	scoreAt := func(start int) float64 {
 		lo := start + pulseSamples/5
 		hi := start + pulseSamples*4/5
-		valid, matched := 0, 0
+		valid := 0
+		sum, sumSquares := 0.0, 0.0
 		for i := lo; i < hi; i++ {
 			f := c.frequency[i]
-			if f < 100 || f > 4_000 || math.IsNaN(f) || math.IsInf(f, 0) {
+			if f < 80 || f > 3_900 || math.IsNaN(f) || math.IsInf(f, 0) {
 				continue
 			}
 			valid++
-			if math.Abs(f-target) <= 90 {
-				matched++
-			}
+			sum += f
+			sumSquares += f * f
 		}
-		if valid < max(6, (hi-lo)/4) {
+		if valid < max(8, (hi-lo)/3) {
 			return 0
 		}
-		return float64(matched) / float64(valid)
+		mean := sum / float64(valid)
+		if mean < minimumTone || mean > maximumTone {
+			return 0
+		}
+		variance := sumSquares/float64(valid) - mean*mean
+		if variance < 0 {
+			variance = 0
+		}
+		spread := math.Sqrt(variance)
+		if spread > 110 {
+			return 0
+		}
+		stability := 1 - spread/110
+		priorScale := math.Max(150, maxOffset)
+		prior := 1 - math.Min(1, math.Abs(mean-target)/priorScale)
+		return 0.65*stability + 0.35*prior
 	}
 	bestStart, bestScore := expected, 0.0
 	bestDistance := int(^uint(0) >> 1)
@@ -761,7 +798,7 @@ func (c *sampleClock) syncFromFrequency(durationMS, searchMS float64) bool {
 			bestStart, bestScore, bestDistance = start, score, distance
 		}
 	}
-	if bestScore < 0.25 {
+	if bestScore < 0.32 {
 		c.skip(durationMS)
 		return false
 	}
@@ -827,15 +864,15 @@ func (c *sampleClock) updateAFC(start, pulseSamples int) {
 	for i, value := range values {
 		deviations[i] = math.Abs(value - centre)
 	}
-	if medianFloat64(deviations) > 45 {
+	if medianFloat64(deviations) > 65 {
 		return
 	}
 	targetOffset := centre - HorizontalSync
 	if math.Abs(targetOffset) > maxOffset {
 		return
 	}
-	delta := math.Max(-20, math.Min(20, targetOffset-c.offset))
-	c.offset += delta * 0.45
+	delta := math.Max(-45, math.Min(45, targetOffset-c.offset))
+	c.offset += delta * 0.60
 }
 
 func (c *sampleClock) scan(freq []float64, width int, totalMS float64) ([]uint8, error) {
@@ -868,7 +905,7 @@ func (c *sampleClock) scanRange(freq []float64, width int, totalMS, minHz, maxHz
 		}
 		sum, count := 0.0, 0
 		for i := lo; i < hi; i++ {
-			if freq[i] > 500 && freq[i] < 3_500 {
+			if freq[i] > 80 && freq[i] < 3_900 {
 				sum += freq[i]
 				count++
 			}
@@ -941,7 +978,13 @@ type bandPass struct {
 }
 
 func newBandPass(fs float64) bandPass {
-	return bandPass{hp: biquadHighPass(900, fs), lp: biquadLowPass(2800, fs)}
+	// Preserve the complete SSTV audio band when a linear-satellite receiver
+	// translates it by several hundred hertz. A narrow 900..2800 Hz filter
+	// clips useful tones before AFC can measure their offset.
+	return bandPass{
+		hp: biquadHighPass(120, fs),
+		lp: biquadLowPass(math.Min(3_800, fs*0.46), fs),
+	}
 }
 
 func (b *bandPass) Do(x float64) float64 {
@@ -969,11 +1012,11 @@ func (a *agc) Do(x float64) float64 {
 	}
 	a.count++
 	if a.count >= a.win {
-		if a.peak > 1e-4 {
+		if a.peak > 1e-7 {
 			target := 0.7 / a.peak
 			a.gain += 0.3 * (target - a.gain)
-			if a.gain > 200 {
-				a.gain = 200
+			if a.gain > 1_000 {
+				a.gain = 1_000
 			}
 		}
 		a.peak = 0
@@ -1023,16 +1066,15 @@ func (t *frequencyTracker) Process(samples []int16) []float64 {
 			// SSTV tones above sampleRate/4. Requiring >=2 silently pinned the
 			// discriminator near 2 kHz on 8 kHz devices. Linear interpolation
 			// supports any positive interval of at least one sample.
-			if period >= 1 && period <= float64(t.rate)/500 {
-				if f := float64(t.rate) * 0.5 / period; f >= 500 && f <= 3_500 {
+			if period >= 1 && period <= float64(t.rate)/100 {
+				if f := float64(t.rate) * 0.5 / period; f >= 80 && f <= math.Min(3_900, float64(t.rate)*0.48) {
 					t.freq = f
 				}
 			}
 		}
-		// No crossing for a long interval means silence or DC: report "no tone"
-		// rather than holding a stale frequency (which would make silence look
-		// like a 1900 Hz tone).
-		if t.sinceCross > float64(t.rate)/500 {
+		// Keep the wider capture band available for AFC offsets, while dropping
+		// stale frequency after a genuine no-crossing interval.
+		if t.sinceCross > float64(t.rate)/100 {
 			t.freq = 0
 			t.sinceCross = 0
 		}
@@ -1546,13 +1588,17 @@ func (d *StreamDecoder) Feed(ctx context.Context, samples []int16) ([]StreamEven
 		}
 
 		if d.mode == nil {
-			spec, vis, bodyStart, headerStart, nextSearch, err := detectModeHeaderFrom(d.pending, d.idleFreq, d.rate, d.visSearchFrom)
+			headerOffsetRange := 350.0
+			if d.afcEnabled && d.afcMaxOffsetHz >= 20 && d.afcMaxOffsetHz <= 1_000 {
+				headerOffsetRange = d.afcMaxOffsetHz
+			}
+			spec, vis, bodyStart, headerStart, nextSearch, err := detectModeHeaderFromRange(d.pending, d.idleFreq, d.rate, d.visSearchFrom, headerOffsetRange)
 			if err != nil && d.fixedMode != "" {
 				// In fixed mode a user has already supplied the mode identity. If
 				// the VIS data/parity symbols are corrupted, fall back to the known
 				// mode-family sync prefix and decode using the selected profile.
 				if fixedSpec, lookupErr := LookupMode(d.fixedMode); lookupErr == nil {
-					spec, vis, bodyStart, headerStart, nextSearch, err = detectFixedModePrefix(d.pending, d.idleFreq, d.rate, d.visSearchFrom, fixedSpec)
+					spec, vis, bodyStart, headerStart, nextSearch, err = detectFixedModePrefixRange(d.pending, d.idleFreq, d.rate, d.visSearchFrom, fixedSpec, headerOffsetRange)
 				}
 			}
 			if err != nil {
@@ -1675,11 +1721,11 @@ func (d *StreamDecoder) prepareProgressiveUpdate(ctx context.Context, frameEnd i
 	if rows <= d.lastPreviewRows || rows <= 0 {
 		return
 	}
-	// Publish roughly 60 immutable snapshots per image. The former 20% cadence
-	// meant a 240-line Robot36 preview stayed blank for about 48 lines. Unlike
-	// the old implementation, this function does not decode pixels: it only
-	// copies the exact frequency prefix needed by the preview worker.
-	stride := max(1, d.mode.Height/60)
+	// Publish at most roughly 24 immutable snapshots per image. Re-decoding
+	// every earlier row for 60 snapshots made preview work compete with the
+	// real-time capture path, especially on slower laptops and high-resolution
+	// modes. The latest-wins preview worker still paints partial images.
+	stride := max(1, d.mode.Height/24)
 	if rows-d.lastPreviewRows < stride && rows < d.mode.Height {
 		return
 	}

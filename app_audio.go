@@ -416,11 +416,10 @@ func (a *App) startRX(modeID string) error {
 		baseCtx = context.Background()
 	}
 	rxCtx, cancel := context.WithCancel(baseCtx)
-	// Keep the end-to-end backlog below a few capture periods. SSTV timing is
-	// sensitive, but multi-second buffering is worse: it makes RX appear frozen
-	// and eventually overflows the native queue. If this short queue fills, the
-	// sender inserts an explicit discontinuity marker and keeps the newest data.
-	queue := make(chan []float32, 16)
+	// Keep one bounded 64-block jitter queue. It absorbs brief scheduler hiccups
+	// without allowing multi-second stale audio to accumulate. Sustained DSP
+	// overload still emits an explicit discontinuity marker.
+	queue := make(chan []float32, 64)
 	a.rxQueueDrops.Store(0)
 
 	a.rxDecoderMu.Lock()
@@ -528,11 +527,15 @@ type rxTelemetryBlock struct {
 	InputDBFS            float64
 	InputPeak            float64
 	OutputPeak           float64
-	AttenuationDB         float64
+	AttenuationDB        float64
 	InputClippedSamples  uint64
 	AutoAttenuator       bool
 	AFCEnabled           bool
 	AFCMaxOffsetHz       float64
+	QueueDepth           int
+	QueueCapacity        int
+	DecodeMS             float64
+	BlockMS              float64
 	ReceivedSamples      uint64
 	DroppedBlocks        uint64
 	Discontinuity        bool
@@ -660,6 +663,7 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 		case <-ctx.Done():
 			return
 		case block := <-queue:
+			queueDepth := len(queue)
 			if block == nil {
 				attenuator.Reset()
 				// The capture backend discarded a stale queue backlog. The SSTV
@@ -685,6 +689,7 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 				continue
 			}
 			receivedSamples += uint64(len(block))
+			blockMS := float64(len(block)) * 1000 / float64(max(1, sampleRate))
 			// Preserve raw samples for diagnostics, but attenuate before PCM
 			// conversion so the decoder and spectrum share the same safe signal.
 			rawBlock := block
@@ -702,9 +707,9 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 				AutoAttenuator: settings.AutoAttenuatorEnabled,
 				AFCEnabled: settings.AFCEnabled, AFCMaxOffsetHz: settings.AFCMaxOffsetHz,
 				ReceivedSamples: receivedSamples, DroppedBlocks: droppedBlocks,
+				QueueDepth: queueDepth, QueueCapacity: cap(queue), BlockMS: blockMS,
 			}
 			// Spectrum is visualization-only and must never hold SSTV decoding.
-			enqueueRXTelemetry(telemetryQueue, telemetry)
 			// Capture dumps intentionally retain the unprocessed input for diagnosis.
 			a.appendCaptureDump(rawBlock, sampleRate*10)
 
@@ -724,8 +729,10 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 				activeMode = *requested
 				latestPreviewSequence.Add(1) // do not paint a stale image after mode changes
 			}
+			decodeStarted := time.Now()
 			events, err := decoder.Feed(ctx, pcm)
 			progress, progressActive := decoder.Progress()
+			telemetry.DecodeMS = float64(time.Since(decodeStarted)) / float64(time.Millisecond)
 			progressiveUpdates := decoder.DrainUpdates()
 			var trailingFrameAudio []int16
 			if len(events) > 0 {
@@ -735,6 +742,7 @@ func (a *App) runRXWorker(ctx context.Context, queue <-chan []float32, decoder *
 				trailingFrameAudio = decoder.PendingAudio()
 			}
 			a.rxDecoderMu.Unlock()
+			enqueueRXTelemetry(telemetryQueue, telemetry)
 
 			// Process the completion signal before checking ActiveMode. Feed may
 			// finish one frame and detect the next frame from the tail of the same
@@ -1113,6 +1121,8 @@ func (a *App) runRXTelemetryWorker(ctx context.Context, queue <-chan rxTelemetry
 					"inputClippedSamples": item.InputClippedSamples,
 					"autoAttenuator": item.AutoAttenuator,
 					"afcEnabled": item.AFCEnabled, "afcMaxOffsetHz": item.AFCMaxOffsetHz,
+					"rxQueueDepth": item.QueueDepth, "rxQueueCapacity": item.QueueCapacity,
+					"decodeMs": item.DecodeMS, "blockMs": item.BlockMS,
 				})
 			}
 			lastTelemetry = time.Now()
