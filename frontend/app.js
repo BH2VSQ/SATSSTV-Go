@@ -1058,7 +1058,10 @@ function bindRuntimeEvents() {
     captureTelemetrySeen = true;
     const peakHz = Number(data?.peakHz || 0);
     const crest = Number(data?.crest || 0);
-    $('spectrumState').textContent = t('spectrumPeak', { peak: peakHz.toFixed(0), crest: crest.toFixed(1) });
+    const signalPresent = data?.signalPresent !== false;
+    $('spectrumState').textContent = signalPresent
+      ? t('spectrumPeak', { peak: peakHz.toFixed(0), crest: crest.toFixed(1) })
+      : 'NO STABLE TONE';
     const dbfs = Number(data?.inputDbfs ?? data?.dbfs ?? -120);
     currentInputDBFS = dbfs;
     currentAttenuationDB = Math.max(0, Number(data?.attenuationDB || 0));
@@ -1098,7 +1101,9 @@ function bindRuntimeEvents() {
     // visible while unrelated trailing FSKID/silence audio continues. The
     // attenuation and AFC metrics above remain live.
     if (!completedFrameViewHeld || frameProgressActive) {
-      renderLiveSpectrum(data?.spectrum, true);
+      // Noise-only windows may refresh the level meter, but must not append
+      // waterfall rows or fabricate a wideband noise trace as SSTV activity.
+      renderLiveSpectrum(data?.signalPresent === false ? null : data?.spectrum, data?.signalPresent !== false);
     }
     $('spectrumOverlay').style.display = 'none';
   });
