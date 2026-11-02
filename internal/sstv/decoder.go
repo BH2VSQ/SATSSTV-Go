@@ -495,7 +495,14 @@ func decodeModeFromFrequency(ctx context.Context, freq []float64, sampleRate int
 }
 
 func decodeModeFromFrequencyWithAFC(ctx context.Context, freq []float64, sampleRate int, spec ModeSpec, bodyStart int, pcm []int16, offset float64, afcEnabled bool, afcMaxOffsetHz float64) (*image.NRGBA, error) {
-	return decodeModeRowsFromFrequencyWithAFC(ctx, freq, sampleRate, spec, bodyStart, pcm, offset, afcEnabled, afcMaxOffsetHz, spec.Height)
+	img, _, err := decodeModeFromFrequencyWithAFCTrace(ctx, freq, sampleRate, spec, bodyStart, pcm, offset, afcEnabled, afcMaxOffsetHz)
+	return img, err
+}
+
+func decodeModeFromFrequencyWithAFCTrace(ctx context.Context, freq []float64, sampleRate int, spec ModeSpec, bodyStart int, pcm []int16, offset float64, afcEnabled bool, afcMaxOffsetHz float64) (*image.NRGBA, []AFCOffsetPoint, error) {
+	var offsets []AFCOffsetPoint
+	img, err := decodeModeRowsFromFrequencyWithAFCTrace(ctx, freq, sampleRate, spec, bodyStart, pcm, offset, afcEnabled, afcMaxOffsetHz, spec.Height, &offsets)
+	return img, offsets, err
 }
 
 // decodeModeRowsFromFrequency decodes only the requested leading raster rows,
@@ -509,6 +516,10 @@ func decodeModeRowsFromFrequency(ctx context.Context, freq []float64, sampleRate
 }
 
 func decodeModeRowsFromFrequencyWithAFC(ctx context.Context, freq []float64, sampleRate int, spec ModeSpec, bodyStart int, pcm []int16, offset float64, afcEnabled bool, afcMaxOffsetHz float64, rows int) (*image.NRGBA, error) {
+	return decodeModeRowsFromFrequencyWithAFCTrace(ctx, freq, sampleRate, spec, bodyStart, pcm, offset, afcEnabled, afcMaxOffsetHz, rows, nil)
+}
+
+func decodeModeRowsFromFrequencyWithAFCTrace(ctx context.Context, freq []float64, sampleRate int, spec ModeSpec, bodyStart int, pcm []int16, offset float64, afcEnabled bool, afcMaxOffsetHz float64, rows int, offsetTrace *[]AFCOffsetPoint) (*image.NRGBA, error) {
 	if sampleRate < 8_000 || sampleRate > 192_000 {
 		return nil, fmt.Errorf("invalid sample rate %d", sampleRate)
 	}
@@ -548,6 +559,7 @@ func decodeModeRowsFromFrequencyWithAFC(ctx context.Context, freq []float64, sam
 	clock := sampleClock{
 		rate: sampleRate, pos: bodyStart, samples: pcm, frequency: freq,
 		offset: offset, afcEnabled: afcEnabled, afcMaxOffsetHz: afcMaxOffsetHz,
+		offsetTrace: []AFCOffsetPoint{{SampleIndex: 0, OffsetHz: offset}},
 	}
 	img := image.NewNRGBA(image.Rect(0, 0, spec.Width, fullHeight))
 
@@ -579,7 +591,18 @@ func decodeModeRowsFromFrequencyWithAFC(ctx context.Context, freq []float64, sam
 	default:
 		return nil, fmt.Errorf("decoder for family %q is not implemented", spec.Family)
 	}
+	if offsetTrace != nil {
+		*offsetTrace = append((*offsetTrace)[:0], clock.offsetTrace...)
+	}
 	return img, nil
+}
+
+// AFCOffsetPoint records the estimated receiver offset from standard SSTV
+// frequencies at a position in the frame's sample-aligned discriminator track.
+// The correction applied to a displayed frequency is the negative of OffsetHz.
+type AFCOffsetPoint struct {
+	SampleIndex int
+	OffsetHz    float64
 }
 
 type sampleClock struct {
@@ -592,6 +615,7 @@ type sampleClock struct {
 	offset         float64
 	afcEnabled     bool
 	afcMaxOffsetHz float64
+	offsetTrace    []AFCOffsetPoint
 }
 
 func (c *sampleClock) skip(ms float64) {
@@ -943,6 +967,8 @@ func (c *sampleClock) updateAFC(start, pulseSamples int) {
 	if mad > 90 {
 		return
 	}
+	previousOffset := c.offset
+	defer func() { c.recordAFCOffset(previousOffset) }()
 	targetOffset := centre - HorizontalSync
 	if math.Abs(targetOffset) > maxOffset {
 		return
@@ -968,6 +994,18 @@ func (c *sampleClock) updateAFC(start, pulseSamples int) {
 	// For ordinary slow drift, retain the existing bounded low-pass behavior.
 	step := math.Max(-45, math.Min(45, delta))
 	c.offset += step * 0.60
+}
+
+func (c *sampleClock) recordAFCOffset(previous float64) {
+	if c == nil || math.Abs(c.offset-previous) < 0.25 {
+		return
+	}
+	point := AFCOffsetPoint{SampleIndex: max(0, min(len(c.frequency), c.pos)), OffsetHz: c.offset}
+	if n := len(c.offsetTrace); n > 0 && c.offsetTrace[n-1].SampleIndex == point.SampleIndex {
+		c.offsetTrace[n-1] = point
+		return
+	}
+	c.offsetTrace = append(c.offsetTrace, point)
 }
 
 func (c *sampleClock) scan(freq []float64, width int, totalMS float64) ([]uint8, error) {
@@ -1560,33 +1598,59 @@ func (u StreamUpdate) Decode(ctx context.Context) (*image.NRGBA, error) {
 }
 
 // DecodeFinal reconstructs a completed frame with the same raw-PCM fallback as
-// the synchronous StreamDecoder path. The PCM slice is an immutable view owned
-// by the request, so a frame worker can safely decode it after Feed returns.
+// the synchronous StreamDecoder path.
 func (u StreamUpdate) DecodeFinal(ctx context.Context) (*image.NRGBA, error) {
+	img, _, err := u.DecodeFinalWithAFC(ctx)
+	return img, err
+}
+
+// DecodeFinalWithAFC also returns the exact per-line AFC offset history used
+// for this raster. The trace is shared with the spectrum/waterfall renderer so
+// displayed frequencies and decoded pixels use identical corrections.
+func (u StreamUpdate) DecodeFinalWithAFC(ctx context.Context) (*image.NRGBA, []AFCOffsetPoint, error) {
 	if u.Image != nil {
-		return u.Image, nil
+		return u.Image, nil, nil
 	}
 	if u.Mode.ID == "" || u.SampleRate <= 0 || u.FrequencyLength <= 0 {
-		return nil, errors.New("invalid completed SSTV frame request")
+		return nil, nil, errors.New("invalid completed SSTV frame request")
 	}
 	frequency := flattenFrequencyChunks(u.FrequencyChunks, u.FrequencyLength)
 	if len(u.PCM) == 0 {
-		return u.DecodeWithFrequency(ctx, frequency)
+		return u.DecodeWithFrequencyAndAFC(ctx, frequency)
 	}
-	return decodeModeFromFrequencyWithAFC(ctx, frequency, u.SampleRate, u.Mode, u.BodyStart, u.PCM, u.Offset, u.AFCEnabled, u.AFCMaxOffsetHz)
+	return decodeModeFromFrequencyWithAFCTrace(ctx, frequency, u.SampleRate, u.Mode, u.BodyStart, u.PCM, u.Offset, u.AFCEnabled, u.AFCMaxOffsetHz)
 }
 
 // DecodeWithFrequency reconstructs a preview from a caller-maintained,
 // contiguous frequency track. The supplied slice must contain at least the
 // FrequencyLength samples referenced by this update.
 func (u StreamUpdate) DecodeWithFrequency(ctx context.Context, frequency []float64) (*image.NRGBA, error) {
+	img, _, err := u.DecodeWithFrequencyAndAFC(ctx, frequency)
+	return img, err
+}
+
+// DecodeWithFrequencyAndAFC returns both the progressive image and the
+// sample-indexed AFC history used to align its frequency mapping.
+func (u StreamUpdate) DecodeWithFrequencyAndAFC(ctx context.Context, frequency []float64) (*image.NRGBA, []AFCOffsetPoint, error) {
 	if u.Image != nil {
-		return u.Image, nil
+		return u.Image, nil, nil
 	}
 	if u.Mode.ID == "" || u.SampleRate <= 0 || u.FrequencyLength <= 0 || len(frequency) < u.FrequencyLength {
-		return nil, errors.New("invalid progressive SSTV preview request")
+		return nil, nil, errors.New("invalid progressive SSTV preview request")
 	}
-	return decodeModeRowsFromFrequencyWithAFC(ctx, frequency[:u.FrequencyLength:u.FrequencyLength], u.SampleRate, u.Mode, u.BodyStart, nil, u.Offset, u.AFCEnabled, u.AFCMaxOffsetHz, u.Rows)
+	var offsets []AFCOffsetPoint
+	img, err := decodeModeRowsFromFrequencyWithAFCTrace(
+		ctx, frequency[:u.FrequencyLength:u.FrequencyLength], u.SampleRate,
+		u.Mode, u.BodyStart, nil, u.Offset, u.AFCEnabled, u.AFCMaxOffsetHz,
+		u.Rows, &offsets,
+	)
+	return img, offsets, err
+}
+
+// FrequencyTrack returns an owned, contiguous copy of the frequency samples
+// associated with this frame update.
+func (u StreamUpdate) FrequencyTrack() []float64 {
+	return flattenFrequencyChunks(u.FrequencyChunks, u.FrequencyLength)
 }
 
 func flattenFrequencyChunks(chunks [][]float64, limit int) []float64 {
