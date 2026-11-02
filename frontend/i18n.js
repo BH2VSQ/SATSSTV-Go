@@ -50,7 +50,7 @@
       imageReceivedStatus: '图像接收完成', imageAddedAlbum: '，已加入相册', txStatePlaying: '发射中', txStateEncoding: '编码中', txStateCompleted: '完成', txStateStopped: '已停止', txStateError: '错误', txStateDraft: '草稿',
       audioDeviceCount: '发现 {inputs} 个输入设备和 {outputs} 个输出设备', audioDeviceEnumFailed: '设备枚举失败：{error}', serialDisconnected: '（已断开）', serialNotFound: '未发现串口', serialEnumFailed: '串口枚举失败', audioInputOpening: '正在打开共享模式音频输入设备…', rxInitFailedShort: '音频初始化失败',
       rxInitFailed: '音频初始化失败：{error}。请检查设备设置。', rxAutoStartFailed: '自动启动 RX 失败：{error}', txOutputNotReady: 'TX 音频输出尚未初始化，请在设备设置中选择输出设备并应用', txEncoderUnavailable: '当前 TX 模式的编码器不可用',
-      spectrumPeak: '峰值 {peak} Hz · 峰度 {crest}', callsignSource: '来源：{source}', callsignFilled: '已通过 {source} 识别到呼号 {callsign}，已填入对方呼号', callsignPreserved: '已通过 {source} 识别到呼号 {callsign}；保留了已手动填写的对方呼号',
+      spectrumPeak: '峰值 {peak} Hz · 峰度 {crest}', noStableTone: '未检测到稳定音调', callsignSource: '来源：{source}', callsignFilled: '已通过 {source} 识别到呼号 {callsign}，已填入对方呼号', callsignPreserved: '已通过 {source} 识别到呼号 {callsign}；保留了已手动填写的对方呼号',
     },
     'en': {
       appTitle: 'SATSSTV-Go', audioRate: 'Audio Sample Rate', toneStop: 'Stop Tone', txStop: 'Stop TX', rxLevel: 'RX level is shown on the left of the spectrum', ready: 'Ready', librarySubtitle: 'Images are stored in your user data directory; templates embed their own copies.', navWorkbench: 'Workbench', navAlbum: 'Album', audioDisconnected: 'Audio device disconnected',
@@ -99,7 +99,7 @@
       imageReceivedStatus: 'Image received', imageAddedAlbum: ' · added to album', txStatePlaying: 'Transmitting', txStateEncoding: 'Encoding', txStateCompleted: 'Completed', txStateStopped: 'Stopped', txStateError: 'Error', txStateDraft: 'Draft',
       audioDeviceCount: 'Found {inputs} input and {outputs} output devices', audioDeviceEnumFailed: 'Device enumeration failed: {error}', serialDisconnected: ' (disconnected)', serialNotFound: 'No serial port found', serialEnumFailed: 'Serial port enumeration failed', audioInputOpening: 'Opening shared-mode audio input…', rxInitFailedShort: 'Audio initialization failed',
       rxInitFailed: 'Audio initialization failed: {error}. Check device settings.', rxAutoStartFailed: 'Failed to start RX automatically: {error}', txOutputNotReady: 'TX audio output is not initialized. Select an output device in Settings and apply it.', txEncoderUnavailable: 'The encoder for the current TX mode is unavailable',
-      spectrumPeak: 'Peak {peak} Hz · Crest {crest}', callsignSource: 'Source: {source}', callsignFilled: 'Callsign {callsign} received via {source} and filled into HisCall', callsignPreserved: 'Callsign {callsign} received via {source}; keeping the manually entered HisCall',
+      spectrumPeak: 'Peak {peak} Hz · Crest {crest}', noStableTone: 'No stable tone', callsignSource: 'Source: {source}', callsignFilled: 'Callsign {callsign} received via {source} and filled into HisCall', callsignPreserved: 'Callsign {callsign} received via {source}; keeping the manually entered HisCall',
     },
     'ja': {
       appTitle: 'SATSSTV-Go', audioRate: 'オーディオサンプルレート', toneStop: 'トーン停止', txStop: '送信停止', rxLevel: 'RX レベルはスペクトラム左側に表示', ready: '準備完了', librarySubtitle: '画像はユーザーデータに保存され、テンプレートには個別のコピーが埋め込まれます。', navWorkbench: 'ワークベンチ', navAlbum: 'アルバム', audioDisconnected: 'オーディオデバイス未接続',
@@ -148,7 +148,7 @@
       imageReceivedStatus: '画像を受信しました', imageAddedAlbum: ' · アルバムに追加しました', txStatePlaying: '送信中', txStateEncoding: 'エンコード中', txStateCompleted: '完了', txStateStopped: '停止', txStateError: 'エラー', txStateDraft: '下書き',
       audioDeviceCount: '入力 {inputs} 台、出力 {outputs} 台を検出', audioDeviceEnumFailed: 'デバイス列挙に失敗：{error}', serialDisconnected: '（切断）', serialNotFound: 'シリアルポートが見つかりません', serialEnumFailed: 'シリアルポートの列挙に失敗しました', audioInputOpening: '共有モードのオーディオ入力を開いています…', rxInitFailedShort: 'オーディオ初期化失敗',
       rxInitFailed: 'オーディオ初期化失敗：{error}。デバイス設定を確認してください。', rxAutoStartFailed: 'RX 自動起動失敗：{error}', txOutputNotReady: 'TX オーディオ出力が未初期化です。設定で出力デバイスを選択して適用してください。', txEncoderUnavailable: '現在の TX モードのエンコーダーは利用できません',
-      spectrumPeak: 'ピーク {peak} Hz · クレスト {crest}', callsignSource: 'ソース：{source}', callsignFilled: '{source} でコールサイン {callsign} を認識し HisCall に入力しました', callsignPreserved: '{source} でコールサイン {callsign} を認識しました。手動入力した HisCall は保持します',
+      spectrumPeak: 'ピーク {peak} Hz · クレスト {crest}', noStableTone: '安定したトーンなし', callsignSource: 'ソース：{source}', callsignFilled: '{source} でコールサイン {callsign} を認識し HisCall に入力しました', callsignPreserved: '{source} でコールサイン {callsign} を認識しました。手動入力した HisCall は保持します',
     }
   };
 
