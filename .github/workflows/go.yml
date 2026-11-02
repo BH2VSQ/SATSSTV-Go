@@ -197,6 +197,14 @@ jobs:
             "artifacts/SATSSTV-Go-${{ matrix.artifact }}.tar.gz" \
             "SATSSTV-Go-${{ matrix.artifact }}"
 
+      - name: Package Linux DEB and AppImage installers
+        if: runner.os == 'Linux'
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          PACKAGE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: bash .github/scripts/package-linux-installers.sh
+        shell: bash
+
       - name: Package macOS artifacts
         if: runner.os == 'macOS'
         shell: bash
