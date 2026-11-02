@@ -56,8 +56,15 @@ func detectVISFromRange(samples []int16, freq []float64, sampleRate, startAt int
 	}
 
 	fineStep := max(1, sampleRate/4000)
+	quickStride := max(1, sampleRate/1_000)
 	for coarse := start; coarse <= maxStart; coarse += step {
-		leaderFreq := meanFreqQuick(freq, coarse, leaderN, max(1, sampleRate/8_000))
+		// Reject noisy windows before entering the raw-PCM Goertzel header
+		// classifier. The 1900 Hz VIS leader is a sustained narrow tone; noise
+		// may have a similar mean crossing rate but a much wider spread.
+		leaderFreq, leaderSpread, leaderCoverage := stableMeanFreqQuick(freq, coarse, leaderN, quickStride)
+		if leaderCoverage < 0.65 || leaderSpread > maxLeaderSpread(sampleRate) {
+			continue
+		}
 		// SSB tuning can move the entire audio passband by several hundred
 		// hertz. A fixed-mode receiver already accepted this broader AFC range;
 		// Auto must search the same practical window before rejecting VIS.
@@ -81,7 +88,7 @@ func detectVISFromRange(samples []int16, freq []float64, sampleRate, startAt int
 			if breakEnd > len(samples) {
 				continue
 			}
-			breakMean := meanFreqQuick(freq, breakStart, breakN, max(1, sampleRate/8_000))
+			breakMean := meanFreqQuick(freq, breakStart, breakN, max(1, sampleRate/1_000))
 			// A 10 ms break is shorter than the discriminator/filter transient.
 			// Keep a wider coarse gate here and let the raw-PCM narrowband
 			// detector below make the final 1200 Hz symbol decision.
